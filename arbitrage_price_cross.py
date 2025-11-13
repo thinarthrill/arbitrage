@@ -2034,33 +2034,42 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         # --- Контроль качества fill'а: проверяем, что реальный спред на входе достаточный ---
     long_px  = float(oa.get("avg_price") or 0.0)
     short_px = float(ob.get("avg_price") or 0.0)
-    entry_bps_filled = ((short_px - long_px) / long_px * 1e4) if long_px > 0 else -1e9
-
     ENTRY_BPS_MIN = float(getenv_float("ENTRY_BPS_MIN", 0.0))
-    if ENTRY_BPS_MIN > 0.0 and entry_bps_filled < ENTRY_BPS_MIN:
-        logging.warning(
-            "Bad fill for %s: entry_bps_filled=%.2f < %.2f bps, panic closing",
-            symbol, entry_bps_filled, ENTRY_BPS_MIN
-        )
-        # Закрываем обе ноги reduce_only маркетами
-        try:
-            _ = _place_perp_market_order(
-                cheap_ex, symbol, "SELL", qty_final,
-                paper=paper, reduce_only=True
-            )
-        except Exception as e2:
-            logging.error("Bad-fill close legA failed: %s", e2)
-        try:
-            _ = _place_perp_market_order(
-                rich_ex, symbol, "BUY", qty_final,
-                paper=paper, reduce_only=True
-            )
-        except Exception as e3:
-            logging.error("Bad-fill close legB failed: %s", e3)
 
-        return False, attempt_id, {
-            "error": f"bad_fill: entry_bps_filled={entry_bps_filled:.2f} < {ENTRY_BPS_MIN:.2f}"
-        }
+    # Если биржи не вернули avg_price (testnet/демо и т.п.),
+    # не считаем это плохим fill'ом, а просто логируем и пропускаем проверку.
+    if long_px <= 0 or short_px <= 0:
+        logging.warning(
+            "Skip ENTRY_BPS_MIN check for %s: long_px=%.6f short_px=%.6f (no avg_price in fills)",
+            symbol, long_px, short_px
+        )
+        entry_bps_filled = None
+    else:
+        entry_bps_filled = (short_px - long_px) / long_px * 1e4
+        if ENTRY_BPS_MIN > 0.0 and entry_bps_filled < ENTRY_BPS_MIN:
+            logging.warning(
+                "Bad fill for %s: entry_bps_filled=%.2f < %.2f bps, panic closing",
+                symbol, entry_bps_filled, ENTRY_BPS_MIN
+            )
+            # Закрываем обе ноги reduce_only маркетами
+            try:
+                _ = _place_perp_market_order(
+                    cheap_ex, symbol, "SELL", qty_final,
+                    paper=paper, reduce_only=True
+                )
+            except Exception as e2:
+                logging.error("Bad-fill close legA failed: %s", e2)
+            try:
+                _ = _place_perp_market_order(
+                    rich_ex, symbol, "BUY", qty_final,
+                    paper=paper, reduce_only=True
+                )
+            except Exception as e3:
+                logging.error("Bad-fill close legB failed: %s", e3)
+
+            return False, attempt_id, {
+                "error": f"bad_fill: entry_bps_filled={entry_bps_filled:.2f} < {ENTRY_BPS_MIN:.2f}"
+            }
 
     # --- Если всё ок, сохраняем метаданные обычным образом ---
     meta = {
@@ -2072,7 +2081,9 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         "open_fees_usd": float(oa.get("fee_usd") or 0.0) + float(ob.get("fee_usd") or 0.0),
         "open_long_cloid":  oa.get("client_order_id"),
         "open_short_cloid": ob.get("client_order_id"),
+        "entry_bps_filled": float(entry_bps_filled) if entry_bps_filled is not None else None,
     }
+
     return True, attempt_id, meta
 
 ########################
