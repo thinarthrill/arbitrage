@@ -1,0 +1,10 @@
+web3
+requests
+urllib3
+six
+certifi
+websocket-client
+python-dotenv
+pandas
+google-cloud-storage
+numpy
