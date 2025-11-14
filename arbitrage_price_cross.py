@@ -334,7 +334,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     net_usd  = float(r["net_usd"])
     gross    = float(r["gross_usd"])
     fees_rt  = float(r["fees_roundtrip_usd"])
-    ts       = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     price_lbl = {"mid":"MID","last":"LAST","mark":"MARK","bid":"BID","ask":"ASK","book":"BBO"}.get(price_source.lower(),"MID")
     z = r.get("z", None)
