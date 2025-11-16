@@ -1075,6 +1075,16 @@ def try_instant_open(best: dict, per_leg_notional_usd: float, taker_fee: float, 
     px_low   = float(best["px_low"])
     px_high  = float(best["px_high"])
 
+    # --- 0a) Ограничим боевую торговлю только binance/bybit ---
+    # Остальные биржи (okx, gate, mexc и т.п.) пока используем только для анализа спредов.
+    SUPPORTED_TRADE_EXCHANGES = {"binance", "bybit"}
+    if cheap_ex.lower() not in SUPPORTED_TRADE_EXCHANGES or rich_ex.lower() not in SUPPORTED_TRADE_EXCHANGES:
+        logging.info(
+            "[OPEN] Skip live trading for %s: unsupported exchange combo %s/%s (analyze-only)",
+            sym, cheap_ex, rich_ex
+        )
+        return False
+
     # 0) Проверим, нет ли уже открытых позиций
     df_pos = load_positions(pos_path)
     if (not df_pos.empty) and any(df_pos["status"] == "open"):
