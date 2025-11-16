@@ -58,6 +58,10 @@ def _private_base(exchange: str) -> str:
     if ex == "gate":
         # у Gate (USDT-перпы) публичного фьюч-тестнета нет
         return "https://api.gateio.ws"
+    if ex == "okx":
+        # у OKX отдельного фьюч-тестнета для USDT-SWAP нет, «демо» режим делается заголовком x-simulated-trading
+        # поэтому всегда используем основной хост
+        return "https://www.okx.com"
     raise ValueError(f"Unknown exchange: {exchange}")
 
 def getenv_str(k: str, d: str = "") -> str:
