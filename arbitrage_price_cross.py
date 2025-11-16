@@ -56,7 +56,12 @@ def _private_base(exchange: str) -> str:
         # у MEXC фьюч-тестнета нет
         return "https://contract.mexc.com"
     if ex == "gate":
-        # у Gate (USDT-перпы) публичного фьюч-тестнета нет
+        # Gate: переключаемся между mainnet и testnet по флагам GATE_TESTNET / GATE_PAPER
+        # Для демо по документации:
+        #   API domain for demo trading: https://api-testnet.gateapi.io/api/v4
+        use_testnet = _is_true("GATE_TESTNET", False) or _is_true("GATE_PAPER", False)
+        if use_testnet:
+            return "https://api-testnet.gateapi.io"
         return "https://api.gateio.ws"
     if ex == "okx":
         # у OKX отдельного фьюч-тестнета для USDT-SWAP нет, «демо» режим делается заголовком x-simulated-trading
@@ -523,7 +528,8 @@ def binance_data_base() -> str:
 def okx_base() -> str: return "https://www.okx.com"
 
 def gate_base() -> str:
-    return "https://api.gateio.ws"
+    # приватная база для Gate (mainnet/testnet по флагам)
+    return _private_base("gate")
 
 def gate_contract_from_symbol(symbol: str) -> str:
     sym = symbol.upper()
@@ -1004,7 +1010,7 @@ def gate_quote(symbol: str, price_source: str = "mid"):
     # contract формат у Gate: BTC_USDT
     contract = gate_contract_from_symbol(symbol)  # твоя функция маппинга
     ps = (price_source or "mid").lower()
-    url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+    url = f"{gate_base()}/api/v4/futures/usdt/tickers"
     j = _get(url, {"contract": contract}) or []
     if not j: return None
     x = j[0]
