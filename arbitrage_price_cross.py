@@ -661,30 +661,44 @@ def _check_gate_auth() -> bool:
     if not key or not sec:
         logging.warning("[AUTH] Gate: ключи не заданы — пропускаю приватную проверку")
         return True
+
     method = "GET"
+    # В Gate API v4 sign_string использует prefix + url: "/api/v4" + "/futures/usdt/accounts"
     path = "/api/v4/futures/usdt/accounts"
     query = ""
     body = ""
-    ts = str(time.time())
-    # signature spec: HMAC_SHA512(secret, method+'\n'+path+'\n'+query+'\n'+body+'\n'+timestamp)
-    msg = "\n".join([method, path, query, body, ts])
+
+    # timestamp — целое число секунд
+    ts = str(int(time.time()))
+
+    # body_hash = sha512(body).hexdigest(), даже если body пустой
+    body_hash = hashlib.sha512(body.encode()).hexdigest()
+
+    # Согласно официальной схеме:
+    # sign_string = method + "\n" + path + "\n" + query + "\n" + body_hash + "\n" + timestamp
+    msg = "\n".join([method, path, query, body_hash, ts])
     sign = _hmac_sha512_hex(sec, msg)
+
     headers = {
         "KEY": key,
         "Timestamp": ts,
         "SIGN": sign,
     }
-    url = f"https://api.gateio.ws{path}"
+
+    # Используем gate_base(), чтобы поддерживать и mainnet, и testnet
+    url = f"{gate_base()}{path}"
+
     try:
         r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             logging.error("[AUTH] Gate FAIL HTTP %s: %s", r.status_code, r.text[:200])
             return False
         j = r.json()
-        if "available" in j or "user" in j or isinstance(j, dict):
+        # Простой sanity-check ответа
+        if isinstance(j, dict):
             logging.info("[AUTH] Gate OK (futures account)")
             return True
-        logging.error("[AUTH] Gate FAIL: неожиданный ответ %s", str(j)[:200])
+        logging.error("[AUTH] Gate: неожиданный формат ответа: %s", str(j)[:200])
         return False
     except Exception as e:
         logging.exception("[AUTH] Gate exception: %s", e)
