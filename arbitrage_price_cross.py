@@ -1099,16 +1099,6 @@ def try_instant_open(best: dict, per_leg_notional_usd: float, taker_fee: float, 
     px_low   = float(best["px_low"])
     px_high  = float(best["px_high"])
 
-    # --- 0a) Ограничим боевую торговлю только binance/bybit ---
-    # Остальные биржи (okx, gate, mexc и т.п.) пока используем только для анализа спредов.
-    SUPPORTED_TRADE_EXCHANGES = {"binance", "bybit"}
-    if cheap_ex.lower() not in SUPPORTED_TRADE_EXCHANGES or rich_ex.lower() not in SUPPORTED_TRADE_EXCHANGES:
-        logging.info(
-            "[OPEN] Skip live trading for %s: unsupported exchange combo %s/%s (analyze-only)",
-            sym, cheap_ex, rich_ex
-        )
-        return False
-
     # 0) Проверим, нет ли уже открытых позиций
     df_pos = load_positions(pos_path)
     if (not df_pos.empty) and any(df_pos["status"] == "open"):
@@ -1674,8 +1664,147 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             return {"status": "FILLED", "avg_price": avg, "order_id": j2["result"].get("orderId"), "client_order_id": payload_lim.get("orderLinkId"), "fee_usd": 0.0}
 
         raise RuntimeError(f"Bybit IOC-limit fallback failed: retCode={j2.get('retCode')} retMsg={j2.get('retMsg')} req={payload_lim} resp={str(j2)[:400]}")
+    elif ex == "okx":
+        # --- OKX USDT-SWAP через REST v5 /api/v5/trade/order ---
+        key = os.getenv("OKX_API_KEY", "")
+        sec = os.getenv("OKX_API_SECRET", "")
+        passphrase = os.getenv("OKX_PASSPHRASE", "")
+        if not key or not sec or not passphrase:
+            raise RuntimeError("OKX: API ключи не заданы (OKX_API_KEY/OKX_API_SECRET/OKX_PASSPHRASE)")
 
+        base = okx_base()
+        inst_id = okx_inst_from_symbol(symbol)
+        td_mode = getenv_str("OKX_TD_MODE", "cross")  # cross | isolated
 
+        body_dict = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side.lower(),        # buy / sell
+            "ordType": "market",
+            "sz": str(qty),
+        }
+        if reduce_only:
+            # у OKX reduceOnly есть только для отдельных режимов, но в демо можно попробовать
+            body_dict["reduceOnly"] = True
+        if cl_oid:
+            body_dict["clOrdId"] = cl_oid
+
+        body = json.dumps(body_dict, separators=(",", ":"))
+
+        # sign: ts + method + path + body
+        path = "/api/v5/trade/order"
+        method = "POST"
+        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        prehash = ts + method + path + body
+        sign = base64.b64encode(
+            hmac.new(sec.encode(), prehash.encode(), hashlib.sha256).digest()
+        ).decode()
+
+        headers = {
+            "OK-ACCESS-KEY": key,
+            "OK-ACCESS-SIGN": sign,
+            "OK-ACCESS-TIMESTAMP": ts,
+            "OK-ACCESS-PASSPHRASE": passphrase,
+            "Content-Type": "application/json",
+            # demo-режим: x-simulated-trading=1 для тестовых ключей
+            "x-simulated-trading": "1" if os.getenv("OKX_TESTNET", "0").lower() in ("1", "true", "t", "yes") else "0",
+        }
+
+        url = f"{base}{path}"
+        r = SESSION.post(url, headers=headers, data=body, timeout=REQUEST_TIMEOUT)
+        j = r.json()
+
+        if r.status_code != 200 or j.get("code") != "0":
+            raise RuntimeError(
+                f"OKX order failed: http={r.status_code} code={j.get('code')} msg={j.get('msg')} resp={str(j)[:400]}"
+            )
+
+        data = (j.get("data") or [{}])[0]
+        avg_px = float(data.get("avgPx") or data.get("fillPx") or 0.0)
+        try:
+            fee = float(data.get("fee") or 0.0)
+        except Exception:
+            fee = 0.0
+
+        return {
+            "status": "FILLED",
+            "avg_price": avg_px,
+            "order_id": data.get("ordId") or "",
+            "client_order_id": data.get("clOrdId") or cl_oid,
+            "fee_usd": abs(fee),
+        }
+    elif ex == "gate":
+        # --- Gate USDT futures /api/v4/futures/usdt/orders ---
+        key = os.getenv("GATE_API_KEY", "")
+        sec = os.getenv("GATE_API_SECRET", "")
+        if not key or not sec:
+            raise RuntimeError("Gate: API ключи не заданы (GATE_API_KEY/GATE_API_SECRET)")
+
+        contract = gate_contract_from_symbol(symbol)
+        base = gate_base()
+        path = "/api/v4/futures/usdt/orders"
+        url = f"{base}{path}"
+
+        # В Gate size > 0 = long, size < 0 = short
+        size = float(qty)
+        if side.upper() == "SELL":
+            size = -size
+
+        body_dict = {
+            "contract": contract,
+            "size": size,
+            "tif": "ioc",         # IOC как у нас везде
+            "auto_size": "none",
+        }
+        if reduce_only:
+            body_dict["reduce_only"] = True
+        if cl_oid:
+            body_dict["text"] = cl_oid
+
+        body = json.dumps(body_dict, separators=(",", ":"))
+
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha512(body.encode()).hexdigest()
+        # sign_string = method + "\n" + path + "\n" + query + "\n" + body_hash + "\n" + timestamp
+        method = "POST"
+        query = ""
+        msg = "\n".join([method, path, query, body_hash, ts])
+        sign = _hmac_sha512_hex(sec, msg)
+
+        headers = {
+            "KEY": key,
+            "Timestamp": ts,
+            "SIGN": sign,
+            "Content-Type": "application/json",
+        }
+
+        r = SESSION.post(url, headers=headers, data=body, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"Gate order HTTP {r.status_code}: {r.text[:400]}")
+
+        j = r.json()
+        # Ошибки Gate формата {"label":"INVALID_SIGNATURE","message":"..."}
+        if isinstance(j, dict) and j.get("label"):
+            raise RuntimeError(f"Gate order failed: label={j.get('label')} msg={j.get('message')} resp={str(j)[:400]}")
+
+        data = j if isinstance(j, dict) else (j[0] if j else {})
+        try:
+            avg = float(data.get("fill_price") or data.get("price") or 0.0)
+        except Exception:
+            avg = 0.0
+        try:
+            fee = float(data.get("fee") or 0.0)
+        except Exception:
+            fee = 0.0
+        oid = str(data.get("id") or data.get("order_id") or "")
+
+        return {
+            "status": "FILLED",
+            "avg_price": avg,
+            "order_id": oid,
+            "client_order_id": cl_oid,
+            "fee_usd": abs(fee),
+        }
     raise ValueError(f"unsupported exchange {exchange}")
 
 # ----------------- Candidate builder -----------------
