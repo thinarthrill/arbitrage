@@ -766,7 +766,7 @@ def _check_okx_auth() -> bool:
         "OK-ACCESS-SIGN": sign,
         "OK-ACCESS-TIMESTAMP": ts,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "1" if os.getenv("OKX_TESTNET", "0") in ("1","true","True") else "0",
+        "x-simulated-trading": "1" if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False) else "0",
     }
     url = f"{base}{endpoint}"
     try:
@@ -3114,7 +3114,17 @@ def main():
         for ex in exchanges:
             base = _private_base(ex)
             env = "testnet" if "testnet" in base else ("demo" if "api-demo" in base else "mainnet")
+
+            # Спец-логика для OKX: demo определяется не URL-ом, а заголовком x-simulated-trading
+            if ex.lower() == "okx":
+                if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False):
+                    env = "demo"
+
             per_env[ex] = env
+
+        price_feed_env = "mainnet"
+        logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
+
 
         price_feed_env = "mainnet"
         logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
