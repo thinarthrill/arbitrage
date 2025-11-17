@@ -1296,6 +1296,7 @@ def scan_all_with_instant_alerts(
     instant_open: bool = True,
     pos_path_for_instant: Optional[str] = None,
     paper: Optional[bool] = None,
+    per_ex_symbols: Optional[Dict[str, set]] = None,
 ) -> pd.DataFrame:
     import pandas as pd
     rows_all = []
@@ -1306,7 +1307,16 @@ def scan_all_with_instant_alerts(
 
     for sym in symbols:
         per_symbol_rows = []
+        sym_u = sym.upper()
         for ex in exchanges:
+            # Если у нас есть матрица доступности символов по биржам,
+            # не дёргаем котировки по тем биржам, где этого символа нет.
+            if per_ex_symbols is not None:
+                allowed = per_ex_symbols.get(ex)
+                # Пустое множество/None трактуем как "нет информации" → не фильтруем.
+                if allowed and sym_u not in allowed:
+                    continue
+
             if ex == "binance":
                 r = binance_quote(sym, price_source)
             elif ex == "bybit":
@@ -2938,6 +2948,38 @@ def symbols_from_matrix(matrix_path: str, exchanges: List[str], mode: str = "uni
     out = sorted(sub.loc[mask, "symbol"].dropna().astype(str).str.upper().unique().tolist())
     return out
 
+def matrix_per_exchange_symbols(matrix_path: str, exchanges: List[str]) -> Dict[str, set]:
+    """
+    Возвращает для каждой биржи множество символов, которые реально есть в матрице.
+    Используется, чтобы *не* дергать котировки по символам, которых на бирже нет,
+    даже если общий список symbols их содержит (например, при SYMBOLS_SOURCE=binance-top).
+    """
+    out: Dict[str, set] = {ex: set() for ex in exchanges}
+    if not matrix_path:
+        return out
+    df = load_matrix_df(matrix_path)
+    if df.empty:
+        return out
+    df.columns = [c.strip() for c in df.columns]
+    if "symbol" not in df.columns:
+        return out
+
+    for ex in exchanges:
+        if ex not in df.columns:
+            continue
+        # считаем, что "1"/True/непустое значение в колонке <ex> означает наличие контракта
+        mask = df[ex].fillna(0) != 0
+        syms = (
+            df.loc[mask, "symbol"]
+            .dropna()
+            .astype(str)
+            .str.upper()
+            .unique()
+            .tolist()
+        )
+        out[ex] = set(syms)
+    return out
+
 def binance_fapi_base_data() -> str:
     return binance_data_base()
 
@@ -3185,8 +3227,15 @@ def main():
     else:
         symbols = COMMON_SYMBOLS
 
-    logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
+    per_ex_symbols = None
+    if matrix_path and use_per_ex:
+        per_ex_symbols = matrix_per_exchange_symbols(matrix_path, exchanges)
+        logging.info(
+            "Per-exchange symbol filter enabled (matrix): %s",
+            {ex: len(s) for ex, s in per_ex_symbols.items()}
+        )
 
+    logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
     pos_cross_path = bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
 
     entry_bps = float(getenv_float("ENTRY_SPREAD_BPS", getenv_float("ENTRY_APR", 10.0)))
@@ -3234,6 +3283,7 @@ def main():
                 instant_open=True,                            # включаем мгновенное открытие
                 pos_path_for_instant=pos_cross_path,          # писаться будет в те же positions
                 paper=paper,                                  # уважаем режим PAPER
+                per_ex_symbols=per_ex_symbols,                # фильтр по доступности символов из матрицы
             )
 
             # ---- ОБНОВЛЯЕМ EMA-статистику из свежих котировок (на лету) ----
