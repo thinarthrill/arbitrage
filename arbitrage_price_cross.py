@@ -1974,8 +1974,10 @@ class StatsStore:
                 "mean_bps":None,"std_bps":None,"required_spread_bps":None,"z_req_profit":None,
                 "Z_IN_suggested":None,"entry_spread_bps_suggested":None
             }
-            self.df = pd.concat([self.df, pd.DataFrame([row])], ignore_index=True)
-            i = self.df.index[-1]
+            # --- вместо concat ---
+            next_idx = len(self.df)
+            self.df.loc[next_idx, STATS_COLS] = [row.get(c) for c in STATS_COLS]
+            i = next_idx
             self._recompute_reco(i)
 
     def maybe_save(self, force: bool=False):
