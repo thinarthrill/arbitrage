@@ -93,8 +93,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 # --- Отключаем подробные HTTP DEBUG-логи от urllib3 и requests ---
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING)
+#logging.getLogger("urllib3").setLevel(logging.WARNING)
+#logging.getLogger("requests").setLevel(logging.WARNING)
 
 # ----------------- HTTP -----------------
 import certifi, requests
