@@ -2415,7 +2415,7 @@ def bybit_unified_usdt_balance() -> dict:  # NEW
         return {"asset":"USDT","equity":equity,"wallet":wallet,"available":avail,"uPnL":unrealPnL}
     except Exception as e:
         logging.debug("bybit_unified_usdt_balance err: %s", e)
-        return {}
+        return {"error": True}
 
 def okx_usdt_balance() -> dict:  # NEW
     """
@@ -2916,10 +2916,13 @@ def positions_once(
                                 )
                             if by:
                                 demo_tag = " (demo)" if _is_true("BYBIT_DEMO", False) else ""
-                                pnl_lines.append(
-                                    f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
-                                    f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
-                                )
+                                if by.get("error"):
+                                    pnl_lines.append("   BYBIT (demo): ошибка при чтении баланса")
+                                else:
+                                    pnl_lines.append(
+                                        f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
+                                        f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
+                                    )
                             if ok:
                                 sim_tag = " (paper)" if _is_true("OKX_PAPER", False) or _is_true("OKX_TESTNET", False) else ""
                                 pnl_lines.append(
