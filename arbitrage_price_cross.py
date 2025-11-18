@@ -2370,7 +2370,8 @@ def binance_usdt_futures_balance() -> dict:  # NEW
         wallet = float(row.get("balance") or row.get("walletBalance") or 0.0)
         avail  = float(row.get("availableBalance") or 0.0)
         upnl   = float(row.get("crossUnPnl") or 0.0)
-        return {"asset":"USDT","wallet":wallet,"available":avail,"uPnL":upnl}
+        equity = wallet + upnl
+        return {"asset":"USDT","wallet":wallet,"available":avail,"uPnL":upnl,"equity":equity}
     except Exception as e:
         logging.debug("binance_usdt_futures_balance err: %s", e)
         return {}
@@ -2391,15 +2392,9 @@ def bybit_unified_usdt_balance() -> dict:  # NEW
         params += "&simulateTrading=true"
     recv = "5000"
     ts = str(now_ms())
-    prehash = ts + key + recv + params  # GET: ts+apiKey+recvWindow+query
-    sign = _hmac_sha256_hex(sec, prehash)
-    headers = {
-        "X-BAPI-API-KEY": key,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-    }
+    qs = f"{params}&recvWindow={recv}&timestamp={ts}"
+    sig = _hmac_sha256_hex(sec, qs)
+    headers = {"X-BAPI-API-KEY": key, "X-BAPI-SIGN": sig, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv}
     if _is_true("BYBIT_DEMO", False):
         headers["X-BAPI-SIMULATED-TRADING"] = "1"
 
@@ -2415,17 +2410,110 @@ def bybit_unified_usdt_balance() -> dict:  # NEW
         row = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
         equity   = float(row.get("equity") or 0.0)
         wallet   = float(row.get("walletBalance") or 0.0)
-        avail    = float(row.get("availableToWithdraw") or 0.0)
+        avail    = float(row.get("availableToWithdraw") or row.get("availableBalance") or 0.0)
         unrealPnL= float(row.get("unrealisedPnl") or 0.0)
         return {"asset":"USDT","equity":equity,"wallet":wallet,"available":avail,"uPnL":unrealPnL}
     except Exception as e:
         logging.debug("bybit_unified_usdt_balance err: %s", e)
         return {}
 
+def okx_usdt_balance() -> dict:  # NEW
+    """
+    Баланс USDT на OKX (унифицированный аккаунт).
+    Учитывает OKX_TESTNET / OKX_PAPER через x-simulated-trading.
+    """
+    key = getenv_str("OKX_API_KEY","")
+    sec = getenv_str("OKX_API_SECRET","")
+    passphrase = getenv_str("OKX_PASSPHRASE","")
+    if not key or not sec or not passphrase:
+        return {}
+    base = okx_base()
+    endpoint = "/api/v5/account/balance"
+    ts = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+    method = "GET"
+    body = ""
+    prehash = f"{ts}{method}{endpoint}{body}"
+    sign = base64.b64encode(hmac.new(sec.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
+    headers = {
+        "OK-ACCESS-KEY": key,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "x-simulated-trading": "1" if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False) else "0",
+    }
+    url = f"{base}{endpoint}"
+    try:
+        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logging.debug("okx_usdt_balance http=%s %s", r.status_code, r.text[:200])
+            return {}
+        j = r.json()
+        if str(j.get("code")) != "0":
+            logging.debug("okx_usdt_balance code=%s %s", j.get("code"), str(j)[:200])
+            return {}
+        data = j.get("data") or []
+        acc = data[0] if data else {}
+        details = acc.get("details") or []
+        row = next((d for d in details if str(d.get("ccy")) == "USDT"), {})
+        # eq — equity по конкретной валюте, totalEq — общее equity по аккаунту
+        equity = float(row.get("eq") or acc.get("totalEq") or 0.0)
+        wallet = float(row.get("cashBal") or 0.0)
+        avail  = float(row.get("availEq") or row.get("availBal") or wallet)
+        return {"asset":"USDT","equity":equity,"wallet":wallet,"available":avail}
+    except Exception as e:
+        logging.debug("okx_usdt_balance err: %s", e)
+        return {}
+
+def gate_usdt_futures_balance() -> dict:  # NEW
+    """
+    Баланс USDT на Gate Futures USDT-счёте.
+    Использует тот же sign, что и _check_gate_auth().
+    """
+    key = getenv_str("GATE_API_KEY","")
+    sec = getenv_str("GATE_API_SECRET","")
+    if not key or not sec:
+        return {}
+    method = "GET"
+    path = "/api/v4/futures/usdt/accounts"
+    query = ""
+    body = ""
+    ts = str(int(time.time()))
+    body_hash = hashlib.sha512(body.encode()).hexdigest()
+    msg = "\n".join([method, path, query, body_hash, ts])
+    sign = _hmac_sha512_hex(sec, msg)
+    headers = {
+        "KEY": key,
+        "Timestamp": ts,
+        "SIGN": sign,
+    }
+    url = f"{gate_base()}{path}"
+    try:
+        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logging.debug("gate_usdt_futures_balance http=%s %s", r.status_code, r.text[:200])
+            return {}
+        j = r.json()
+        # Ответ может быть dict или list — подстрахуемся
+        row = {}
+        if isinstance(j, dict):
+            row = j
+        elif isinstance(j, list) and j:
+            row = next((x for x in j if str(x.get("currency")) == "USDT"), j[0])
+        if not row:
+            return {}
+        wallet = float(row.get("total") or row.get("equity") or row.get("balance") or 0.0)
+        upnl   = float(row.get("unrealized_pnl") or row.get("unrealised_pnl") or 0.0)
+        equity = float(row.get("equity") or (wallet + upnl))
+        avail  = float(row.get("available") or row.get("available_margin") or (equity - float(row.get("position_margin") or 0.0) - float(row.get("order_margin") or 0.0)))
+        return {"asset":"USDT","equity":equity,"wallet":wallet,"available":avail,"uPnL":upnl}
+    except Exception as e:
+        logging.debug("gate_usdt_futures_balance err: %s", e)
+        return {}
+
 def get_post_close_balances(exchanges: list[str]) -> dict[str, dict]:  # NEW
     """
     Возвращает словарь балансов по указанным биржам (ключ — EXCH in CAPS).
-    Сейчас поддержаны: binance, bybit. Остальные можно доделать по аналогии.
+    Сейчас поддержаны: binance, bybit, okx, gate.
     """
     out: dict[str, dict] = {}
     for ex in exchanges:
@@ -2434,9 +2522,10 @@ def get_post_close_balances(exchanges: list[str]) -> dict[str, dict]:  # NEW
             out["BINANCE"] = binance_usdt_futures_balance()
         elif el == "bybit":
             out["BYBIT"] = bybit_unified_usdt_balance()
-        # elif el == "okx": ...  # при желании добавить
-        # elif el == "gate": ...
-        # elif el == "mexc": ...
+        elif el == "okx":
+            out["OKX"] = okx_usdt_balance()
+        elif el == "gate":
+            out["GATE"] = gate_usdt_futures_balance()
     return out
 
 def summarize_fills(exchange: str, symbol: str, open_side: str, open_oid: str|None, open_cloid: str|None, close_side: str, close_oid: str|None, close_cloid: str|None, start_ms: int) -> dict:
@@ -2811,11 +2900,15 @@ def positions_once(
                 # --- Балансы после закрытия (только если не PAPER)  # NEW
                 if not paper:
                     try:
-                        balances = get_post_close_balances([long_ex, short_ex])
+                        all_exchanges = getenv_list("EXCHANGES", DEFAULT_EXCHANGES)
+                        balances = get_post_close_balances(all_exchanges)
                         if balances:
                             pnl_lines.append("🏦 <b>Балансы после закрытия</b>:")
                             bn = balances.get("BINANCE", {})
                             by = balances.get("BYBIT",   {})
+                            ok = balances.get("OKX",     {})
+                            gt = balances.get("GATE",    {})
+
                             if bn:
                                 pnl_lines.append(
                                     f"   BINANCE (USDT): wallet ${bn.get('wallet',0):.2f}, "
@@ -2823,13 +2916,35 @@ def positions_once(
                                 )
                             if by:
                                 demo_tag = " (demo)" if _is_true("BYBIT_DEMO", False) else ""
-                                # Для Bybit полезно показать equity
                                 pnl_lines.append(
                                     f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
                                     f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
                                 )
+                            if ok:
+                                sim_tag = " (paper)" if _is_true("OKX_PAPER", False) or _is_true("OKX_TESTNET", False) else ""
+                                pnl_lines.append(
+                                    f"   OKX{sim_tag} (USDT): equity ${ok.get('equity',0):.2f}, "
+                                    f"wallet ${ok.get('wallet',0):.2f}, available ${ok.get('available',0):.2f}"
+                                )
+                            if gt:
+                                sim_tag = " (testnet)" if _is_true("GATE_TESTNET", False) or _is_true("GATE_PAPER", False) else ""
+                                pnl_lines.append(
+                                    f"   GATE{sim_tag} (USDT): equity ${gt.get('equity',0):.2f}, "
+                                    f"wallet ${gt.get('wallet',0):.2f}, available ${gt.get('available',0):.2f}"
+                                )
+
+                            # --- ИТОГО по всем биржам ---
+                            total_equity = 0.0
+                            for name, b in balances.items():
+                                eq = b.get("equity")
+                                if eq is None:
+                                    eq = (b.get("wallet", 0.0) or 0.0) + float(b.get("uPnL", 0.0) or 0.0)
+                                total_equity += float(eq or 0.0)
+                            if total_equity > 0:
+                                pnl_lines.append(f"   TOTAL ≈ ${total_equity:.2f}")
                     except Exception as e:
                         logging.debug("post-close balances fetch skipped: %s", e)
+
 
                 maybe_send_telegram("\n".join(pnl_lines))
             except Exception:
