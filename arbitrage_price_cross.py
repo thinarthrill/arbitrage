@@ -630,30 +630,12 @@ def check_connectivity(exchanges: list[str], probe_symbol: str="BTCUSDT") -> boo
             else:
                 bal = "-"
                 try:
-                    base = _private_base("bybit")
-                    endpoint = "/v5/account/wallet-balance"
-                    params = "accountType=UNIFIED"
-                    if _is_true("BYBIT_DEMO", False):
-                        params += "&simulateTrading=true"
-                    recv = "20000"
-                    ts = str(now_ms())
-                    pre_sign = ts + key + recv + params
-                    sign = _hmac_sha256_hex(sec, pre_sign)
-                    url = f"{base}{endpoint}?{params}&timestamp={ts}&recvWindow={recv}&sign={sign}"
-                    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-                    if r.status_code == 200:
-                        j = r.json()
-                        if str(j.get("retCode")) == "0":
-                            data = ((j.get("result") or {}).get("list") or [])
-                            coins = (data[0] or {}).get("coin", []) if data else []
-                            usdt = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
-                            bal = usdt.get("walletBalance", "-")
-                        else:
-                            logging.warning("[CHECK] Bybit balance retCode=%s, msg=%s",
-                                            j.get("retCode"), j.get("retMsg"))
+                    # ✅ Используем уже рабочую функцию
+                    info = bybit_unified_usdt_balance()
+                    if info:
+                        bal = info.get("wallet", "-")
                     else:
-                        logging.warning("[CHECK] Bybit balance HTTP %s: %s",
-                                        r.status_code, r.text[:200])
+                        bal = "-"
                 except Exception as e:
                     logging.warning("[CHECK] Bybit balance error: %s", e)
                 logging.info("[BALANCE] Bybit USDT: %s", bal)
@@ -2617,56 +2599,7 @@ def binance_usdt_futures_balance() -> dict:  # NEW
     except Exception as e:
         logging.debug("binance_usdt_futures_balance err: %s", e)
         return {}
-'''
-def bybit_unified_usdt_balance() -> dict:  # NEW
-    key = getenv_str("BYBIT_API_KEY","")
-    sec = getenv_str("BYBIT_API_SECRET","")
-    if not key or not sec:
-        return {}
-    base = _private_base("bybit")
-    endpoint = "/v5/account/wallet-balance"
-    params = "accountType=UNIFIED"
-    if _is_true("BYBIT_DEMO", False):
-        params += "&simulateTrading=true"
-    recv = "5000"
-    ts = str(now_ms())
-    qs = f"{params}&recvWindow={recv}&timestamp={ts}"
-    sig = _hmac_sha256_hex(sec, qs)
-    headers = {"X-BAPI-API-KEY": key, "X-BAPI-SIGN": sig, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv}
-    if _is_true("BYBIT_DEMO", False):
-        headers["X-BAPI-SIMULATED-TRADING"] = "1"
 
-    url = f"{base}{endpoint}?{params}"
-    try:
-        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        j = r.json()
-        if r.status_code != 200 or j.get("retCode") != 0:
-            logging.warning(
-                "bybit_unified_usdt_balance ret=%s http=%s %s",
-                j.get("retCode"), r.status_code, str(j)[:200]
-            )
-            # Вернём «пустой, но не None» баланс, чтобы BYBIT хотя бы появился в сообщении
-            return {
-                "asset": "USDT",
-                "equity": 0.0,
-                "wallet": 0.0,
-                "available": 0.0,
-                "uPnL": 0.0,
-                "error": j.get("retCode"),
-            }
-
-        lst = ((j.get("result") or {}).get("list") or [])
-        coins = (lst[0] or {}).get("coin", []) if lst else []
-        row = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
-        equity   = float(row.get("equity") or 0.0)
-        wallet   = float(row.get("walletBalance") or 0.0)
-        avail    = float(row.get("availableToWithdraw") or row.get("availableBalance") or 0.0)
-        unrealPnL= float(row.get("unrealisedPnl") or 0.0)
-        return {"asset":"USDT","equity":equity,"wallet":wallet,"available":avail,"uPnL":unrealPnL}
-    except Exception as e:
-        logging.debug("bybit_unified_usdt_balance err: %s", e)
-        return {"error": True}
-'''
 def bybit_unified_usdt_balance() -> dict:
     """
     Возвращает equity/кошелёк/доступный по USDT на Bybit Unified.
@@ -3602,9 +3535,21 @@ def main():
         price_feed_env = "mainnet"
         logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
 
+                # ===== ЖЁСТКАЯ ПРОВЕРКА BYBIT ПРИ СТАРТЕ =====
+        try:
+            logging.info("[DEBUG] Startup Bybit balance via bybit_unified_usdt_balance()")
+            bal = bybit_unified_usdt_balance()
+            logging.info("[DEBUG] bybit_unified_usdt_balance() -> %s", bal)
+        except Exception as e:
+            logging.exception("[DEBUG] bybit_unified_usdt_balance() startup error: %s", e)
 
-        price_feed_env = "mainnet"
-        logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
+        try:
+            logging.info("[DEBUG] Startup Bybit auth via _check_bybit_auth()")
+            ok = _check_bybit_auth()
+            logging.info("[DEBUG] _check_bybit_auth() -> %s", ok)
+        except Exception as e:
+            logging.exception("[DEBUG] _check_bybit_auth() startup error: %s", e)
+        # ==============================================
 
         # === проверка согласованности окружений ===
         #if len(set(per_env.values())) > 1:
