@@ -2403,8 +2403,20 @@ def bybit_unified_usdt_balance() -> dict:  # NEW
         r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         j = r.json()
         if r.status_code != 200 or j.get("retCode") != 0:
-            logging.debug("bybit_unified_usdt_balance ret=%s http=%s %s", j.get("retCode"), r.status_code, str(j)[:200])
-            return {}
+            logging.warning(
+                "bybit_unified_usdt_balance ret=%s http=%s %s",
+                j.get("retCode"), r.status_code, str(j)[:200]
+            )
+            # Вернём «пустой, но не None» баланс, чтобы BYBIT хотя бы появился в сообщении
+            return {
+                "asset": "USDT",
+                "equity": 0.0,
+                "wallet": 0.0,
+                "available": 0.0,
+                "uPnL": 0.0,
+                "error": j.get("retCode"),
+            }
+
         lst = ((j.get("result") or {}).get("list") or [])
         coins = (lst[0] or {}).get("coin", []) if lst else []
         row = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
@@ -2916,13 +2928,10 @@ def positions_once(
                                 )
                             if by:
                                 demo_tag = " (demo)" if _is_true("BYBIT_DEMO", False) else ""
-                                if by.get("error"):
-                                    pnl_lines.append("   BYBIT (demo): ошибка при чтении баланса")
-                                else:
-                                    pnl_lines.append(
-                                        f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
-                                        f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
-                                    )
+                                pnl_lines.append(
+                                    f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
+                                    f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
+                                )
                             if ok:
                                 sim_tag = " (paper)" if _is_true("OKX_PAPER", False) or _is_true("OKX_TESTNET", False) else ""
                                 pnl_lines.append(
