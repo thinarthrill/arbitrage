@@ -557,36 +557,261 @@ def _http_ok(url: str, params: dict|None=None, expect_key: str|None=None) -> boo
 
 def check_connectivity(exchanges: list[str], probe_symbol: str="BTCUSDT") -> bool:
     """
-    Возвращает True, если все выбранные биржи отвечают. Иначе — False.
-    Для простоты дергаем лёгкие публичные эндпоинты.
+    Возвращает True, если все выбранные биржи отвечают.
+    Дополнительно пытается вывести USDT-баланс по каждому доступному аккаунту.
     """
     ok_all = True
+    probe_symbol = probe_symbol.upper()
+
     for ex in exchanges:
         ex_l = ex.lower().strip()
+
+        # -------------------------------
+        # BINANCE
+        # -------------------------------
         if ex_l == "binance":
-            base = binance_data_base()
-            ok = _http_ok(f"{base}/fapi/v1/time") and _http_ok(f"{base}/fapi/v1/ticker/bookTicker", {"symbol": probe_symbol})
-            logging.info("[CHECK] Binance (%s) -> %s", "testnet" if "testnet" in base else "mainnet", "OK" if ok else "FAIL")
+            data_base = binance_data_base()
+            ok = (
+                _http_ok(f"{data_base}/fapi/v1/time")
+                and _http_ok(f"{data_base}/fapi/v1/ticker/bookTicker", {"symbol": probe_symbol})
+            )
+            env_label = "testnet" if "testnet" in data_base else "mainnet"
+            logging.info("[CHECK] Binance (%s) -> %s", env_label, "OK" if ok else "FAIL")
+
+            # Баланс Binance Futures (если заданы ключи)
+            key = os.getenv("BINANCE_API_KEY", "")
+            sec = os.getenv("BINANCE_API_SECRET", "")
+            if not key or not sec:
+                logging.info("[BALANCE] Binance USDT: (no API keys)")
+            else:
+                bal = "-"
+                try:
+                    base = _private_base("binance")
+                    ts = now_ms()
+                    qs = f"timestamp={ts}&recvWindow=20000"
+                    sig = _hmac_sha256_hex(sec, qs)
+                    headers = {"X-MBX-APIKEY": key}
+                    url = f"{base}/fapi/v2/balance?{qs}&signature={sig}"
+                    r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        j = r.json()
+                        if isinstance(j, list):
+                            usdt = next((x for x in j if str(x.get("asset")) == "USDT"), None)
+                            if usdt:
+                                bal = usdt.get("balance", "-")
+                        else:
+                            logging.warning("[CHECK] Binance balance: unexpected JSON %s", str(j)[:200])
+                    else:
+                        logging.warning("[CHECK] Binance balance HTTP %s: %s", r.status_code, r.text[:200])
+                except Exception as e:
+                    logging.warning("[CHECK] Binance balance error: %s", e)
+                logging.info("[BALANCE] Binance USDT: %s", bal)
+
             ok_all &= ok
-        elif ex_l == "bybit":
-            base = bybit_data_base()
-            ok = _http_ok(f"{base}/v5/market/tickers", {"category":"linear","symbol":probe_symbol}, expect_key="result")
-            logging.info("[CHECK] Bybit (%s) -> %s", "testnet" if "testnet" in base else "mainnet", "OK" if ok else "FAIL")
+            continue
+
+        # -------------------------------
+        # BYBIT
+        # -------------------------------
+        if ex_l == "bybit":
+            data_base = bybit_data_base()
+            ok = _http_ok(
+                f"{data_base}/v5/market/tickers",
+                {"category": "linear", "symbol": probe_symbol},
+                expect_key="result",
+            )
+            env_label = "demo" if "api-demo" in data_base else ("testnet" if "testnet" in data_base else "mainnet")
+            logging.info("[CHECK] Bybit (%s) -> %s", env_label, "OK" if ok else "FAIL")
+
+            key = os.getenv("BYBIT_API_KEY", "")
+            sec = os.getenv("BYBIT_API_SECRET", "")
+            if not key or not sec:
+                logging.info("[BALANCE] Bybit USDT: (no API keys)")
+            else:
+                bal = "-"
+                try:
+                    base = _private_base("bybit")
+                    endpoint = "/v5/account/wallet-balance"
+                    params = "accountType=UNIFIED"
+                    if _is_true("BYBIT_DEMO", False):
+                        params += "&simulateTrading=true"
+                    recv = "20000"
+                    ts = str(now_ms())
+                    pre_sign = ts + key + recv + params
+                    sign = _hmac_sha256_hex(sec, pre_sign)
+                    url = f"{base}{endpoint}?{params}&timestamp={ts}&recvWindow={recv}&sign={sign}"
+                    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        j = r.json()
+                        if str(j.get("retCode")) == "0":
+                            data = ((j.get("result") or {}).get("list") or [])
+                            coins = (data[0] or {}).get("coin", []) if data else []
+                            usdt = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
+                            bal = usdt.get("walletBalance", "-")
+                        else:
+                            logging.warning("[CHECK] Bybit balance retCode=%s, msg=%s",
+                                            j.get("retCode"), j.get("retMsg"))
+                    else:
+                        logging.warning("[CHECK] Bybit balance HTTP %s: %s",
+                                        r.status_code, r.text[:200])
+                except Exception as e:
+                    logging.warning("[CHECK] Bybit balance error: %s", e)
+                logging.info("[BALANCE] Bybit USDT: %s", bal)
+
             ok_all &= ok
-        elif ex_l == "okx":
+            continue
+
+        # -------------------------------
+        # OKX
+        # -------------------------------
+        if ex_l == "okx":
             ok = _http_ok("https://www.okx.com/api/v5/public/time")
-            logging.info("[CHECK] OKX (mainnet) -> %s", "OK" if ok else "FAIL")
+            env_label = "demo" if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False) else "mainnet"
+            logging.info("[CHECK] OKX (%s) -> %s", env_label, "OK" if ok else "FAIL")
+
+            key = os.getenv("OKX_API_KEY", "")
+            sec = os.getenv("OKX_API_SECRET", "")
+            passphrase = os.getenv("OKX_PASSPHRASE", "")
+            if not key or not sec or not passphrase:
+                logging.info("[BALANCE] OKX USDT: (no API keys)")
+            else:
+                bal = "-"
+                try:
+                    base = okx_base()
+                    endpoint = "/api/v5/account/balance"
+                    ts = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                    method = "GET"
+                    body = ""
+                    prehash = f"{ts}{method}{endpoint}{body}"
+                    sign = base64.b64encode(
+                        hmac.new(sec.encode(), prehash.encode(), hashlib.sha256).digest()
+                    ).decode()
+                    headers = {
+                        "OK-ACCESS-KEY": key,
+                        "OK-ACCESS-SIGN": sign,
+                        "OK-ACCESS-TIMESTAMP": ts,
+                        "OK-ACCESS-PASSPHRASE": passphrase,
+                        "x-simulated-trading": "1"
+                            if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False)
+                            else "0",
+                    }
+                    url = f"{base}{endpoint}"
+                    r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        j = r.json()
+                        data = j.get("data") or []
+                        details = (data[0] or {}).get("details", []) if data else []
+                        usdt_row = next((x for x in details if x.get("ccy") == "USDT"), None)
+                        if usdt_row:
+                            bal = usdt_row.get("cashBal") or usdt_row.get("eq", "-")
+                    else:
+                        logging.warning("[CHECK] OKX balance HTTP %s: %s",
+                                        r.status_code, r.text[:200])
+                except Exception as e:
+                    logging.warning("[CHECK] OKX balance error: %s", e)
+                logging.info("[BALANCE] OKX USDT: %s", bal)
+
             ok_all &= ok
-        elif ex_l == "gate":
-            ok = _http_ok("https://api.gateio.ws/api/v4/futures/usdt/tickers", {"contract": "BTC_USDT"})
-            logging.info("[CHECK] Gate (mainnet) -> %s", "OK" if ok else "FAIL")
+            continue
+
+        # -------------------------------
+        # GATE
+        # -------------------------------
+        if ex_l == "gate":
+            base_pub = gate_base()
+            ok = _http_ok(
+                f"{base_pub}/api/v4/futures/usdt/tickers",
+                {"contract": "BTC_USDT"},
+            )
+            env_label = "testnet" if "api-testnet" in base_pub else "mainnet"
+            logging.info("[CHECK] Gate (%s) -> %s", env_label, "OK" if ok else "FAIL")
+
+            key = os.getenv("GATE_API_KEY", "")
+            sec = os.getenv("GATE_API_SECRET", "")
+            if not key or not sec:
+                logging.info("[BALANCE] Gate USDT: (no API keys)")
+            else:
+                bal = "-"
+                try:
+                    method = "GET"
+                    path = "/api/v4/futures/usdt/accounts"
+                    query = ""
+                    body = ""
+                    ts = str(int(time.time()))
+                    body_hash = hashlib.sha512(body.encode()).hexdigest()
+                    msg = "\n".join([method, path, query, body_hash, ts])
+                    sign = _hmac_sha512_hex(sec, msg)
+                    headers = {
+                        "KEY": key,
+                        "Timestamp": ts,
+                        "SIGN": sign,
+                    }
+                    url = f"{gate_base()}{path}"
+                    r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        j = r.json()
+                        if isinstance(j, dict):
+                            # у Gate futures в ответе есть поле available
+                            bal = j.get("available", "-")
+                    else:
+                        logging.warning("[CHECK] Gate balance HTTP %s: %s",
+                                        r.status_code, r.text[:200])
+                except Exception as e:
+                    logging.warning("[CHECK] Gate balance error: %s", e)
+                logging.info("[BALANCE] Gate USDT: %s", bal)
+
             ok_all &= ok
-        elif ex_l == "mexc":
-            ok = _http_ok(f"https://contract.mexc.com/api/v1/contract/depth/{probe_symbol.replace('USDT','_USDT')}", {"limit":1})
+            continue
+
+        # -------------------------------
+        # MEXC
+        # -------------------------------
+        if ex_l == "mexc":
+            ok = _http_ok(
+                f"https://contract.mexc.com/api/v1/contract/depth/{probe_symbol.replace('USDT','_USDT')}",
+                {"limit": 1},
+            )
             logging.info("[CHECK] MEXC (mainnet) -> %s", "OK" if ok else "FAIL")
+
+            key = os.getenv("MEXC_API_KEY", "")
+            sec = os.getenv("MEXC_API_SECRET", "")
+            if not key or not sec:
+                logging.info("[BALANCE] MEXC USDT: (no API keys)")
+            else:
+                bal = "-"
+                try:
+                    base = "https://contract.mexc.com"
+                    endpoint = "/api/v1/private/account/asset"
+                    rt = str(now_ms())
+                    query = ""
+                    string_to_sign = rt + key + query
+                    sign = _hmac_sha256_hex(sec, string_to_sign)
+                    headers = {
+                        "ApiKey": key,
+                        "Request-Time": rt,
+                        "Signature": sign,
+                    }
+                    url = f"{base}{endpoint}"
+                    r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        j = r.json()
+                        data = j.get("data") or {}
+                        bal = data.get("usdtBalance", "-")
+                    else:
+                        logging.warning("[CHECK] MEXC balance HTTP %s: %s",
+                                        r.status_code, r.text[:200])
+                except Exception as e:
+                    logging.warning("[CHECK] MEXC balance error: %s", e)
+                logging.info("[BALANCE] MEXC USDT: %s", bal)
+
             ok_all &= ok
-        else:
-            logging.warning("[CHECK] %s: не поддержана проверка коннекта — пропускаю", ex)
+            continue
+
+        # -------------------------------
+        # UNKNOWN
+        # -------------------------------
+        logging.warning("[CHECK] %s: не поддержана проверка коннекта — пропускаю", ex)
+
     return ok_all
 
 # ----------------- AUTH connectivity checks (private endpoints) -----------------
@@ -653,8 +878,25 @@ def _check_bybit_auth() -> bool:
             return False
         j = r.json()
         if j.get("retCode") == 0:
-            logging.info("[AUTH] Bybit OK (wallet-balance)")
+            data = ((j.get("result") or {}).get("list") or [])
+            coins = (data[0] or {}).get("coin", []) if data else []
+            usdt = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
+
+            equity = float(usdt.get("equity") or 0.0)
+            wallet = float(usdt.get("walletBalance") or 0.0)
+            avail  = float(
+                usdt.get("availableToWithdraw")
+                or usdt.get("availableBalance")
+                or 0.0
+            )
+            upnl   = float(usdt.get("unrealisedPnl") or 0.0)
+
+            logging.info(
+                "[AUTH] Bybit OK — equity=%.2f, wallet=%.2f, available=%.2f, uPnL=%.2f",
+                equity, wallet, avail, upnl
+            )
             return True
+
         logging.error("[AUTH] Bybit FAIL retCode=%s: %s", j.get("retCode"), j.get("retMsg"))
         return False
     except Exception as e:
@@ -2375,12 +2617,8 @@ def binance_usdt_futures_balance() -> dict:  # NEW
     except Exception as e:
         logging.debug("binance_usdt_futures_balance err: %s", e)
         return {}
-
+'''
 def bybit_unified_usdt_balance() -> dict:  # NEW
-    """
-    Возвращает equity/кошелёк/доступный по USDT на Bybit Unified.
-    Учитывает BYBIT_DEMO=1 (simulateTrading).
-    """
     key = getenv_str("BYBIT_API_KEY","")
     sec = getenv_str("BYBIT_API_SECRET","")
     if not key or not sec:
@@ -2428,7 +2666,77 @@ def bybit_unified_usdt_balance() -> dict:  # NEW
     except Exception as e:
         logging.debug("bybit_unified_usdt_balance err: %s", e)
         return {"error": True}
+'''
+def bybit_unified_usdt_balance() -> dict:
+    """
+    Возвращает equity/кошелёк/доступный по USDT на Bybit Unified.
+    Учитывает BYBIT_DEMO=1 (simulateTrading).
+    """
+    key = getenv_str("BYBIT_API_KEY", "")
+    sec = getenv_str("BYBIT_API_SECRET", "")
+    if not key or not sec:
+        logging.warning("BYBIT_API_KEY или BYBIT_API_SECRET не заданы, возвращаю пустой dict")
+        return {}
 
+    base = _private_base("bybit")
+    endpoint = "/v5/account/wallet-balance"
+    params = "accountType=UNIFIED"
+    if _is_true("BYBIT_DEMO", False):
+        params += "&simulateTrading=true"
+
+    recv = "5000"
+    ts = str(now_ms())
+
+    # ВАЖНО: формат подписи как в рабочем тесте
+    prehash = ts + key + recv + params  # GET: ts+apiKey+recvWindow+query
+    sign = _hmac_sha256_hex(sec, prehash)
+
+    headers = {
+        "X-BAPI-API-KEY": key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+    }
+    if _is_true("BYBIT_DEMO", False):
+        headers["X-BAPI-SIMULATED-TRADING"] = "1"
+
+    url = f"{base}{endpoint}?{params}"
+    try:
+        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        if r.status_code != 200 or j.get("retCode") != 0:
+            logging.warning(
+                "bybit_unified_usdt_balance ret=%s http=%s %s",
+                j.get("retCode"), r.status_code, str(j)[:200]
+            )
+            return {}
+
+        lst = ((j.get("result") or {}).get("list") or [])
+        coins = (lst[0] or {}).get("coin", []) if lst else []
+        row = next((c for c in coins if str(c.get("coin")) == "USDT"), {})
+
+        equity   = float(row.get("equity") or 0.0)
+        wallet   = float(row.get("walletBalance") or 0.0)
+        avail    = float(
+            row.get("availableToWithdraw")
+            or row.get("availableBalance")
+            or 0.0
+        )
+        unrealPnL = float(row.get("unrealisedPnl") or 0.0)
+
+        return {
+            "asset": "USDT",
+            "equity": equity,
+            "wallet": wallet,
+            "available": avail,
+            "uPnL": unrealPnL,
+        }
+
+    except Exception as e:
+        logging.debug("bybit_unified_usdt_balance err: %s", e)
+        return {}
+    
 def okx_usdt_balance() -> dict:  # NEW
     """
     Баланс USDT на OKX (унифицированный аккаунт).
