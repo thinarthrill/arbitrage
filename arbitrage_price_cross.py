@@ -1818,7 +1818,12 @@ def scan_all_with_instant_alerts(
                     }
 
             # --- 2) Если bulk выключен или для этой биржи/символа данных нет — старый путь ---
+            # --- 2) Fallback отключён, если включён bulk ---
             if r is None:
+                if use_bulk:
+                    # bulk включён → НЕ делаем построчные запросы
+                    continue
+                # старый fallback, если bulk выключен
                 if ex == "binance":
                     r = binance_quote(sym, price_source)
                 elif ex == "bybit":
@@ -1829,8 +1834,6 @@ def scan_all_with_instant_alerts(
                     r = mexc_quote(sym, price_source)
                 elif ex == "gate":
                     r = gate_quote(sym, price_source)
-                else:
-                    r = None
 
             if r:
                 rows_all.append(r)
