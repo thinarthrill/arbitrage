@@ -221,6 +221,37 @@ def _bulk_gate():
     except Exception:
         logging.exception("Gate bulk tickers failed")
         return {}
+def _bulk_okx():
+    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+    try:
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logging.warning("OKX bulk tickers HTTP %s: %s", r.status_code, r.text[:200])
+            return {}
+        data = r.json().get("data", [])
+        out = {}
+        for j in data:
+            inst = j.get("instId", "")
+            if not inst.endswith("-USDT-SWAP"):
+                continue
+            sym = inst.replace("-", "").replace("SWAP", "")
+            bid = float(j.get("bidPx") or 0)
+            ask = float(j.get("askPx") or 0)
+            mark = float(j.get("markPx") or 0) if j.get("markPx") else None
+            last = float(j.get("last", 0)) if j.get("last") else None
+            if bid <= 0 or ask <= 0:
+                continue
+            out[sym.upper()] = {
+                "bid": bid,
+                "ask": ask,
+                "mark": mark,
+                "last": last,
+            }
+        logging.debug("OKX bulk loaded %d contracts", len(out))
+        return out
+    except Exception:
+        logging.exception("OKX bulk tickers failed")
+        return {}
 
 def load_all_bulk_quotes(exchanges):
     quotes = {}
