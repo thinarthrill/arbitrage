@@ -1810,7 +1810,26 @@ def try_instant_open(best: dict, per_leg_notional_usd: float, taker_fee: float, 
             maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best, per_leg_notional_usd, price_source))
             return True
         else:
-            logging.warning("Instant open failed: %s", meta.get("error"))
+            err = str(meta.get("error") or "unknown")
+            logging.warning("Instant open failed for %s: %s", sym, err)
+
+            # Если включён DEBUG_INSTANT_OPEN, отправляем причину в Telegram
+            if getenv_bool("DEBUG_INSTANT_OPEN", False):
+                try:
+                    price_source = getenv_str("PRICE_SOURCE", "mid")
+                    card = format_signal_card(best, per_leg_notional_usd, price_source)
+                except Exception:
+                    card = ""
+                msg = (
+                    "⚠️ <b>OPEN FAILED</b>\n"
+                    f"{sym} {cheap_ex.upper()} ↔ {rich_ex.upper()}\n"
+                    f"Причина: <code>{err}</code>"
+                )
+                # если карточка собралась – приклеим её ниже
+                if card:
+                    msg = msg + "\n\n" + card
+                maybe_send_telegram(msg)
+
             return False
     finally:
         open_lock_clear()
@@ -3865,7 +3884,23 @@ def positions_once(
                 maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best, per_leg_notional_usd, price_source))
                 open_lock_clear()
             else:
-                logging.warning("Open failed: %s", meta.get("error"))
+                err = str(meta.get("error") or "unknown")
+                logging.warning("Open failed: %s", err)
+
+                if getenv_bool("DEBUG_INSTANT_OPEN", False):
+                    try:
+                        card = format_signal_card(best, per_leg_notional_usd, price_source)
+                    except Exception:
+                        card = ""
+                    msg = (
+                        "⚠️ <b>OPEN FAILED</b>\n"
+                        f"{sym} {cheap_ex.upper()} ↔ {rich_ex.upper()}\n"
+                        f"Причина: <code>{err}</code>"
+                    )
+                    if card:
+                        msg = msg + "\n\n" + card
+                    maybe_send_telegram(msg)
+
                 open_lock_clear()
     save_positions(pos_path, df_pos)
 
