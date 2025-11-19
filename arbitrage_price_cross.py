@@ -1665,6 +1665,8 @@ def scan_all_with_instant_alerts(
 
     stats_df = read_spread_stats()
     SLIPPAGE_BPS = float(getenv_float("SLIPPAGE_BPS", 1.0))
+    use_bulk = getenv_bool("USE_BULK_QUOTES", False)
+    bulk_quotes = load_all_bulk_quotes(exchanges) if use_bulk else {}
 
     for sym in symbols:
         per_symbol_rows = []
@@ -1678,18 +1680,61 @@ def scan_all_with_instant_alerts(
                 if allowed and sym_u not in allowed:
                     continue
 
-            if ex == "binance":
-                r = binance_quote(sym, price_source)
-            elif ex == "bybit":
-                r = bybit_quote(sym, price_source)
-            elif ex == "okx":
-                r = okx_quote(sym, price_source)
-            elif ex == "mexc":
-                r = mexc_quote(sym, price_source)
-            elif ex == "gate":
-                r = gate_quote(sym, price_source)
-            else:
-                r = None
+            r = None
+
+            # --- 1) Пытаемся взять котировку из bulk ---
+            if use_bulk and ex in ("binance", "bybit", "okx", "gate"):
+                q_ex = bulk_quotes.get(ex, {})
+                q = q_ex.get(sym_u)
+                if q:
+                    bid = q.get("bid")
+                    ask = q.get("ask")
+                    mark = q.get("mark")
+                    last = q.get("last")
+                    mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+
+                    # Эмулируем ту же логику price_source, что и в *quote-функциях
+                    ps = (price_source or "mid").lower()
+                    if ps == "bid":
+                        ask = last = mark = None
+                    elif ps == "ask":
+                        bid = last = mark = None
+                    elif ps == "last":
+                        bid = ask = mid = mark = None
+                    elif ps == "mark":
+                        bid = ask = mid = last = None
+                    elif ps == "mid":
+                        last = mark = None
+                    elif ps == "book":
+                        # чисто best bid/ask
+                        last = mark = mid = None
+
+                    r = {
+                        "exchange": ex,
+                        "symbol": sym_u,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": mid,
+                        "last": last,
+                        "mark": mark,
+                        "ts": utc_ms_now(),
+                    }
+
+            # --- 2) Если bulk выключен или для этой биржи/символа данных нет — старый путь ---
+            if r is None:
+                if ex == "binance":
+                    r = binance_quote(sym, price_source)
+                elif ex == "bybit":
+                    r = bybit_quote(sym, price_source)
+                elif ex == "okx":
+                    r = okx_quote(sym, price_source)
+                elif ex == "mexc":
+                    r = mexc_quote(sym, price_source)
+                elif ex == "gate":
+                    r = gate_quote(sym, price_source)
+                else:
+                    r = None
+
             if r:
                 rows_all.append(r)
                 per_symbol_rows.append(r)
@@ -3924,34 +3969,18 @@ def main():
 
     while True:
         try:
-            if use_bulk:
-                # НОВЫЙ bulk-сканер
-                quotes_df = scan_spreads_once(
-                    exchanges=exchanges,
-                    symbols=symbols,
-                    per_leg_notional_usd=per_leg_notional,
-                    taker_fee=taker_fee,
-                    price_source=price_source,
-                    alert_spread_pct=ALERT_SPREAD_PCT,
-                    cooldown_sec=ALERT_COOLDOWN_SEC,
-                    instant_open=True,
-                    pos_path_for_instant=pos_cross_path,
-                    paper=paper,
-                )
-            else:
-                # СТАРЫЙ вариант — на всякий случай, чтобы можно было откатиться
-                quotes_df = scan_all_with_instant_alerts(
-                    exchanges=exchanges,
-                    symbols=symbols,
-                    per_leg_notional_usd=per_leg_notional,
-                    taker_fee=taker_fee,
-                    price_source=price_source,
-                    alert_spread_pct=ALERT_SPREAD_PCT,
-                    cooldown_sec=ALERT_COOLDOWN_SEC,
-                    instant_open=True,
-                    pos_path_for_instant=pos_cross_path,
-                    paper=paper,
-                )
+            quotes_df = scan_all_with_instant_alerts(
+                exchanges=exchanges,
+                symbols=symbols,
+                per_leg_notional_usd=per_leg_notional,
+                taker_fee=taker_fee,
+                price_source=price_source,
+                alert_spread_pct=ALERT_SPREAD_PCT,
+                cooldown_sec=ALERT_COOLDOWN_SEC,
+                instant_open=True,
+                pos_path_for_instant=pos_cross_path,
+                paper=paper,
+            )
 
             # ---- ОБНОВЛЯЕМ EMA-статистику из свежих котировок (на лету) ----
             # Берём по каждому символу все доступные биржи в quotes_df и считаем лог-спред для каждой пары.
