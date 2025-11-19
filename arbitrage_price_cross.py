@@ -1788,7 +1788,14 @@ def scan_spreads_once(
     taker_fee,
     pos_path,
     price_stats_path,
-    debug=False
+    debug: bool = False,
+    *,
+    price_source: str = "mid",
+    alert_spread_pct: float = 0.5,
+    cooldown_sec: int = 60,
+    instant_open: bool = True,
+    pos_path_for_instant: Optional[str] = None,
+    paper: Optional[bool] = None,
 ):
     """
     Быстрый цикл сканирования, использующий bulk-тickers для Binance, Bybit, OKX, Gate.
@@ -3922,8 +3929,13 @@ def main():
                 quotes_df = scan_spreads_once(
                     exchanges=exchanges,
                     symbols=symbols,
+                    spread_bps_min=ENTRY_BPS_MIN,
+                    spread_bps_max=EXIT_BPS_MAX,
                     per_leg_notional_usd=per_leg_notional,
                     taker_fee=taker_fee,
+                    pos_path=pos_cross_path,
+                    price_stats_path=spread_stats_path,
+                    debug=True,
                     price_source=price_source,
                     alert_spread_pct=ALERT_SPREAD_PCT,
                     cooldown_sec=ALERT_COOLDOWN_SEC,
