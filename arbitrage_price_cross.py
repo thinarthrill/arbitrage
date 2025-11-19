@@ -3929,13 +3929,8 @@ def main():
                 quotes_df = scan_spreads_once(
                     exchanges=exchanges,
                     symbols=symbols,
-                    spread_bps_min=ENTRY_BPS_MIN,
-                    spread_bps_max=EXIT_BPS_MAX,
                     per_leg_notional_usd=per_leg_notional,
                     taker_fee=taker_fee,
-                    pos_path=pos_cross_path,
-                    price_stats_path=spread_stats_path,
-                    debug=True,
                     price_source=price_source,
                     alert_spread_pct=ALERT_SPREAD_PCT,
                     cooldown_sec=ALERT_COOLDOWN_SEC,
