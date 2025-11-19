@@ -580,8 +580,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     price_lbl = {"mid":"MID","last":"LAST","mark":"MARK","bid":"BID","ask":"ASK","book":"BBO"}.get(price_source.lower(),"MID")
-    z = r.get("z", None)
-    std = r.get("std", None)
+    z          = r.get("z", None)
+    std        = r.get("std", None)
     net_usd_adj = r.get("net_usd_adj", None)
 
     lines = [
@@ -589,16 +589,24 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"<b>{sym}</b>",
         f"{_anchor(long_ex, sym)} BUY  ↔  {_anchor(short_ex, sym)} SELL",
     ]
+
+    # Net after slippage
     if net_usd_adj is not None:
         lines.append(f"🧮 Net after slippage: ${float(net_usd_adj):.2f}")
+
+    # Z / σ
     if z is not None and z == z:  # not NaN
         if std is not None and std == std:
             lines.append(f"\n📈 <code>Z-score: {float(z):.2f} (σ={float(std):.2f})</code>")
         else:
             lines.append(f"\n📈 <code>Z-score: {float(z):.2f}</code>")
 
-    if r.get("entry_bps_sugg") is not None:
-        lines.append(f"\n🎯 <code>Entry ≥ {float(r['entry_bps_sugg']):.0f} bps</code>")
+    # Локальный entry-порог по спреду (если есть)
+    entry_bps_sugg = r.get("entry_bps_sugg")
+    if entry_bps_sugg is not None:
+        lines.append(f"\n🎯 <code>Entry ≥ {float(entry_bps_sugg):.0f} bps</code>")
+
+    # Основные метрики
     lines.extend([
         f"\n🧮 SPREAD: {sp_pct:.2f}% ({sp_bps:.0f} bps)",
         f"💵 Gross: ${gross:.2f}",
@@ -607,8 +615,74 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"📊 Prices [{price_lbl}]",
         f"   Low @ {long_ex}:  {px_low:.6f}",
         f"   High @ {short_ex}: {px_high:.6f}",
-        f"🕒 {ts}"
+        f"🕒 {ts}",
     ])
+
+    # ==============================
+    #  Блок с галочками и крестиками
+    # ==============================
+    if getenv_bool("SHOW_ENTRY_FILTERS", False):
+        # режим открытия
+        entry_mode = getenv_str("ENTRY_MODE", "price").lower()
+        if entry_mode not in ("zscore", "price"):
+            entry_mode = "price"
+
+        # локальные пороги
+        try:
+            z_in_loc = float(r.get("z_in_loc") or getenv_float("Z_IN", 2.5))
+        except Exception:
+            z_in_loc = float(getenv_float("Z_IN", 2.5))
+
+        try:
+            entry_bps = float(entry_bps_sugg or sp_bps)
+        except Exception:
+            entry_bps = sp_bps
+
+        std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+
+        # условия
+        eco_ok = (net_usd_adj is not None) and (float(net_usd_adj) > 0.0)
+        spread_ok = sp_bps >= entry_bps
+        z_ok = (z is not None) and (z == z) and (float(z) >= z_in_loc)
+        std_ok = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
+
+        def _flag(ok: bool) -> str:
+            return "✅" if ok else "❌"
+
+        lines.append("\n\n⚙️ <b>ENTRY FILTERS</b>")
+
+        # eco_ok
+        if net_usd_adj is not None:
+            lines.append(
+                f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} {'>' if eco_ok else '<='} 0"
+            )
+        else:
+            lines.append(f"{_flag(False)} eco_ok   · net_adj is None")
+
+        # spread_ok
+        lines.append(
+            f"{_flag(spread_ok)} spread_ok · {sp_bps:.0f} bps ≥ {entry_bps:.0f} bps"
+        )
+
+        # только в режиме zscore имеет смысл показывать z_ok и std_ok как фильтры
+        if entry_mode == "zscore":
+            if z is not None and z == z:
+                lines.append(
+                    f"{_flag(z_ok)} z_ok      · z={float(z):.2f} ≥ {z_in_loc:.2f}"
+                )
+            else:
+                lines.append(f"{_flag(False)} z_ok      · z is NaN")
+
+            if std is not None and std == std:
+                lines.append(
+                    f"{_flag(std_ok)} std_ok    · σ={float(std):.4f} ≥ {std_min_for_open:.4f}"
+                )
+            else:
+                lines.append(f"{_flag(False)} std_ok    · σ is NaN")
+
+        # маленький хвостик: режим
+        lines.append(f"\n🔧 mode: {entry_mode}")
+
     return "\n".join(lines)
 
 def maybe_send_telegram(text: str) -> None:
@@ -1857,7 +1931,11 @@ def scan_all_with_instant_alerts(
 
         Z_IN_LOC  = float(z_in_loc)
         entry_bps = float(entry_bps_sugg)
+
+        # сохраняем локальный порог Z и спреда внутрь best, чтобы отрисовать в карточке
+        best["z_in_loc"]       = Z_IN_LOC
         best["entry_bps_sugg"] = entry_bps  # показываем в карточке, что именно используем
+
 
         # Считаем Z и экономику (всегда), чтобы решить вопрос об ОТКРЫТИИ
         _, z, std = get_z_for_pair(
