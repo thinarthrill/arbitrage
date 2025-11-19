@@ -95,34 +95,62 @@ def _bulk_bybit():
         traceback.print_exc()
         return {}
 
-def _bulk_okx():
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+def _bulk_gate():
+    base = gate_base()  # важно: используем ту же базу, что и для ордеров (mainnet/testnet)
+    url = f"{base}/api/v4/futures/usdt/tickers"
     try:
         r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
+            logging.warning("Gate bulk tickers HTTP %s: %s", r.status_code, r.text[:200])
             return {}
-        data = r.json().get("data", [])
+
+        data = r.json()
+
+        # На успешном ответе Gate возвращает список, на ошибке — dict с label/message
+        if isinstance(data, dict):
+            logging.warning("Gate bulk tickers unexpected dict: %s", str(data)[:200])
+            return {}
+
         out = {}
+        skipped = 0
+
         for j in data:
-            inst = j.get("instId", "")
-            if not inst.endswith("-USDT-SWAP"):
+            inst = j.get("contract")
+            if not inst or not inst.endswith("_USDT"):
                 continue
-            sym = inst.replace("-", "").replace("SWAP", "")
-            bid = float(j["bidPx"])
-            ask = float(j["askPx"])
-            mark = float(j.get("markPx", 0)) if j.get("markPx") else None
-            last = float(j.get("last", 0)) if j.get("last") else None
+
+            # Gate futures: ключи bid1 / ask1
+            try:
+                bid = float(j.get("bid1"))
+                ask = float(j.get("ask1"))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+
             if bid <= 0 or ask <= 0:
+                skipped += 1
                 continue
-            out[sym.upper()] = {
+
+            mark = to_float(j.get("mark_price"))
+            last = to_float(j.get("last"))
+
+            sym = inst.replace("_", "").upper()
+            out[sym] = {
                 "bid": bid,
                 "ask": ask,
                 "mark": mark,
-                "last": last
+                "last": last,
             }
+
+        logging.debug(
+            "Gate bulk loaded %d contracts, skipped=%d without valid bid/ask",
+            len(out),
+            skipped,
+        )
         return out
-    except:
-        traceback.print_exc()
+
+    except Exception:
+        logging.exception("Gate bulk tickers failed")
         return {}
 
 def _bulk_gate():
@@ -2288,19 +2316,31 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             hmac.new(sec.encode(), prehash.encode(), hashlib.sha256).digest()
         ).decode()
 
+        # demo/testnet для OKX определяется заголовком x-simulated-trading
+        sim_flag = "1" if (_is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False)) else "0"
+
         headers = {
             "OK-ACCESS-KEY": key,
             "OK-ACCESS-SIGN": sign,
             "OK-ACCESS-TIMESTAMP": ts,
             "OK-ACCESS-PASSPHRASE": passphrase,
             "Content-Type": "application/json",
-            # demo-режим: x-simulated-trading=1 для тестовых ключей
-            "x-simulated-trading": "1" if os.getenv("OKX_TESTNET", "0").lower() in ("1", "true", "t", "yes") else "0",
+            "x-simulated-trading": sim_flag,
         }
 
         url = f"{base}{path}"
+        logging.info(
+            "[OKX] NEW ORDER instId=%s side=%s qty=%s tdMode=%s sim=%s",
+            inst_id, side.upper(), qty, td_mode, sim_flag,
+        )
+        logging.debug("[OKX] Request body: %s", body)
+
         r = SESSION.post(url, headers=headers, data=body, timeout=REQUEST_TIMEOUT)
-        j = r.json()
+        try:
+            j = r.json()
+        except Exception:
+            logging.error("OKX order: non-JSON response http=%s text=%s", r.status_code, r.text[:400])
+            raise RuntimeError(f"OKX order failed: http={r.status_code}, non-JSON response")
 
         if r.status_code != 200 or j.get("code") != "0":
             raise RuntimeError(
