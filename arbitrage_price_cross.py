@@ -126,34 +126,72 @@ def _bulk_okx():
         return {}
 
 def _bulk_gate():
-    base = "https://api.gateio.ws" if not _is_true("GATE_API_TESTNET", False) else "https://api-testnet.gateapi.io"
+    base = gate_base()  # важно: используем ту же базу, что и для ордеров
     url = f"{base}/api/v4/futures/usdt/tickers"
     try:
         r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
+            logging.warning("Gate bulk tickers HTTP %s: %s", r.status_code, r.text[:200])
             return {}
+
         data = r.json()
         out = {}
+        skipped = 0
+
         for j in data:
             inst = j.get("contract")
             if not inst or not inst.endswith("_USDT"):
                 continue
-            sym = inst.replace("_", "")
-            bid = float(j["bid1"])
-            ask = float(j["ask1"])
-            mark = float(j.get("mark_price", 0)) if j.get("mark_price") else None
-            last = float(j.get("last", 0)) if j.get("last") else None
-            if bid <= 0 or ask <= 0:
+
+            # аккуратно достаём bid/ask, т.к. bid1/ask1 может не быть
+            raw_bid = j.get("bid1") or j.get("highest_bid") or j.get("best_bid_price")
+            raw_ask = j.get("ask1") or j.get("lowest_ask") or j.get("best_ask_price")
+
+            if raw_bid is None or raw_ask is None:
+                skipped += 1
                 continue
-            out[sym.upper()] = {
+
+            try:
+                bid = float(raw_bid)
+                ask = float(raw_ask)
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+
+            if bid <= 0 or ask <= 0:
+                skipped += 1
+                continue
+
+            mark = None
+            last = None
+            if j.get("mark_price") not in (None, ""):
+                try:
+                    mark = float(j["mark_price"])
+                except (TypeError, ValueError):
+                    mark = None
+            if j.get("last") not in (None, ""):
+                try:
+                    last = float(j["last"])
+                except (TypeError, ValueError):
+                    last = None
+
+            sym = inst.replace("_", "").upper()
+            out[sym] = {
                 "bid": bid,
                 "ask": ask,
                 "mark": mark,
-                "last": last
+                "last": last,
             }
+
+        logging.debug(
+            "Gate bulk loaded %d contracts, skipped=%d without bid/ask",
+            len(out),
+            skipped,
+        )
         return out
-    except:
-        traceback.print_exc()
+
+    except Exception:
+        logging.exception("Gate bulk tickers failed")
         return {}
 
 def load_all_bulk_quotes(exchanges):
