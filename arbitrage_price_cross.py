@@ -1784,7 +1784,7 @@ def scan_spreads_once(
     symbols,
     spread_bps_min,
     spread_bps_max,
-    notional_usd,
+    per_leg_notional_usd,  # <-- имя параметра совпадает с вызовом
     taker_fee,
     pos_path,
     price_stats_path,
