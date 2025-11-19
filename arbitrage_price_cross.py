@@ -1889,14 +1889,37 @@ def scan_all_with_instant_alerts(
         spread_ok = float(best.get("spread_bps") or 0.0) >= entry_bps
         z_ok      = (z == z) and (z >= Z_IN_LOC)
         eco_ok    = net_usd_adj > 0.0
-        ENTRY_MODE = getenv_str("ENTRY_MODE", "zscore").lower()
-        if ENTRY_MODE not in ("zscore","price"):
-            ENTRY_MODE = "zscore"
+        # === РЕЖИМ ОТКРЫТИЯ ===
+        # По умолчанию теперь открываемся в режиме "price":
+        #   ENTRY_MODE=price  → проверяем только экономику и спред
+        #   ENTRY_MODE=zscore → добавляем фильтры по z и std
+        ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
+        if ENTRY_MODE not in ("zscore", "price"):
+            ENTRY_MODE = "price"
 
         if ENTRY_MODE == "zscore":
             cond_open = instant_open and z_ok and eco_ok and spread_ok and std_ok
         else:  # price
             cond_open = instant_open and eco_ok and spread_ok  # без z и std
+
+        # Опциональный детальный лог, почему не открылись (если нужно дебажить)
+        if not cond_open and getenv_bool("DEBUG_INSTANT_OPEN", False):
+            logging.debug(
+                "INSTANT_OPEN SKIP %s | mode=%s eco_ok=%s spread_ok=%s z_ok=%s std_ok=%s "
+                "net_usd_adj=%.4f z=%.4f std=%.6f spread_bps=%.2f entry_bps=%.2f Z_IN_LOC=%.2f",
+                best.get("symbol"),
+                ENTRY_MODE,
+                eco_ok,
+                spread_ok,
+                z_ok,
+                std_ok,
+                net_usd_adj,
+                z,
+                std,
+                float(best.get("spread_bps") or 0.0),
+                entry_bps,
+                Z_IN_LOC,
+            )
 
         # 1) МГНОВЕННОЕ ОТКРЫТИЕ — теперь НЕ зависит от alert_spread_pct
         if cond_open:
@@ -3334,12 +3357,13 @@ def positions_once(
         ].copy()
 
     # --- читаем статистику спредов и считаем z для кандидатов ---
-        Z_IN  = float(getenv_float("Z_IN", 2.5))
+    Z_IN  = float(getenv_float("Z_IN", 2.5))
     Z_OUT = float(getenv_float("Z_OUT", 0.8))
     SLIPPAGE_BPS = float(getenv_float("SLIPPAGE_BPS", 1.0))  # консервативный запас
-    ENTRY_MODE = getenv_str("ENTRY_MODE", "zscore").lower()
-    if ENTRY_MODE not in ("zscore","price"):
-        ENTRY_MODE = "zscore"
+    # Дефолт выравниваем с bulk-сканером: по умолчанию режим price
+    ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
+    if ENTRY_MODE not in ("zscore", "price"):
+        ENTRY_MODE = "price"
     STD_MIN_FOR_OPEN = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
 
     stats = stats_df if stats_df is not None else pd.DataFrame(columns=STATS_COLS)
