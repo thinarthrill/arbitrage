@@ -3411,18 +3411,80 @@ def positions_once(
         do_close = False
         reason = ""
         i = df_pos.index[df_pos["status"]=="open"][0]
+        
         sym = str(df_pos.at[i,"symbol"]).upper()
-        long_ex = str(df_pos.at[i,"long_ex"]); short_ex = str(df_pos.at[i,"short_ex"])
+        long_ex = str(df_pos.at[i,"long_ex"])
+        short_ex = str(df_pos.at[i,"short_ex"])
 
-        sub = quotes_df[(quotes_df["symbol"]==sym)]
-        px_low = None; px_high=None
-        try:
-            row_low  = sub[sub["exchange"]==long_ex].iloc[0]
-            row_high = sub[sub["exchange"]==short_ex].iloc[0]
-            px_low  = float(select_px(row_low,  getenv_str("PRICE_SOURCE", "mid")) or 0.0)
-            px_high = float(select_px(row_high, getenv_str("PRICE_SOURCE", "mid")) or 0.0)
-        except Exception:
-            pass
+        # --- 1) Пытаемся взять котировки из текущего скана (в т.ч. bulk) ---
+        sub = quotes_df[(quotes_df["symbol"] == sym)]
+        row_low = None
+        row_high = None
+
+        if not sub.empty:
+            try:
+                row_low = sub[sub["exchange"] == long_ex].iloc[0]
+            except Exception:
+                row_low = None
+            try:
+                row_high = sub[sub["exchange"] == short_ex].iloc[0]
+            except Exception:
+                row_high = None
+
+        # --- 2) Если одной из ног нет в quotes_df (типичная ситуация при USE_BULK_QUOTES),
+        #         подтягиваем актуальный BBO прямым запросом только для этой пары.
+        if row_low is None or row_high is None:
+            ps = getenv_str("PRICE_SOURCE", "mid")
+
+            def _single_quote(ex: str, symbol: str):
+                try:
+                    ex_l = ex.lower()
+                    if ex_l == "binance":
+                        return binance_quote(symbol, ps)
+                    if ex_l == "bybit":
+                        return bybit_quote(symbol, ps)
+                    if ex_l == "okx":
+                        return okx_quote(symbol, ps)
+                    if ex_l == "gate":
+                        return gate_quote(symbol, ps)
+                    if ex_l == "mexc":
+                        return mexc_quote(symbol, ps)
+                except Exception as e:
+                    logging.debug(
+                        "positions_once: direct quote failed for %s@%s: %s",
+                        symbol, ex, e
+                    )
+                return None
+
+            if row_low is None:
+                q = _single_quote(long_ex, sym)
+                if q:
+                    # превращаем dict в Series с нужными полями
+                    row_low = pd.Series({"exchange": long_ex, "symbol": sym, **q})
+
+            if row_high is None:
+                q = _single_quote(short_ex, sym)
+                if q:
+                    row_high = pd.Series({"exchange": short_ex, "symbol": sym, **q})
+
+        # --- 3) Если и после фоллбэка котировок нет — пропускаем exit в этом цикле ---
+        px_low = None
+        px_high = None
+        if row_low is None or row_high is None:
+            logging.debug(
+                "positions_once: no quotes for %s (%s/%s) in this cycle — skip exit check",
+                sym, long_ex, short_ex
+            )
+        else:
+            try:
+                ps = getenv_str("PRICE_SOURCE", "mid")
+                px_low = float(select_px(row_low, ps) or 0.0)
+                px_high = float(select_px(row_high, ps) or 0.0)
+            except Exception as e:
+                logging.debug("positions_once: failed to select_px for %s: %s", sym, e)
+                px_low = None
+                px_high = None
+
 
         spread_bps_now = None
         z_now = None
