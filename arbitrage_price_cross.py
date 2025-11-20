@@ -2541,7 +2541,12 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         if reduce_only:
             body_dict["reduce_only"] = True
         if cl_oid:
-            body_dict["text"] = cl_oid
+            # Gate требует, чтобы text начинался с 't-' и был коротким
+            txt = str(cl_oid)
+            if not txt.startswith("t-"):
+                txt = "t-" + txt[:26]  # итого максимум ~28 символов
+            body_dict["text"] = txt
+
 
         body = json.dumps(body_dict, separators=(",", ":"))
 
