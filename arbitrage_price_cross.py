@@ -609,8 +609,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     # Основные метрики
     lines.extend([
         f"\n🧮 SPREAD: {sp_pct:.2f}% ({sp_bps:.0f} bps)",
-        f"💵 Gross: ${gross:.2f}",
-        f"💸 Fees RT: ${fees_rt:.2f}",
+        #f"💵 Gross: ${gross:.2f}",
+        #f"💸 Fees RT: ${fees_rt:.2f}",
         f"✅ Net: ${net_usd:.2f}",
         f"📊 Prices [{price_lbl}]",
         f"   Low @ {long_ex}:  {px_low:.6f}",
@@ -639,7 +639,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             entry_bps = sp_bps
 
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-
+        min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * float(getenv_float("CAPITAL", 100))  # 1% от капитала
         # условия
         eco_ok = (net_usd_adj is not None) and (float(net_usd_adj) > 0.0)
         spread_ok = sp_bps >= entry_bps
@@ -1986,18 +1986,31 @@ def scan_all_with_instant_alerts(
         spread_ok = float(best.get("spread_bps") or 0.0) >= entry_bps
         z_ok      = (z == z) and (z >= Z_IN_LOC)
         eco_ok    = net_usd_adj > 0.0
+
+        # минимальный ожидаемый net в долларах — 1% от CAPITAL
+        capital = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
+
         # === РЕЖИМ ОТКРЫТИЯ ===
-        # По умолчанию теперь открываемся в режиме "price":
         #   ENTRY_MODE=price  → проверяем только экономику и спред
-        #   ENTRY_MODE=zscore → добавляем фильтры по z и std
+        #   ENTRY_MODE=zscore → добавляем фильтры по z, std и минимуму по net
         ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
         if ENTRY_MODE not in ("zscore", "price"):
             ENTRY_MODE = "price"
 
         if ENTRY_MODE == "zscore":
-            cond_open = instant_open and z_ok and eco_ok and spread_ok and std_ok
+            # для zscore-режима требуем ещё и net_usd_adj ≥ 1% от CAPITAL
+            cond_open = (
+                instant_open
+                and z_ok
+                and std_ok
+                and spread_ok
+                and eco_ok
+                and (net_usd_adj >= min_net_abs)
+            )
         else:  # price
-            cond_open = instant_open and eco_ok and spread_ok  # без z и std
+            # price-режим оставляем как был: достаточно положительной экономики и спреда
+            cond_open = instant_open and eco_ok and spread_ok
 
         # Опциональный детальный лог, почему не открылись (если нужно дебажить)
         if not cond_open and getenv_bool("DEBUG_INSTANT_OPEN", False):
@@ -2527,15 +2540,23 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         path = "/api/v4/futures/usdt/orders"
         url = f"{base}{path}"
 
-        # В Gate size > 0 = long, size < 0 = short
-        size = float(qty)
+        # В Gate size — ЦЕЛОЕ число контрактов (int64), >0 = long, <0 = short
+        raw_qty = float(qty)
+        size_int = int(abs(raw_qty))  # отбрасываем дробную часть
+
+        if size_int <= 0:
+            raise RuntimeError(f"Gate: qty={raw_qty} даёт 0 контрактов после округления")
+
         if side.upper() == "SELL":
-            size = -size
+            size_int = -size_int
 
         body_dict = {
             "contract": contract,
-            "size": size,
-            "tif": "ioc",         # IOC как у нас везде
+            "size": size_int,
+            "iceberg": 0,
+            # price=0 + tif=ioc -> рыночный ордер по Gate
+            "price": "0",
+            "tif": "ioc",
             "auto_size": "none",
         }
         if reduce_only:
@@ -2547,12 +2568,10 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
                 txt = "t-" + txt[:26]  # итого максимум ~28 символов
             body_dict["text"] = txt
 
-
         body = json.dumps(body_dict, separators=(",", ":"))
 
         ts = str(int(time.time()))
         body_hash = hashlib.sha512(body.encode()).hexdigest()
-        # sign_string = method + "\n" + path + "\n" + query + "\n" + body_hash + "\n" + timestamp
         method = "POST"
         query = ""
         msg = "\n".join([method, path, query, body_hash, ts])
@@ -2566,13 +2585,17 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         }
 
         r = SESSION.post(url, headers=headers, data=body, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
+
+        # Gate при успешном создании ордера возвращает 201
+        if r.status_code not in (200, 201):
             raise RuntimeError(f"Gate order HTTP {r.status_code}: {r.text[:400]}")
 
         j = r.json()
-        # Ошибки Gate формата {"label":"INVALID_SIGNATURE","message":"..."}
+        # Ошибки Gate формата {"label":"INVALID_SIGNATURE","message":"."}
         if isinstance(j, dict) and j.get("label"):
-            raise RuntimeError(f"Gate order failed: label={j.get('label')} msg={j.get('message')} resp={str(j)[:400]}")
+            raise RuntimeError(
+                f"Gate order failed: label={j.get('label')} msg={j.get('message')} resp={str(j)[:400]}"
+            )
 
         data = j if isinstance(j, dict) else (j[0] if j else {})
         try:
@@ -3483,7 +3506,9 @@ def positions_once(
         cands["net_usd_adj"] = cands["net_usd"] - (4.0 * (SLIPPAGE_BPS/1e4) * per_leg_notional_usd)
         # фильтр по входу — режимно
         if ENTRY_MODE == "zscore":
-            cands = cands[(cands["net_usd_adj"]>0.0) & (cands["z"]>=Z_IN) & (cands["std"].fillna(0.0) >= STD_MIN_FOR_OPEN)].copy()
+            capital = float(getenv_float("CAPITAL", 1000.0))
+            min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
+            cands = cands[(cands["net_usd_adj"]>min_net_abs) & (cands["z"]>=Z_IN) & (cands["std"].fillna(0.0) >= STD_MIN_FOR_OPEN)].copy()
             cands = cands.sort_values(
                 ["net_usd_adj", "spread_bps", "z"],
                 ascending=[False, False, False]
