@@ -641,7 +641,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
         min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * float(getenv_float("CAPITAL", 100))  # 1% от капитала
         # условия
-        eco_ok = (net_usd_adj is not None) and (float(net_usd_adj) > 0.0)
+        eco_ok = (net_usd_adj is not None) and (float(net_usd_adj) > min_net_abs)
         spread_ok = sp_bps >= entry_bps
         z_ok = (z is not None) and (z == z) and (float(z) >= z_in_loc)
         std_ok = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
@@ -1985,11 +1985,10 @@ def scan_all_with_instant_alerts(
         std_ok    = float(best.get("std") or 0.0) >= std_min_for_open
         spread_ok = float(best.get("spread_bps") or 0.0) >= entry_bps
         z_ok      = (z == z) and (z >= Z_IN_LOC)
-        eco_ok    = net_usd_adj > 0.0
-
         # минимальный ожидаемый net в долларах — 1% от CAPITAL
         capital = float(getenv_float("CAPITAL", 1000.0))
         min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
+        eco_ok    = net_usd_adj > min_net_abs
 
         # === РЕЖИМ ОТКРЫТИЯ ===
         #   ENTRY_MODE=price  → проверяем только экономику и спред
