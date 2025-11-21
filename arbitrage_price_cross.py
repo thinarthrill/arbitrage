@@ -2037,10 +2037,39 @@ def scan_all_with_instant_alerts(
                 slip_bps = max(SLIPPAGE_BPS, 0.5 * gap_bps)
             except Exception:
                 pass
-        net_usd_adj = float(best["net_usd"]) - (4.0 * (slip_bps / 1e4) * per_leg_notional_usd)
+                # --- ECONOMY fallback (bulk candidates иногда приходят без net_usd) ---
+        if best.get("net_usd") is None:
+            try:
+                px_low_f  = float(best.get("px_low") or 0.0)
+                px_high_f = float(best.get("px_high") or 0.0)
+
+                if px_low_f > 0 and px_high_f > 0:
+                    qty_est = float(best.get("qty_est") or (per_leg_notional_usd / px_low_f))
+                    gross_usd = (px_high_f - px_low_f) * qty_est
+                    fees_roundtrip_usd = 4.0 * float(taker_fee) * float(per_leg_notional_usd)
+                    net_usd = gross_usd - fees_roundtrip_usd
+
+                    best["qty_est"] = qty_est
+                    best["gross_usd"] = gross_usd
+                    best["fees_roundtrip_usd"] = fees_roundtrip_usd
+                    best["net_usd"] = net_usd
+            except Exception as e:
+                logging.debug("Economy fallback failed for %s: %s", best.get("symbol"), e)
+                best["net_usd"] = None
+
+        # --- net after slippage (safe) ---
+        net_usd_adj = None
+        try:
+            if best.get("net_usd") is not None:
+                net_usd_adj = float(best["net_usd"]) - (4.0 * (slip_bps / 1e4) * per_leg_notional_usd)
+        except Exception as e:
+            logging.debug("net_usd_adj calc failed for %s: %s", best.get("symbol"), e)
+            net_usd_adj = None
+
         best["z"]   = z
         best["std"] = std
         best["net_usd_adj"] = net_usd_adj
+
         if net_usd_adj is None:
             logging.debug(f"[NET_ADJ NONE] {best.get('symbol')} | "
                         f"px_low={best.get('px_low')} "
