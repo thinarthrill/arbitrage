@@ -39,6 +39,53 @@ def _public_base(exchange: str) -> str:
 # === BULK PATCH START ===
 import time
 import traceback
+def ensure_gcs_credentials_from_env():
+    """
+    Использует именно твои env-переменные:
+      - GCS_KEY_JSON (строка с service account json)
+      - GOOGLE_APPLICATION_CREDENTIALS (если уже задан — не трогаем)
+    Делает:
+      1) парсит json
+      2) пишет во временный файл
+      3) устанавливает GOOGLE_APPLICATION_CREDENTIALS
+    """
+    import os, json, tempfile, logging
+
+    # если путь уже задан (например, через Render Secret File) — ок
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        logging.info("[GCS] GOOGLE_APPLICATION_CREDENTIALS already set")
+        return
+
+    raw = os.getenv("GCS_KEY_JSON")
+    if not raw:
+        logging.warning("[GCS] GCS_KEY_JSON is empty -> GCS writes will be anonymous")
+        return
+
+    # в env у тебя значение обёрнуто в одинарные кавычки ' {...} '
+    raw = raw.strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+        raw = raw[1:-1].strip()
+
+    try:
+        sa = json.loads(raw)
+    except Exception as e:
+        logging.error("[GCS] Failed to parse GCS_KEY_JSON: %s", e)
+        return
+
+    try:
+        fd, path = tempfile.mkstemp(prefix="gcs_sa_", suffix=".json")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sa, f)
+
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+        logging.info("[GCS] Credentials loaded from GCS_KEY_JSON into %s", path)
+    except Exception as e:
+        logging.error("[GCS] Failed to write temp credentials file: %s", e)
+
+
+# вызови один раз при старте
+ensure_gcs_credentials_from_env()
 
 def _bulk_binance():
     url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
