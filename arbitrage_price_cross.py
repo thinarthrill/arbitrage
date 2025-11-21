@@ -2038,11 +2038,17 @@ def scan_all_with_instant_alerts(
             except Exception:
                 pass
         net_usd_adj = float(best["net_usd"]) - (4.0 * (slip_bps / 1e4) * per_leg_notional_usd)
-        best["net_usd_adj"] = net_usd_adj
         best["z"]   = z
         best["std"] = std
         best["net_usd_adj"] = net_usd_adj
-        
+        if net_usd_adj is None:
+            logging.debug(f"[NET_ADJ NONE] {best.get('symbol')} | "
+                        f"px_low={best.get('px_low')} "
+                        f"px_high={best.get('px_high')} "
+                        f"qty_est={best.get('qty_est')} "
+                        f"bbo_low={best.get('bbo_low')} "
+                        f"bbo_high={best.get('bbo_high')}")
+    
         # --- проверки на качество сигнала ---
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
         std_ok    = float(best.get("std") or 0.0) >= std_min_for_open
@@ -3575,7 +3581,7 @@ def positions_once(
     stats = stats_df if stats_df is not None else pd.DataFrame(columns=STATS_COLS)
 
     # Отсекаем редкие/шумные пары: требуем минимум наблюдений и разумную дисперсию лог-спреда
-    MIN_SPREAD_COUNT = int(getenv_float("MIN_SPREAD_COUNT", 100))   # можно вынести в .env
+    MIN_SPREAD_COUNT = int(getenv_float("MIN_SPREAD_COUNT", 20))   # можно вынести в .env
     MAX_SPREAD_VAR   = float(getenv_float("MAX_SPREAD_VAR", 1.5e-5))
 
     if cands is not None and not cands.empty and stats is not None and not stats.empty:
