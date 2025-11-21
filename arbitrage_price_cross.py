@@ -2211,6 +2211,18 @@ def _fmt_qty_str(q: float) -> str:
     s = ("%.10f" % float(q)).rstrip("0").rstrip(".")
     return s if s else "0"
 
+# ----------------- Client order ID helpers -----------------
+def normalize_okx_clordid(cloid: str) -> str:
+    """
+    OKX: clOrdId должен быть 1-32 символа, только буквы/цифры/нижнее подчёркивание.
+    Убираем запрещённые символы и обрезаем до 32.
+    """
+    import re
+    if not cloid:
+        return cloid
+    s = re.sub(r'[^A-Za-z0-9_]', '', str(cloid))
+    return s[:32]
+
 def binance_signed_post(params: dict) -> dict:
     api_key = getenv_str("BINANCE_API_KEY",""); api_secret = getenv_str("BINANCE_API_SECRET","")
     now = int(time.time()*1000)
@@ -2469,7 +2481,7 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             # у OKX reduceOnly есть только для отдельных режимов, но в демо можно попробовать
             body_dict["reduceOnly"] = True
         if cl_oid:
-            body_dict["clOrdId"] = cl_oid
+            body_dict["clOrdId"] = normalize_okx_clordid(cl_oid)
 
         body = json.dumps(body_dict, separators=(",", ":"))
 
