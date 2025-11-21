@@ -1743,7 +1743,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     # --- 2) refresh-confirm (подтверждаем BBO на месте) ---
     REFRESH_CONFIRM = getenv_bool("REFRESH_CONFIRM", True)
     REFRESH_CONFIRM_SEC = float(getenv_float("REFRESH_CONFIRM_SEC", 0.25))
-    MAX_LAG_BPS_CONFIRM = float(getenv_float("MAX_LAG_BPS_CONFIRM", 80.0))
+    MAX_LAG_BPS_CONFIRM = float(getenv_float("MAX_LAG_BPS_CONFIRM", 20.0))
 
     def _bbo(ex_name: str):
         ex = ex_name.lower()
