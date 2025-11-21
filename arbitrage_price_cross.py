@@ -96,64 +96,6 @@ def _bulk_bybit():
         return {}
 
 def _bulk_gate():
-    base = gate_base()  # важно: используем ту же базу, что и для ордеров (mainnet/testnet)
-    url = f"{base}/api/v4/futures/usdt/tickers"
-    try:
-        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            logging.warning("Gate bulk tickers HTTP %s: %s", r.status_code, r.text[:200])
-            return {}
-
-        data = r.json()
-
-        # На успешном ответе Gate возвращает список, на ошибке — dict с label/message
-        if isinstance(data, dict):
-            logging.warning("Gate bulk tickers unexpected dict: %s", str(data)[:200])
-            return {}
-
-        out = {}
-        skipped = 0
-
-        for j in data:
-            inst = j.get("contract")
-            if not inst or not inst.endswith("_USDT"):
-                continue
-
-            # Gate futures: ключи bid1 / ask1
-            try:
-                bid = float(j.get("bid1"))
-                ask = float(j.get("ask1"))
-            except (TypeError, ValueError):
-                skipped += 1
-                continue
-
-            if bid <= 0 or ask <= 0:
-                skipped += 1
-                continue
-
-            mark = to_float(j.get("mark_price"))
-            last = to_float(j.get("last"))
-
-            sym = inst.replace("_", "").upper()
-            out[sym] = {
-                "bid": bid,
-                "ask": ask,
-                "mark": mark,
-                "last": last,
-            }
-
-        logging.debug(
-            "Gate bulk loaded %d contracts, skipped=%d without valid bid/ask",
-            len(out),
-            skipped,
-        )
-        return out
-
-    except Exception:
-        logging.exception("Gate bulk tickers failed")
-        return {}
-
-def _bulk_gate():
     base = gate_base()  # важно: используем ту же базу, что и для ордеров
     url = f"{base}/api/v4/futures/usdt/tickers"
     try:
@@ -221,6 +163,7 @@ def _bulk_gate():
     except Exception:
         logging.exception("Gate bulk tickers failed")
         return {}
+    
 def _bulk_okx():
     url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
     try:
@@ -368,8 +311,72 @@ def _get(u, params=None):
     except Exception:
         return None
 
+def get_bbo(symbol: str, ex_name: str):
+    ex = (ex_name or "").lower()
+    if ex == "bybit":
+        return bybit_best_bid_ask(symbol)
+    if ex == "okx":
+        return okx_best_bid_ask(symbol)
+    if ex == "gate":
+        return gate_best_bid_ask(symbol)
+    # default binance
+    return binance_best_bid_ask(symbol)
+
+def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
+                       qty: float, paper: bool) -> Tuple[bool, dict]:
+    """
+    Закрытие кросса:
+      cheap_ex -> SELL reduce_only (закрываем LONG)
+      rich_ex  -> BUY  reduce_only (закрываем SHORT)
+    """
+
+    attempt_id = new_attempt_id()
+    cl_close_long  = _gen_cloid("CLOSEA", attempt_id, "A")
+    cl_close_short = _gen_cloid("CLOSEB", attempt_id, "B")
+
+    meta = {"attempt_id": attempt_id}
+    try:
+        # закрываем LONG на дешёвой
+        oa = _place_perp_market_order(
+            cheap_ex, symbol, "SELL", qty,
+            paper=paper, cl_oid=cl_close_long, reduce_only=True
+        )
+        if oa.get("status") != "FILLED":
+            raise RuntimeError(f"legA close not filled: {oa}")
+
+        # закрываем SHORT на дорогой
+        ob = _place_perp_market_order(
+            rich_ex, symbol, "BUY", qty,
+            paper=paper, cl_oid=cl_close_short, reduce_only=True
+        )
+        if ob.get("status") != "FILLED":
+            raise RuntimeError(f"legB close not filled: {ob}")
+
+        close_long_px  = float(oa.get("avgPrice") or oa.get("price") or 0.0)
+        close_short_px = float(ob.get("avgPrice") or ob.get("price") or 0.0)
+
+        meta.update({
+            "close_long_order_id": oa.get("orderId") or oa.get("id") or "",
+            "close_short_order_id": ob.get("orderId") or ob.get("id") or "",
+            "close_long_px": close_long_px,
+            "close_short_px": close_short_px,
+        })
+
+        return True, meta
+
+    except Exception as e:
+        meta["error"] = str(e)
+        return False, meta
+
 # ----------------- utils -----------------
 def utc_ms_now() -> int: return int(datetime.now(timezone.utc).timestamp()*1000)
+
+def now_utc_str() -> str:
+    try:
+        return iso_utc(utc_ms_now())
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
 def iso_utc(ms: Optional[int]) -> str:
     if not ms: return ""
     return datetime.fromtimestamp(ms/1000, tz=timezone.utc).isoformat()
@@ -564,7 +571,75 @@ def bybit_best_bid_ask(symbol: str):
     best_ask = float(asks[0]) if asks else None
     return best_bid, best_ask
 
+# ------------------------------------------------------------
+# Generic BBO helpers for preflight refresh (fix undefined vars)
+# ------------------------------------------------------------
 
+def _best_bid_ask_generic(ex: str, symbol: str):
+    """
+    Returns (best_bid, best_ask) for given exchange.
+    Uses existing low-level fetchers already present in the script.
+    """
+    ex = ex.lower()
+    try:
+        # if you already have a unified _fetch_bbo(ex, symbol) - use it
+        if "_fetch_bbo" in globals():
+            bid, ask = _fetch_bbo(ex, symbol)
+            return float(bid or 0.0), float(ask or 0.0)
+    except Exception:
+        pass
+
+    # fallback: try per-exchange quote fetcher if exists
+    try:
+        if ex == "binance" and "binance_book_ticker" in globals():
+            q = binance_book_ticker(symbol)
+            return float(q.get("bid", 0.0)), float(q.get("ask", 0.0))
+        if ex == "okx" and "okx_best_bid_ask" in globals():
+            return okx_best_bid_ask(symbol)
+        if ex == "gate" and "_gate_best_bid_ask" in globals():
+            return gate_best_bid_ask(symbol)
+        if ex == "mexc" and "mexc_best_bid_ask" in globals():
+            return mexc_best_bid_ask(symbol)
+        if ex == "bybit" and "bybit_best_bid_ask" in globals():
+            return bybit_best_bid_ask(symbol)        
+    except Exception:
+        pass
+
+    return 0.0, 0.0
+
+
+def binance_best_bid_ask(symbol: str):
+    return _best_bid_ask_generic("binance", symbol)
+
+def okx_best_bid_ask(symbol: str):
+    return _best_bid_ask_generic("okx", symbol)
+
+def gate_best_bid_ask(symbol: str):
+    return _best_bid_ask_generic("gate", symbol)
+
+def mexc_best_bid_ask(symbol: str):
+    return _best_bid_ask_generic("mexc", symbol)
+
+def bybit_best_bid_ask(symbol: str):
+    return _best_bid_ask_generic("bybit", symbol)
+
+def quote(ex: str, symbol: str, price_source: str = "mid"):
+    """
+    Unified quote() used by older parts of the code.
+    Returns dict: {"bid","ask","mid","last","mark","ts"}
+    """
+    bid, ask = _best_bid_ask_generic(ex, symbol)
+    mid = (bid + ask) / 2 if (bid and ask) else (bid or ask or 0.0)
+    return {
+        "exchange": ex,
+        "symbol": symbol.upper(),
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "last": mid,
+        "mark": mid,
+        "ts": utc_ms_now() if "utc_ms_now" in globals() else int(time.time()*1000),
+    }
 # ----------------- Telegram -----------------
 def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) -> str:
     sym      = str(r["symbol"])
@@ -1618,147 +1693,110 @@ def get_pair_reco(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str) -
         entry_bps_sugg = entry_bps_d
 
     return float(z_in_sugg), float(entry_bps_sugg)
-def try_instant_open(best: dict, per_leg_notional_usd: float, taker_fee: float, paper: bool, pos_path: str) -> bool:
+def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     """
-    Пытается открыть позицию сразу при найденном сигнале (внутри сканера),
-    если сейчас нет открытых позиций, не нарушен кулдаун и pair-lock доступен.
-    Возвращает True, если открытие выполнено, иначе False.
+    Единственный источник открытия позиции.
+    Работает и в bulk, и в row_scan, не конфликтует со старым open-блоком.
     """
-    import pandas as pd
-    sym      = str(best["symbol"]).upper()
-    cheap_ex = str(best["long_ex"])
-    rich_ex  = str(best["short_ex"])
-    px_low   = float(best["px_low"])
-    px_high  = float(best["px_high"])
 
-    # 0) Проверим, нет ли уже открытых позиций
-    df_pos = load_positions(pos_path)
-    if (not df_pos.empty) and any(df_pos["status"] == "open"):
+    if best is None:
         return False
 
-    # 1) Кулдаун после закрытия (чтобы не перезаходить мгновенно в тот же тикер)
-    COOLDOWN_AFTER_CLOSE_SEC = int(getenv_float("COOLDOWN_AFTER_CLOSE_SEC", 30))
-    _LAST_CLOSED: dict[str, float] = globals().setdefault("_LAST_CLOSED", {})
-    if COOLDOWN_AFTER_CLOSE_SEC > 0 and sym in _LAST_CLOSED:
-        if (time.time() - _LAST_CLOSED[sym]) < COOLDOWN_AFTER_CLOSE_SEC:
-            logging.debug("Skip open %s due to cooldown after close", sym)
+    # --- 0) Базовые поля ---
+    sym = str(best.get("symbol", "")).upper()
+    if not sym:
+        return False
+
+    cheap_ex = str(best.get("long_ex") or best.get("cheap_ex") or "").lower()
+    rich_ex  = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
+    if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
+        return False
+
+    px_low  = float(best.get("px_low")  or 0.0)
+    px_high = float(best.get("px_high") or 0.0)
+    if px_low <= 0 or px_high <= 0:
+        return False
+
+    spread_bps = float(best.get("spread_bps") or 0.0)
+    z          = float(best.get("z") or 0.0)
+    net_adj    = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
+
+    # --- 1) Фильтры входа (единый стандарт) ---
+    ENTRY_MODE = getenv_str("ENTRY_MODE", "price")  # 'price' или 'zscore'
+    Z_IN = float(getenv_float("Z_IN", 2.0))
+    ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+
+    eco_ok = net_adj > 0
+    spread_ok = spread_bps >= ENTRY_SPREAD_BPS
+
+    if ENTRY_MODE == "zscore":
+        z_ok = (z >= Z_IN)
+        if not (z_ok and eco_ok):
+            return False
+    else:
+        # price-mode: нужен положительный net + спред >= порога
+        if not (eco_ok and spread_ok):
             return False
 
-        # 1.5) Preflight-refresh котировок перед открытием (если включен REFRESH_CONFIRM)
-    try:
-        do_confirm = os.getenv("REFRESH_CONFIRM", "0").lower() in ("1", "true", "yes")
-        if do_confirm:
-            ps = getenv_str("PRICE_SOURCE", "mid") or "mid"
+    # --- 2) refresh-confirm (подтверждаем BBO на месте) ---
+    REFRESH_CONFIRM = getenv_bool("REFRESH_CONFIRM", True)
+    REFRESH_CONFIRM_SEC = float(getenv_float("REFRESH_CONFIRM_SEC", 0.25))
+    MAX_LAG_BPS_CONFIRM = float(getenv_float("MAX_LAG_BPS_CONFIRM", 80.0))
 
-            def _bbo(ex: str) -> tuple[float, float]:
-                ex_l = (ex or "").lower()
-                if ex_l == "bybit":
-                    bid, ask = bybit_best_bid_ask(sym)
-                    return float(bid or 0.0), float(ask or 0.0)
-                else:
-                    q = binance_quote(sym, "book") or {}
-                    bid = float(q.get("bid") or 0.0)
-                    ask = float(q.get("ask") or 0.0)
-                    return bid, ask
+    def _bbo(ex_name: str):
+        ex = ex_name.lower()
+        if ex == "bybit":
+            return bybit_best_bid_ask(sym)
+        if ex == "okx":
+            return okx_best_bid_ask(sym)
+        if ex == "gate":
+            return gate_best_bid_ask(sym)
+        # default binance
+        return binance_best_bid_ask(sym)
 
-            # На дешёвой бирже мы покупаем (нужен ask), на дорогой продаём (нужен bid)
-            bid_short, ask_short = _bbo(rich_ex)
-            bid_long,  ask_long  = _bbo(cheap_ex)
+    if REFRESH_CONFIRM:
+        try:
+            time.sleep(max(0.0, REFRESH_CONFIRM_SEC))
 
-            if ask_long <= 0.0 or bid_short <= 0.0:
-                logging.debug("Preflight skip %s: no valid BBO (ask_long=%.8f, bid_short=%.8f)",
-                              sym, ask_long, bid_short)
+            low_bid, low_ask   = _bbo(cheap_ex)
+            high_bid, high_ask = _bbo(rich_ex)
+
+            if low_bid <= 0 or low_ask <= 0 or high_bid <= 0 or high_ask <= 0:
+                logging.debug("REFRESH_CONFIRM bad bbo -> skip %s", sym)
                 return False
 
-            # Требуемый спред: либо персональный из best["entry_bps_sugg"], либо ENTRY_SPREAD_BPS из .env
-            entry_req_env  = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
-            entry_req_best = float(best.get("entry_bps_sugg") or 0.0)
-            entry_bps_req  = max(entry_req_env, entry_req_best, 0.0)
+            # обновляем цены в best на подтверждённые
+            px_low  = float(low_ask)   # BUY по ask на дешёвой
+            px_high = float(high_bid)  # SELL по bid на дорогой
 
-            ENTRY_HYST_BPS = float(getenv_float("ENTRY_HYST_BPS", 3.0))
+            spread_bps_confirm = (px_high - px_low) / max(px_low, 1e-12) * 1e4
 
-            entry_bps_now = (bid_short - ask_long) / ask_long * 1e4
-            if entry_bps_req > 0.0 and entry_bps_now < (entry_bps_req - ENTRY_HYST_BPS):
+            if spread_bps_confirm < spread_bps - MAX_LAG_BPS_CONFIRM:
                 logging.debug(
-                    "Preflight skip %s: entry_bps_now=%.2f < %.2f (req-hyst, req=%.2f)",
-                    sym, entry_bps_now, entry_bps_req - ENTRY_HYST_BPS, entry_bps_req
+                    "REFRESH_CONFIRM reject %s: old=%.2f bps new=%.2f bps",
+                    sym, spread_bps, spread_bps_confirm
                 )
                 return False
-    except Exception as e:
-        logging.debug("Preflight exception for %s: %s", sym, e)
 
-    # 2) Pair-lock: чтоб другой тикер не начал открываться в этот же момент
-    if not open_lock_check_or_set(sym):
-        return False
+            best["px_low"] = px_low
+            best["px_high"] = px_high
+            best["spread_bps"] = spread_bps_confirm
 
-    # --- (NEW) Refresh-confirm снапшота перед расчётом qty и отправкой ордеров ---
+        except Exception as e:
+            logging.debug("REFRESH_CONFIRM exception: %s", e)
+            return False
+
+    # --- 3) Qty расчёт как в positions_once ---
     try:
-        do_confirm = os.getenv("REFRESH_CONFIRM", "0").lower() in ("1","true","yes")
-        if do_confirm:
-            ps = getenv_str("PRICE_SOURCE", "mid")
-            # свежие котировки только для нужного символа на двух биржах
-            rows = []
-            try:
-                rows.append(binance_quote(sym, ps))
-            except Exception:
-                pass
-            try:
-                rows.append(bybit_quote(sym, ps))
-            except Exception:
-                pass
-            rows = [r for r in rows if r]  # убрать None
-
-            ref_best = best_pair_for_symbol(rows, per_leg_notional_usd, taker_fee, ps)
-            if (not ref_best) or \
-               (str(ref_best["long_ex"]) != cheap_ex) or \
-               (str(ref_best["short_ex"]) != rich_ex):
-                open_lock_clear()
-                logging.debug("REFRESH_CONFIRM failed: pair changed for %s", sym)
-                return False
-
-            # не даём открыть, если спред заметно деградировал
-            hyst = float(getenv_float("EXIT_HYST_BPS", 3.0))
-            entry_req = float(getenv_float("ENTRY_SPREAD_BPS", 70.0))
-            if float(ref_best["spread_bps"]) < max(entry_req - hyst, entry_req * 0.9):
-                open_lock_clear()
-                logging.debug("REFRESH_CONFIRM failed: spread deteriorated for %s", sym)
-                return False
-
-            # проверка актуального Z (если доступна статистика)
-            try:
-                x_now, z_now, std_now = get_z_for_pair(
-                    read_spread_stats(),
-                    sym, str(ref_best["long_ex"]), str(ref_best["short_ex"]),
-                    float(ref_best["px_low"]), float(ref_best["px_high"])
-                )
-                Z_IN_LOC = float(getenv_float("Z_IN", 3.0))
-                STD_MIN_FOR_OPEN = float(getenv_float("STD_MIN_FOR_OPEN", 0.0))
-                if (std_now is not None and std_now == std_now and std_now < STD_MIN_FOR_OPEN) or \
-                   (z_now is not None and z_now == z_now and z_now < Z_IN_LOC):
-                    open_lock_clear()
-                    logging.debug("REFRESH_CONFIRM failed: z/std check for %s", sym)
-                    return False
-            except Exception:
-                # если статистика недоступна — пропускаем этот чек
-                pass
-    except Exception as e:
-        open_lock_clear()
-        logging.debug("REFRESH_CONFIRM exception: %s", e)
-        return False
-
-    try:
-        # 3) Рассчитываем qty как в positions_once (капитал/леверидж/шаги лота)
-        # Базовая оценка
         qty = float(best.get("qty_est") or 0.0)
         if qty <= 0:
-            per_leg_notional = per_leg_notional_usd
-            qty = per_leg_notional / max(px_low, 1.0)
+            qty = float(per_leg_notional_usd) / max(px_low, 1.0)
 
-        # Шаги лота (Bybit/ Binance), жёсткое ограничение по капиталу
         try:
             _, _, _, by_qty_step = bybit_get_filters(sym)
         except Exception:
             by_qty_step = 0.0
+
         bn_info = _binance_symbol_info(sym) or {}
         lot_f = {f["filterType"]: f for f in bn_info.get("filters", [])}.get("LOT_SIZE") or {}
         bn_qty_step = float(lot_f.get("stepSize") or 0.0)
@@ -1768,71 +1806,94 @@ def try_instant_open(best: dict, per_leg_notional_usd: float, taker_fee: float, 
         qty_capA = cap_qty_by_capital(px_low,  by_qty_step or bn_qty_step or 0.0, capital, leverage)
         qty_capB = cap_qty_by_capital(px_high, by_qty_step or bn_qty_step or 0.0, capital, leverage)
         qty = max(0.0, min(qty, qty_capA, qty_capB))
+
         if qty <= 0:
             logging.debug("Qty capped to 0 by capital limits — skip %s", sym)
             return False
 
-        # 4) Открываем атомарно
-        ok, attempt_id, meta = atomic_cross_open(
-            symbol=sym, cheap_ex=cheap_ex, rich_ex=rich_ex,
-            qty=qty, price_low=px_low, price_high=px_high, paper=paper
+    except Exception as e:
+        logging.exception("Qty calc failed for %s: %s", sym, e)
+        return False
+
+    # --- 4) Кулдаун после закрытия ---
+    COOLDOWN_AFTER_CLOSE_SEC = int(getenv_float("COOLDOWN_AFTER_CLOSE_SEC", 30))
+    _LAST_CLOSED = globals().setdefault("_LAST_CLOSED", {})
+    if COOLDOWN_AFTER_CLOSE_SEC > 0 and sym in _LAST_CLOSED:
+        if (time.time() - _LAST_CLOSED[sym]) < COOLDOWN_AFTER_CLOSE_SEC:
+            logging.debug("Skip open %s due to cooldown after close", sym)
+            return False
+
+    # --- 5) Pair-lock ---
+    if not open_lock_check_or_set(sym):
+        return False
+
+    # --- 6) Открываем атомарно ---
+    ok, attempt_id, meta = atomic_cross_open(
+        symbol=sym, cheap_ex=cheap_ex, rich_ex=rich_ex,
+        qty=qty, price_low=px_low, price_high=px_high, paper=paper
+    )
+
+    now_ms = utc_ms_now()
+
+    if ok:
+        df_pos = load_positions(pos_path)
+        cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max() if not df_pos.empty else None
+        next_id = int(cur_max) + 1 if cur_max == cur_max and cur_max is not None else 1
+
+        new = {
+            "id": next_id, "attempt_id": attempt_id, "symbol": sym,
+            "long_ex": cheap_ex, "short_ex": rich_ex,
+            "opened_ms": now_ms, "last_ms": now_ms, "held_h": 0.0,
+            "size_usd": per_leg_notional_usd,
+            "entry_spread_bps": float(best["spread_bps"]),
+            "entry_px_low": px_low, "entry_px_high": px_high,
+            "status": "open",
+            "opened_at": iso_utc(now_ms), "closed_at": "", "close_reason": "",
+            "validated_qty": meta.get("qty", qty),
+            "note_net_usd": float(best.get("net_usd") or 0.0),
+            "open_long_order_id":  meta.get("open_long_order_id",""),
+            "open_short_order_id": meta.get("open_short_order_id",""),
+            "open_long_px":  meta.get("open_long_px", 0.0),
+            "open_short_px": meta.get("open_short_px", 0.0),
+            "open_fees_usd": meta.get("open_fees_usd", 0.0),
+            "open_long_cloid": meta.get("open_long_cloid",""),
+            "open_short_cloid": meta.get("open_short_cloid","")
+        }
+
+        df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+        save_positions(pos_path, df_pos)
+
+        # карточка OPENED — только по fill-ценам
+        price_source = getenv_str("PRICE_SOURCE", "mid")
+        best_opened = dict(best)
+        if meta.get("open_long_px"):
+            best_opened["px_low"] = float(meta["open_long_px"])
+        if meta.get("open_short_px"):
+            best_opened["px_high"] = float(meta["open_short_px"])
+
+        best_opened["spread_bps"] = (
+            (best_opened["px_high"] - best_opened["px_low"]) / max(best_opened["px_low"], 1e-12) * 1e4
         )
 
-        now_ms = utc_ms_now()
-        if ok:
-            # проставим запись в positions
-            cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max() if not df_pos.empty else None
-            next_id = int(cur_max)+1 if cur_max==cur_max and cur_max is not None else 1
-            new = {
-                "id": next_id, "attempt_id": attempt_id, "symbol": sym,
-                "long_ex": cheap_ex, "short_ex": rich_ex,
-                "opened_ms": now_ms, "last_ms": now_ms, "held_h": 0.0,
-                "size_usd": per_leg_notional_usd,
-                "entry_spread_bps": float(best["spread_bps"]),
-                "entry_px_low": px_low, "entry_px_high": px_high,
-                "status": "open",
-                "opened_at": iso_utc(now_ms), "closed_at": "", "close_reason": "",
-                "validated_qty": meta.get("qty", qty),
-                "note_net_usd": float(best.get("net_usd") or 0.0),
-                "open_long_order_id":  meta.get("open_long_order_id",""),
-                "open_short_order_id": meta.get("open_short_order_id",""),
-                "open_long_px":  meta.get("open_long_px", 0.0),
-                "open_short_px": meta.get("open_short_px", 0.0),
-                "open_fees_usd": meta.get("open_fees_usd", 0.0),
-                "open_long_cloid": meta.get("open_long_cloid",""),
-                "open_short_cloid": meta.get("open_short_cloid","")
-            }
-            df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
-            save_positions(pos_path, df_pos)
+        maybe_send_telegram(
+            "✅ <b>OPENED</b>\n" + format_signal_card(best_opened, per_leg_notional_usd, price_source)
+        )
+        return True
 
-            # Телеграм карточка «OPENED»
-            price_source = getenv_str("PRICE_SOURCE", "mid")
-            maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best, per_leg_notional_usd, price_source))
-            return True
-        else:
-            err = str(meta.get("error") or "unknown")
-            logging.warning("Instant open failed for %s: %s", sym, err)
+    else:
+        err = str(meta.get("error") or "unknown")
+        logging.warning("Instant open failed for %s: %s", sym, err)
 
-            # Если включён DEBUG_INSTANT_OPEN, отправляем причину в Telegram
-            if getenv_bool("DEBUG_INSTANT_OPEN", False):
-                try:
-                    price_source = getenv_str("PRICE_SOURCE", "mid")
-                    card = format_signal_card(best, per_leg_notional_usd, price_source)
-                except Exception:
-                    card = ""
-                msg = (
-                    "⚠️ <b>OPEN FAILED</b>\n"
-                    f"{sym} {cheap_ex.upper()} ↔ {rich_ex.upper()}\n"
-                    f"Причина: <code>{err}</code>"
-                )
-                # если карточка собралась – приклеим её ниже
-                if card:
-                    msg = msg + "\n\n" + card
-                maybe_send_telegram(msg)
+        if getenv_bool("DEBUG_INSTANT_OPEN", False):
+            try:
+                price_source = getenv_str("PRICE_SOURCE", "mid")
+                card = format_signal_card(best, per_leg_notional_usd, price_source)
+                maybe_send_telegram("⚠️ <b>OPEN FAILED</b>\n" + card + f"\nПричина: <code>{err}</code>")
+            except Exception:
+                pass
 
-            return False
-    finally:
-        open_lock_clear()
+        open_lock_release(sym)
+        return False
 
 # ----------------- Scanners -----------------
 def scan_all_with_instant_alerts(
@@ -1990,26 +2051,14 @@ def scan_all_with_instant_alerts(
         min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
         eco_ok    = net_usd_adj > min_net_abs
 
-        # === РЕЖИМ ОТКРЫТИЯ ===
-        #   ENTRY_MODE=price  → проверяем только экономику и спред
-        #   ENTRY_MODE=zscore → добавляем фильтры по z, std и минимуму по net
-        ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
-        if ENTRY_MODE not in ("zscore", "price"):
-            ENTRY_MODE = "price"
 
-        if ENTRY_MODE == "zscore":
-            # для zscore-режима требуем ещё и net_usd_adj ≥ 1% от CAPITAL
-            cond_open = (
-                instant_open
-                and z_ok
-                and std_ok
-                and spread_ok
-                and eco_ok
-                and (net_usd_adj >= min_net_abs)
-            )
-        else:  # price
-            # price-режим оставляем как был: достаточно положительной экономики и спреда
-            cond_open = instant_open and eco_ok and spread_ok
+        cond_open = (
+            instant_open
+            and spread_ok
+            and eco_ok
+            and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
+        )
+
 
         # Опциональный детальный лог, почему не открылись (если нужно дебажить)
         if not cond_open and getenv_bool("DEBUG_INSTANT_OPEN", False):
@@ -2017,7 +2066,7 @@ def scan_all_with_instant_alerts(
                 "INSTANT_OPEN SKIP %s | mode=%s eco_ok=%s spread_ok=%s z_ok=%s std_ok=%s "
                 "net_usd_adj=%.4f z=%.4f std=%.6f spread_bps=%.2f entry_bps=%.2f Z_IN_LOC=%.2f",
                 best.get("symbol"),
-                ENTRY_MODE,
+                getenv_str("ENTRY_MODE", "price"),
                 eco_ok,
                 spread_ok,
                 z_ok,
@@ -2988,6 +3037,15 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         )
         if oa.get("status") != "FILLED":
             raise RuntimeError(f"legA not filled: {oa}")
+        # --- NEW: фиксируем реальную цену открытия LONG ---
+        open_long_px = float(oa.get("avg_price") or 0.0)
+        if open_long_px <= 0:
+            # avg_price не пришёл => берём актуальный BBO ПОСЛЕ фактического открытия
+            q = get_bbo(cheap_ex, symbol, "book") or {}
+            b = q.get("bid")
+            a = q.get("ask")
+            open_long_px = float(a or b or 0.0)
+
     except Exception as e:
         return False, attempt_id, {"error": f"legA error: {e}"}
 
@@ -3007,6 +3065,15 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             return False, attempt_id, {"error": f"legB not filled: {ob}"}
         if ob.get("status") != "FILLED":
             raise RuntimeError(f"legB not filled: {ob}")
+        # --- NEW: фиксируем реальную цену открытия SHORT ---
+        open_short_px = float(ob.get("avg_price") or 0.0)
+        if open_short_px <= 0:
+            q = get_bbo(rich_ex, symbol, "book") or {}
+            b = q.get("bid")
+            a = q.get("ask")
+            open_short_px = float(b or a or 0.0)
+
+
     except Exception as e:
         # откат первой ноги (продаём то, что купили)
         try:
@@ -3067,6 +3134,38 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         "open_short_cloid": ob.get("client_order_id"),
         "entry_bps_filled": float(entry_bps_filled) if entry_bps_filled is not None else None,
     }
+    # --- NEW: сразу подтягиваем реальные fills и переписываем open_*_px ---
+    try:
+        time.sleep(float(getenv_float("POST_OPEN_FILL_SLEEP", 0.25)))
+        lookback_ms = int(getenv_float("FILL_LOOKBACK_MS", 180_000))
+        start_ms_for_trades = utc_ms_now() - int(getenv_float("FILL_LOOKBACK_MS", 180_000))
+
+        sum_long = summarize_fills(
+            cheap_ex, symbol, "BUY",
+            meta.get("open_long_order_id",""),
+            meta.get("open_long_cloid",""),
+            None, None, None,
+            start_ms_for_trades
+        )
+        sum_short = summarize_fills(
+            rich_ex, symbol, "SELL",
+            meta.get("open_short_order_id",""),
+            meta.get("open_short_cloid",""),
+            None, None, None,
+            start_ms_for_trades
+        )
+
+        if sum_long.get("avg_open_px"):
+            meta["open_long_px"] = float(sum_long["avg_open_px"])
+        if sum_short.get("avg_open_px"):
+            meta["open_short_px"] = float(sum_short["avg_open_px"])
+
+        meta["open_fees_usd"] = float(meta.get("open_fees_usd", 0.0)) \
+                                + float(sum_long.get("fees_open_usd", 0.0)) \
+                                + float(sum_short.get("fees_open_usd", 0.0))
+
+    except Exception as e:
+        logging.debug("post-open fill fetch skipped: %s", e)
 
     return True, attempt_id, meta
 
@@ -3453,6 +3552,7 @@ def _estimate_net_now(px_low: float, px_high: float, qty: float,
     return gross - fees - slip
 
 # ----------------- Core loop: open/close/rotate -----------------
+'''
 def positions_once(
     quotes_df: pd.DataFrame,
     per_leg_notional_usd: float,
@@ -3732,7 +3832,7 @@ def positions_once(
                 except Exception as e:
                     logging.warning("Close error %s: %s", sym, e)
             # Попытка добрать фактические цены/комиссии по открытию и закрытию (если поддержано)
-            start_ms_for_trades = int(df_pos.at[i,"opened_ms"] or (now_ms - 6*3600*1000))
+            start_ms_for_trades = utc_ms_now() - int(getenv_float("FILL_LOOKBACK_MS", 180_000))
             open_long_oid  = str(df_pos.at[i,"open_long_order_id"]  or "")
             open_short_oid = str(df_pos.at[i,"open_short_order_id"] or "")
             open_long_cl   = str(df_pos.at[i,"open_long_cloid"] or "")
@@ -3747,10 +3847,14 @@ def positions_once(
             open_short_px  = float(df_pos.at[i,"open_short_px"] or 0.0) or sum_short["avg_open_px"]
 
             # если Bybit demo не вернуло execPrice — подставляем цены входа из меты
+            used_snapshot_open = False
+
             if open_long_px == 0.0:
-                open_long_px = float(df_pos.at[i, "entry_px_low"]  or 0.0)
+                open_long_px = float(df_pos.at[i, "entry_px_low"] or 0.0)
+                used_snapshot_open = True
             if open_short_px == 0.0:
                 open_short_px = float(df_pos.at[i, "entry_px_high"] or 0.0)
+                used_snapshot_open = True
 
             close_long_px  = close_long_px  or sum_long["avg_close_px"]
             close_short_px = close_short_px or sum_short["avg_close_px"]
@@ -3848,6 +3952,11 @@ def positions_once(
                     except Exception as e:
                         logging.debug("post-close balances fetch skipped: %s", e)
 
+                snap_tag = " (snapshot)" if used_snapshot_open else ""
+                pnl_lines.append(
+                    f"   Long: open {open_long_px:.6f}{snap_tag} → close {close_long_px:.6f}\n"
+                    f"   Short: open {open_short_px:.6f}{snap_tag} → close {close_short_px:.6f}"
+                )
 
                 maybe_send_telegram("\n".join(pnl_lines))
             except Exception:
@@ -3920,7 +4029,18 @@ def positions_once(
                     "open_short_cloid":meta.get("open_short_cloid","")
                 }
                 df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
-                maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best, per_leg_notional_usd, price_source))
+                # --- NEW: подменяем снапшотные цены на реальные fill-цены для карточки OPENED
+                best_opened = dict(best)
+                if meta.get("open_long_px"):
+                    best_opened["px_low"] = float(meta["open_long_px"])
+                if meta.get("open_short_px"):
+                    best_opened["px_high"] = float(meta["open_short_px"])
+
+                best_opened["spread_bps"] = (
+                    (best_opened["px_high"] - best_opened["px_low"]) / max(best_opened["px_low"], 1e-12) * 1e4
+                )
+
+                maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best_opened, per_leg_notional_usd, price_source))
                 open_lock_clear()
             else:
                 err = str(meta.get("error") or "unknown")
@@ -3941,6 +4061,268 @@ def positions_once(
                     maybe_send_telegram(msg)
 
                 open_lock_clear()
+    save_positions(pos_path, df_pos)
+'''
+def positions_once(
+    quotes_df: pd.DataFrame,
+    per_leg_notional_usd: float,
+    entry_bps: float,
+    exit_bps: float,
+    taker_fee: float,
+    pos_path: str,
+    paper: bool,
+    top3_to_tg: int,
+    rotate_on: bool,
+    rotate_delta_usd: float,
+    stats_df: pd.DataFrame,
+):
+    price_source = getenv_str("PRICE_SOURCE", "mid")
+    cands = build_price_arbitrage(quotes_df, per_leg_notional_usd, taker_fee, price_source)
+
+    # ------------------------------
+    # 1) квалификация (ema/std/z)
+    # ------------------------------
+    if stats_df is not None and not stats_df.empty:
+        try:
+            stats = stats_df.copy()
+            # нормализуем названия колонок, если нужно
+            for col in ["ex_low", "ex_high"]:
+                if col not in stats.columns and col.replace("ex_", "") in stats.columns:
+                    stats[col] = stats[col.replace("ex_", "")]
+
+            qual = (
+                stats[["symbol", "ex_low", "ex_high", "ema_spread_bps", "std_spread_bps", "zscore"]]
+                .rename(
+                    columns={
+                        "ex_low": "long_ex",
+                        "ex_high": "short_ex",
+                        "ema_spread_bps": "ema_bps",
+                        "std_spread_bps": "std_bps",
+                        "zscore": "z",
+                    }
+                )
+                .dropna()
+            )
+
+            cands = cands.merge(qual, on=["symbol", "long_ex", "short_ex"], how="left")
+        except Exception as e:
+            logging.debug("positions_once: merge stats failed: %s", e)
+
+    # ------------------------------
+    # 2) топ кандидатов + TG
+    # ------------------------------
+    if cands is None or cands.empty:
+        cands = pd.DataFrame(columns=[
+            "symbol","long_ex","short_ex","px_low","px_high",
+            "spread_bps","net_usd","fees_usd","gross_usd",
+            "ema_bps","std_bps","z"
+        ])
+
+    # сортировка по net_usd_adj если есть, иначе net_usd
+    sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
+    cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+    best = None
+    if not cands.empty:
+        best = dict(cands.iloc[0])
+
+    if top3_to_tg and top3_to_tg > 0 and not cands.empty:
+        try:
+            topN = cands.head(int(top3_to_tg)).to_dict("records")
+            for rec in topN:
+                try:
+                    msg = ">" + format_signal_card(rec, per_leg_notional_usd, price_source)
+                    maybe_send_telegram(msg)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.debug("positions_once: topN TG failed: %s", e)
+
+    # ------------------------------
+    # 3) загрузка/обновление позиций
+    # ------------------------------
+    df_pos = load_positions(pos_path)
+    if df_pos is None or df_pos.empty:
+        df_pos = pd.DataFrame(columns=[
+            "symbol","long_ex","short_ex",
+            "open_price_long","open_price_short",
+            "qty","status","opened_at",
+            "open_long_order_id","open_short_order_id",
+            "close_long_order_id","close_short_order_id",
+            "reason","pnl_usd"
+        ])
+
+    has_open = False
+    try:
+        has_open = any(df_pos.get("status","") == "open")
+    except Exception:
+        has_open = False
+
+    # ------------------------------
+    # 4) проверяем открытые позиции на выход
+    # ------------------------------
+    if not df_pos.empty:
+        for i, row in df_pos.iterrows():
+            if str(row.get("status","")) != "open":
+                continue
+
+            sym = str(row.get("symbol","")).upper()
+            ex_l = str(row.get("long_ex",""))
+            ex_h = str(row.get("short_ex",""))
+            qty  = float(row.get("qty", 0.0) or 0.0)
+
+            if not sym or not ex_l or not ex_h or qty <= 0:
+                continue
+
+            # ------- локальная функция котировок -------
+            def _single_quote(ex: str, symbol: str):
+                ps = getenv_str("PRICE_SOURCE", "mid") or "mid"
+                try:
+                    ex_lc = str(ex).lower()
+                    if ex_lc == "binance":
+                        return binance_quote(symbol, ps)
+                    if ex_lc == "bybit":
+                        return bybit_quote(symbol, ps)
+                    if ex_lc == "okx":
+                        return okx_quote(symbol, ps)
+                    if ex_lc == "gate":
+                        return gate_quote(symbol, ps)
+                    if ex_lc == "mexc":
+                        return mexc_quote(symbol, ps)
+                except Exception as e:
+                    logging.debug(
+                        "positions_once: direct quote failed for %s@%s: %s",
+                        symbol, ex, e
+                    )
+                return None
+
+            row_low  = _single_quote(ex_l, sym)
+            row_high = _single_quote(ex_h, sym)
+            if row_low is None or row_high is None:
+                continue
+
+            bid_low  = float(row_low.get("bid") or 0.0)
+            ask_low  = float(row_low.get("ask") or 0.0)
+            bid_high = float(row_high.get("bid") or 0.0)
+            ask_high = float(row_high.get("ask") or 0.0)
+
+            if ask_low <= 0 or bid_high <= 0:
+                continue
+
+            # текущий спред выхода: мы закрываем, т.е. long продаём по bid_low, short откупаем по ask_high
+            exit_bps_now = (bid_low - ask_high) / ask_high * 1e4
+
+            EXIT_HYST_BPS = float(getenv_float("EXIT_HYST_BPS", 3.0))
+            exit_req = float(exit_bps)
+
+            exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
+
+            # z-условия выхода (если включены)
+            z_ok = True
+            if getenv_bool("EXIT_USE_ZSCORE", False):
+                try:
+                    z_out = float(getenv_float("Z_OUT", 0.0))
+                    # если в stats были z/std/ema — используем их
+                    z_cur = float(best.get("z", 0.0) if best else 0.0)
+                    z_ok = abs(z_cur) <= abs(z_out)
+                except Exception:
+                    z_ok = True
+
+            if exit_ok and z_ok:
+                # закрываем позицию
+                try:
+                    ok, meta = atomic_cross_close(
+                        symbol=sym,
+                        cheap_ex=ex_l,
+                        rich_ex=ex_h,
+                        qty=qty,
+                        paper=paper,
+                    )
+                except Exception as e:
+                    ok, meta = False, {"error": str(e)}
+
+                if ok:
+                    df_pos.at[i, "status"] = "closed"
+                    df_pos.at[i, "reason"] = "exit"
+                    try:
+                        df_pos.at[i, "closed_at"] = now_utc_str()
+                    except Exception:
+                        pass
+
+                    try:
+                        pnl = float(meta.get("pnl_usd", 0.0) or 0.0)
+                        df_pos.at[i, "pnl_usd"] = pnl
+                    except Exception:
+                        pass
+
+                    maybe_send_telegram(
+                        "✅ <b>CLOSED</b>\n"
+                        f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                        f"exit_bps_now={exit_bps_now:.2f} bps"
+                    )
+                else:
+                    err = str(meta.get("error") or "unknown")
+                    logging.warning("Close failed: %s", err)
+                    maybe_send_telegram(
+                        "⚠️ <b>CLOSE FAILED</b>\n"
+                        f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                        f"Причина: <code>{err}</code>"
+                    )
+
+    # ------------------------------
+    # 5) ротация (optional)
+    # ------------------------------
+    if rotate_on and best is not None and not df_pos.empty:
+        try:
+            # ищем открытую и сравниваем её net с новым best
+            open_rows = df_pos[df_pos["status"] == "open"]
+            if not open_rows.empty:
+                open_row = open_rows.iloc[0]
+                open_net = float(open_row.get("net_usd_adj") or open_row.get("net_usd") or 0.0)
+                best_net = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
+
+                if best_net - open_net >= float(rotate_delta_usd):
+                    # закрыть текущую (по причине rotate), открыть best через try_instant_open
+                    sym = str(open_row["symbol"]).upper()
+                    ex_l = str(open_row["long_ex"])
+                    ex_h = str(open_row["short_ex"])
+                    qty = float(open_row.get("qty", 0.0) or 0.0)
+                    if qty > 0:
+                        ok, meta = atomic_cross_close(
+                            symbol=sym, cheap_ex=ex_l, rich_ex=ex_h, qty=qty, paper=paper
+                        )
+                        if ok:
+                            idx = open_rows.index[0]
+                            df_pos.at[idx, "status"] = "closed"
+                            df_pos.at[idx, "reason"] = "rotate"
+                            maybe_send_telegram(
+                                "🔁 <b>ROTATED OUT</b>\n"
+                                f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                                f"open_net={open_net:.2f} → best_net={best_net:.2f}"
+                            )
+                            # открыть новый best единым механизмом
+                            try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path)
+                            df_pos = load_positions(pos_path)
+        except Exception as e:
+            logging.debug("positions_once: rotate failed: %s", e)
+
+    # ------------------------------
+    # 6) ЕДИНЫЙ путь ОТКРЫТИЯ (NEW)
+    # ------------------------------
+    # Важно: больше нет старого "второго" пути через atomic_cross_open внутри positions_once.
+    # Открываем только try_instant_open(), чтобы все фильтры/refresh-confirm были едиными.
+    if (not has_open) and best is not None:
+        opened = try_instant_open(
+            best=best,
+            per_leg_notional_usd=per_leg_notional_usd,
+            taker_fee=taker_fee,
+            paper=paper,
+            pos_path=pos_path,
+        )
+        if opened:
+            # try_instant_open сам сохраняет позицию и отправляет OPENED
+            df_pos = load_positions(pos_path)
+
     save_positions(pos_path, df_pos)
 
 # ===== Symbols & matrix helpers =====
