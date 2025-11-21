@@ -8,3 +8,5 @@ python-dotenv
 pandas
 google-cloud-storage
 numpy
+fsspec>=2023.0
+gcsfs>=2023.0
