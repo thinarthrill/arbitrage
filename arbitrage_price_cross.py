@@ -729,7 +729,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         # eco_ok
         if net_usd_adj is not None:
             lines.append(
-                f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} {'>' if eco_ok else '<='} 0"
+                f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} "
+                f"{'>' if eco_ok else '<='} {min_net_abs:.2f}"
             )
         else:
             lines.append(f"{_flag(False)} eco_ok   · net_adj is None")
@@ -1720,23 +1721,31 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         return False
 
     spread_bps = float(best.get("spread_bps") or 0.0)
-    z          = float(best.get("z") or 0.0)
-    net_adj    = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
+    z_raw      = best.get("z")
+    std_raw    = best.get("std")
+    net_adj_raw = best.get("net_usd_adj")
 
-    # --- 1) Фильтры входа (единый стандарт) ---
-    ENTRY_MODE = getenv_str("ENTRY_MODE", "price")  # 'price' или 'zscore'
+    z   = float(z_raw)   if (z_raw is not None and z_raw == z_raw) else float("nan")
+    std = float(std_raw) if (std_raw is not None and std_raw == std_raw) else float("nan")
+    net_adj = float(net_adj_raw) if net_adj_raw is not None else float("nan")
+
+    ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
     Z_IN = float(getenv_float("Z_IN", 2.0))
     ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
 
-    eco_ok = net_adj > 0
+    std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+    capital = float(getenv_float("CAPITAL", 1000.0))
+    min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1))/100.0) * capital
+
+    eco_ok = (net_adj == net_adj) and (net_adj > min_net_abs)
     spread_ok = spread_bps >= ENTRY_SPREAD_BPS
+    z_ok = (z == z) and (z >= Z_IN)
+    std_ok = (std == std) and (std >= std_min_for_open)
 
     if ENTRY_MODE == "zscore":
-        z_ok = (z >= Z_IN)
-        if not (z_ok and eco_ok):
+        if not (eco_ok and z_ok and std_ok):
             return False
     else:
-        # price-mode: нужен положительный net + спред >= порога
         if not (eco_ok and spread_ok):
             return False
 
@@ -2037,7 +2046,17 @@ def scan_all_with_instant_alerts(
                 slip_bps = max(SLIPPAGE_BPS, 0.5 * gap_bps)
             except Exception:
                 pass
-                # --- ECONOMY fallback (bulk candidates иногда приходят без net_usd) ---
+        
+        # --- ECONOMY fallback (bulk candidates иногда приходят без net_usd) ---
+        # гарантируем qty_est если его не было
+        if best.get("qty_est") is None:
+            try:
+                px_for_qty = float(best.get("px_low") or 0.0)
+                if px_for_qty > 0:
+                    best["qty_est"] = per_leg_notional_usd / px_for_qty
+            except Exception:
+                best["qty_est"] = None
+
         if best.get("net_usd") is None:
             try:
                 px_low_f  = float(best.get("px_low") or 0.0)
@@ -2069,6 +2088,9 @@ def scan_all_with_instant_alerts(
         best["z"]   = z
         best["std"] = std
         best["net_usd_adj"] = net_usd_adj
+        # если stats невалидна — помечаем отдельным флагом
+        stats_ok = (std == std) and (std > 0)
+        best["stats_ok"] = stats_ok
 
         if net_usd_adj is None:
             logging.debug(f"[NET_ADJ NONE] {best.get('symbol')} | "
@@ -2086,16 +2108,15 @@ def scan_all_with_instant_alerts(
         # минимальный ожидаемый net в долларах — 1% от CAPITAL
         capital = float(getenv_float("CAPITAL", 1000.0))
         min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
-        eco_ok    = net_usd_adj > min_net_abs
-
+        eco_ok    = (net_usd_adj is not None) and (net_usd_adj > min_net_abs)
 
         cond_open = (
             instant_open
             and spread_ok
             and eco_ok
+            and (getenv_str("ENTRY_MODE", "price").lower() != "zscore" or best.get("stats_ok", False))
             and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
         )
-
 
         # Опциональный детальный лог, почему не открылись (если нужно дебажить)
         if not cond_open and getenv_bool("DEBUG_INSTANT_OPEN", False):
@@ -3660,7 +3681,9 @@ def positions_once(
                 ascending=[False, False, False]
             ).reset_index(drop=True)
         else:  # price
-            cands = cands[(cands["net_usd_adj"]>0.0) & (cands["spread_bps"]>=entry_bps)].copy()
+            capital = float(getenv_float("CAPITAL", 1000.0))
+            min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1))/100.0) * capital
+            cands = cands[(cands["net_usd_adj"]>min_net_abs) & (cands["spread_bps"]>=entry_bps)].copy()
             cands = cands.sort_values(
                 ["net_usd_adj", "spread_bps"],
                 ascending=[False, False]
@@ -4758,6 +4781,33 @@ def main():
 
     while True:
         try:
+            # ============================================================
+            # A) ТОРГОВЫЙ СКАНЕР (bulk) — только он выбирает best и открывает
+            # ============================================================
+            spread_bps_min = entry_bps
+            spread_bps_max = float(getenv_float("SPREAD_BPS_MAX", 1e9))  # безопасный верхний потолок
+    
+            best = scan_spreads_once(
+                exchanges=exchanges,
+                symbols=symbols,
+                spread_bps_min=spread_bps_min,
+                spread_bps_max=spread_bps_max,
+                per_leg_notional_usd=per_leg_notional,
+                taker_fee=taker_fee,
+                pos_path=pos_cross_path,
+                price_stats_path=SPREAD_STATS_PATH,
+                debug=False,
+                price_source=price_source,
+                alert_spread_pct=ALERT_SPREAD_PCT,
+                cooldown_sec=ALERT_COOLDOWN_SEC,
+                instant_open=True,
+                pos_path_for_instant=pos_cross_path,
+                paper=paper,
+            )
+    
+            # ============================================================
+            # B) АЛЕРТНЫЙ СКАНЕР — только уведомления/quotes_df, БЕЗ ОТКРЫТИЯ
+            # ============================================================
             quotes_df = scan_all_with_instant_alerts(
                 exchanges=exchanges,
                 symbols=symbols,
@@ -4766,8 +4816,8 @@ def main():
                 price_source=price_source,
                 alert_spread_pct=ALERT_SPREAD_PCT,
                 cooldown_sec=ALERT_COOLDOWN_SEC,
-                instant_open=True,
-                pos_path_for_instant=pos_cross_path,
+                instant_open=False,          # <-- ключевой фикс
+                pos_path_for_instant=None,   # <-- чтобы не было старого пути
                 paper=paper,
             )
 
