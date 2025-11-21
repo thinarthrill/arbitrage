@@ -2568,7 +2568,6 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             # price=0 + tif=ioc -> рыночный ордер по Gate
             "price": "0",
             "tif": "ioc",
-            "auto_size": "none",
         }
         if reduce_only:
             body_dict["reduce_only"] = True
