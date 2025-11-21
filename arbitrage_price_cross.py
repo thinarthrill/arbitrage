@@ -2553,22 +2553,21 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
 
         # В Gate size — ЦЕЛОЕ число контрактов (int64), >0 = long, <0 = short
         raw_qty = float(qty)
-        size_int = int(abs(raw_qty))  # отбрасываем дробную часть
+        if raw_qty <= 0:
+            raise RuntimeError(f"Gate: qty={raw_qty} <= 0")
 
-        if size_int <= 0:
-            raise RuntimeError(f"Gate: qty={raw_qty} даёт 0 контрактов после округления")
-
+        size = raw_qty
         if side.upper() == "SELL":
-            size_int = -size_int
+            size = -size
 
         body_dict = {
             "contract": contract,
-            "size": size_int,
+            "size": size,
             "iceberg": 0,
-            # price=0 + tif=ioc -> рыночный ордер по Gate
-            "price": "0",
+            "price": "0",   # market через price=0 + tif=ioc
             "tif": "ioc",
         }
+
         if reduce_only:
             body_dict["reduce_only"] = True
         if cl_oid:
