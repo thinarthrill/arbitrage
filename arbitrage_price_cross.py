@@ -2299,7 +2299,7 @@ def scan_spreads_once(
                 "px_low": px_low,
                 "px_high": px_high,
                 "spread_bps": spread_bps,
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             }
         )
 
@@ -2338,7 +2338,8 @@ def scan_spreads_once(
     if debug:
         logging.info(f"Best candidate: {best}")
 
-    return best
+    quotes_df = pd.DataFrame(records)
+    return best, quotes_df
 
 # ----------------- Trading API (Binance/Bybit) -----------------
 _BINANCE_TIME_OFFSET_MS = 0
@@ -4834,7 +4835,7 @@ def main():
             spread_bps_min = entry_bps
             spread_bps_max = float(getenv_float("SPREAD_BPS_MAX", 1e9))  # безопасный верхний потолок
     
-            best = scan_spreads_once(
+            best, quotes_df = scan_spreads_once(
                 exchanges=exchanges,
                 symbols=symbols,
                 spread_bps_min=spread_bps_min,
@@ -4849,22 +4850,6 @@ def main():
                 cooldown_sec=ALERT_COOLDOWN_SEC,
                 instant_open=True,
                 pos_path_for_instant=pos_cross_path,
-                paper=paper,
-            )
-    
-            # ============================================================
-            # B) АЛЕРТНЫЙ СКАНЕР — только уведомления/quotes_df, БЕЗ ОТКРЫТИЯ
-            # ============================================================
-            quotes_df = scan_all_with_instant_alerts(
-                exchanges=exchanges,
-                symbols=symbols,
-                per_leg_notional_usd=per_leg_notional,
-                taker_fee=taker_fee,
-                price_source=price_source,
-                alert_spread_pct=ALERT_SPREAD_PCT,
-                cooldown_sec=ALERT_COOLDOWN_SEC,
-                instant_open=False,          # <-- ключевой фикс
-                pos_path_for_instant=None,   # <-- чтобы не было старого пути
                 paper=paper,
             )
 
