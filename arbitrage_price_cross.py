@@ -709,7 +709,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             z_in_loc = float(getenv_float("Z_IN", 2.5))
 
         try:
-            entry_bps = float(entry_bps_sugg or sp_bps)
+            entry_bps = float(entry_bps_sugg or getenv_float("ENTRY_SPREAD_BPS", 0.0))
         except Exception:
             entry_bps = sp_bps
 
