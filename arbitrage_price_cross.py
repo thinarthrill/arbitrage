@@ -14,7 +14,7 @@ import os, time, json, math, hmac, hashlib, logging, uuid, base64
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
-
+import numpy as np
 # ----------------- ENV helpers -----------------
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -1656,9 +1656,9 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
     now  = time.time()
 
     # фильтры качества статистики
-     # синхронизируемся с MIN_SPREAD_COUNT из .env (мягче/жестче на твой выбор)
-     min_cnt = int(getenv_float("MIN_SPREAD_COUNT", SPREAD_MIN_COUNT))
-     if cnt < min_cnt or (upd > 0 and (now - upd) > SPREAD_STALE_SEC):
+    # синхронизируемся с MIN_SPREAD_COUNT из .env (мягче/жестче на твой выбор)
+    min_cnt = int(getenv_float("MIN_SPREAD_COUNT", SPREAD_MIN_COUNT))
+    if cnt < min_cnt or (upd > 0 and (now - upd) > SPREAD_STALE_SEC):
         return x, float('nan'), float('nan')
 
     std = max(math.sqrt(max(var or 0.0, 0.0)), SPREAD_STD_FLOOR)
@@ -4092,41 +4092,41 @@ def positions_once(
                 if col not in stats.columns and col.replace("ex_", "") in stats.columns:
                     stats[col] = stats[col.replace("ex_", "")]
 
-             # В spread_stats.csv реальные поля: ema_mean, ema_var, count, updated_ms.
-             # Старых ema_spread_bps/std_spread_bps/zscore может не быть → делаем совместимо.
-             base_cols = ["symbol", "ex_low", "ex_high"]
-             opt_cols = []
-             for oc in ["ema_spread_bps", "std_spread_bps", "zscore", "ema_mean", "ema_var", "count", "updated_ms"]:
-                 if oc in stats.columns:
-                     opt_cols.append(oc)
-             qual = (
-                 stats[base_cols + opt_cols]
-                 .drop_duplicates()
-                 .rename(columns={"ex_low": "long_ex", "ex_high": "short_ex"})
-             )
- 
-             # если нет готовых bps/zscore — оценим из log-спреда
-             if "ema_spread_bps" not in qual.columns and "ema_mean" in qual.columns:
-                 qual["ema_bps"] = pd.to_numeric(qual["ema_mean"], errors="coerce") * 1e4
-             elif "ema_spread_bps" in qual.columns:
-                 qual["ema_bps"] = pd.to_numeric(qual["ema_spread_bps"], errors="coerce")
- 
-             if "std_spread_bps" not in qual.columns and "ema_var" in qual.columns:
-                 qual["std_bps"] = np.sqrt(pd.to_numeric(qual["ema_var"], errors="coerce").clip(lower=0.0)) * 1e4
-             elif "std_spread_bps" in qual.columns:
-                 qual["std_bps"] = pd.to_numeric(qual["std_spread_bps"], errors="coerce")
- 
-             if "zscore" in qual.columns:
-                 qual["z"] = pd.to_numeric(qual["zscore"], errors="coerce")
- 
-             # мерджим только то, что реально посчитали
-             keep = ["symbol", "long_ex", "short_ex"]
-             for k in ["ema_bps", "std_bps", "z", "count", "ema_var", "updated_ms"]:
-                 if k in qual.columns:
-                     keep.append(k)
-             qual = qual[keep]
- 
-             cands = cands.merge(qual, on=["symbol", "long_ex", "short_ex"], how="left")
+            # В spread_stats.csv реальные поля: ema_mean, ema_var, count, updated_ms.
+            # Старых ema_spread_bps/std_spread_bps/zscore может не быть → делаем совместимо.
+            base_cols = ["symbol", "ex_low", "ex_high"]
+            opt_cols = []
+            for oc in ["ema_spread_bps", "std_spread_bps", "zscore", "ema_mean", "ema_var", "count", "updated_ms"]:
+                if oc in stats.columns:
+                    opt_cols.append(oc)
+            qual = (
+                stats[base_cols + opt_cols]
+                .drop_duplicates()
+                .rename(columns={"ex_low": "long_ex", "ex_high": "short_ex"})
+            )
+
+            # если нет готовых bps/zscore — оценим из log-спреда
+            if "ema_spread_bps" not in qual.columns and "ema_mean" in qual.columns:
+                qual["ema_bps"] = pd.to_numeric(qual["ema_mean"], errors="coerce") * 1e4
+            elif "ema_spread_bps" in qual.columns:
+                qual["ema_bps"] = pd.to_numeric(qual["ema_spread_bps"], errors="coerce")
+
+            if "std_spread_bps" not in qual.columns and "ema_var" in qual.columns:
+                qual["std_bps"] = np.sqrt(pd.to_numeric(qual["ema_var"], errors="coerce").clip(lower=0.0)) * 1e4
+            elif "std_spread_bps" in qual.columns:
+                qual["std_bps"] = pd.to_numeric(qual["std_spread_bps"], errors="coerce")
+
+            if "zscore" in qual.columns:
+                qual["z"] = pd.to_numeric(qual["zscore"], errors="coerce")
+
+            # мерджим только то, что реально посчитали
+            keep = ["symbol", "long_ex", "short_ex"]
+            for k in ["ema_bps", "std_bps", "z", "count", "ema_var", "updated_ms"]:
+                if k in qual.columns:
+                    keep.append(k)
+            qual = qual[keep]
+
+            cands = cands.merge(qual, on=["symbol", "long_ex", "short_ex"], how="left")
         except Exception as e:
             logging.debug("positions_once: merge stats failed: %s", e)
 
