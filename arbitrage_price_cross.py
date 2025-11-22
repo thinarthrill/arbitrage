@@ -2422,11 +2422,14 @@ def scan_spreads_once(
         if instant_open:
             try_instant_open(
                 best=best,
-                pos_path=(pos_path_for_instant or pos_path),
+                per_leg_notional_usd=per_leg_notional_usd,
+                taker_fee=taker_fee,
                 paper=paper,
+                pos_path=(pos_path_for_instant or pos_path),
             )
     except Exception as e:
         logging.warning("[OPEN] instant open failed: %s", e)
+
 
     return best, quotes_df
 
