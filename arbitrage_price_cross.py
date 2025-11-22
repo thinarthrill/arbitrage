@@ -4061,7 +4061,7 @@ def positions_once(
 
             # z-условия выхода (если включены)
             z_ok = True
-            if getenv_bool("EXIT_USE_ZSCORE", False):
+            if getenv_str("EXIT_MODE", "zscore").lower() == "zscore":
                 try:
                     z_out = float(getenv_float("Z_OUT", 0.0))
                     # если в stats были z/std/ema — используем их
@@ -4403,59 +4403,62 @@ def dryrun_log_close(ex_long: str, sym_long: str, qty_long: float,
 
 # ----------------- Main loop -----------------
 def main():
-    # ----- глобальный traceback в лог -----
+    # --------------------------------------------------------
+    # Глобальный traceback в лог
+    # --------------------------------------------------------
     def _global_excepthook(exc_type, exc, tb):
         try:
             logging.critical("FATAL EXCEPTION", exc_info=(exc_type, exc, tb))
         finally:
             traceback.print_exception(exc_type, exc, tb)
+
     sys.excepthook = _global_excepthook
+
+    # --------------------------------------------------------
+    # Чтение конфигов
+    # --------------------------------------------------------
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
-    # Проверка коннектов перед запуском цикла
     must_check = _is_true("CHECK_EXCHANGES_AT_START", True)
     must_quit  = _is_true("QUIT_ON_CONNECTIVITY_FAIL", True)
     probe_sym  = os.getenv("CONNECTIVITY_PROBE_SYMBOL", "BTCUSDT").upper()
 
-    # ----- GCS creds теперь безопасно тут -----
+    # --------------------------------------------------------
+    # GCS credentials
+    # --------------------------------------------------------
     try:
         ensure_gcs_credentials_from_env()
     except Exception as e:
         logging.exception("[GCS] ensure_gcs_credentials_from_env failed: %s", e)
 
+    # --------------------------------------------------------
+    # Connectivity checks
+    # --------------------------------------------------------
     if must_check:
-        # определяем окружение для каждой биржи (mainnet / testnet / demo)
         per_env = {}
         for ex in exchanges:
             base = _private_base(ex)
             env = "testnet" if "testnet" in base else ("demo" if "api-demo" in base else "mainnet")
 
-            # Спец-логика для OKX: demo определяется не URL-ом, а заголовком x-simulated-trading
             if ex.lower() == "okx":
                 if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False):
                     env = "demo"
 
             per_env[ex] = env
 
-        price_feed_env = "mainnet"
-        logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
+        logging.info(f"[ENV] price_feed_env=mainnet  order_env_per_exchange={per_env}")
 
-        # ===== ЖЁСТКАЯ ПРОВЕРКА BYBIT ПРИ СТАРТЕ =====
         try:
-            logging.info("[DEBUG] Startup Bybit balance via bybit_unified_usdt_balance()")
             bal = bybit_unified_usdt_balance()
-            logging.info("[DEBUG] bybit_unified_usdt_balance() -> %s", bal)
+            logging.info("[DEBUG] Bybit balance startup = %s", bal)
         except Exception as e:
             logging.exception("[DEBUG] bybit_unified_usdt_balance() startup error: %s", e)
 
         try:
-            logging.info("[DEBUG] Startup Bybit auth via _check_bybit_auth()")
             ok = _check_bybit_auth()
-            logging.info("[DEBUG] _check_bybit_auth() -> %s", ok)
+            logging.info("[DEBUG] Bybit auth startup = %s", ok)
         except Exception as e:
             logging.exception("[DEBUG] _check_bybit_auth() startup error: %s", e)
-        # ==============================================
 
-    # === проверка коннектов ===
         if not check_connectivity(exchanges, probe_symbol=probe_sym):
             msg = "Startup connectivity check failed — one or more exchanges unavailable."
             logging.error(msg)
@@ -4463,9 +4466,8 @@ def main():
                 maybe_send_telegram(f"❌ {msg}")
                 return
             else:
-                logging.warning("Continuing despite failed connectivity (QUIT_ON_CONNECTIVITY_FAIL=0)")
+                logging.warning("Continuing despite failed connectivity")
 
-        # Auth check (private)
         if _is_true("AUTH_CHECK_AT_START", True):
             logging.info("Running private API auth checks...")
             if not check_auth_connectivity(exchanges):
@@ -4475,8 +4477,11 @@ def main():
                     maybe_send_telegram(f"❌ {msg}")
                     return
                 else:
-                    logging.warning("Continuing despite auth failure (QUIT_ON_CONNECTIVITY_FAIL=0)")
+                    logging.warning("Continuing despite auth failure")
 
+    # --------------------------------------------------------
+    # SYMBOL SOURCES
+    # --------------------------------------------------------
     src = getenv_str("SYMBOLS_SOURCE", "common").lower()
     symbols_env = getenv_list("SYMBOLS", [])
     top_n = int(getenv_float("TOP_N", 200))
@@ -4490,18 +4495,11 @@ def main():
     elif src == "binance-top":
         symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote)
     elif src == "union":
-        if matrix_path:
-            symbols = symbols_from_matrix(matrix_path, exchanges, mode="union")
-        else:
-            symbols = COMMON_SYMBOLS
+        symbols = symbols_from_matrix(matrix_path, exchanges, mode="union") if matrix_path else COMMON_SYMBOLS
     elif src == "common":
         symbols = COMMON_SYMBOLS
     elif src == "matrix":
-        if not matrix_path:
-            logging.error("SYMBOLS_SOURCE=matrix, но MATRIX_READ_PATH не задан — беру COMMON")
-            symbols = COMMON_SYMBOLS
-        else:
-            symbols = symbols_from_matrix(matrix_path, exchanges, mode=matrix_mode)
+        symbols = symbols_from_matrix(matrix_path, exchanges, mode=matrix_mode) if matrix_path else COMMON_SYMBOLS
     else:
         symbols = COMMON_SYMBOLS
 
@@ -4514,15 +4512,18 @@ def main():
         )
 
     logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
-    pos_cross_path = bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
 
+    # --------------------------------------------------------
+    # PARAMETERS
+    # --------------------------------------------------------
+    pos_cross_path = bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
     entry_bps = float(getenv_float("ENTRY_SPREAD_BPS", getenv_float("ENTRY_APR", 10.0)))
-    exit_bps  = float(getenv_float("EXIT_SPREAD_BPS",  getenv_float("EXIT_APR", 2.0)))
+    exit_bps  = float(getenv_float("EXIT_SPREAD_BPS", getenv_float("EXIT_APR", 2.0)))
     taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
     paper = getenv_bool("PAPER", True)
     sleep_s = int(getenv_float("SLEEP_SEC", 3))
 
-    notional_env = getenv_str("NOTIONAL","")
+    notional_env = getenv_str("NOTIONAL", "")
     notional = float(notional_env) if notional_env else None
     capital = float(getenv_float("CAPITAL", 1000.0))
     leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
@@ -4533,35 +4534,24 @@ def main():
 
     stats_store = StatsStore(SPREAD_STATS_PATH, ALPHA)
 
-    logging.info("PriceArb started | exchanges=%s | symbols=%s", exchanges, symbols)
-    logging.info("PAPER=%s | per-leg notional=$%.2f | ENTRY=%.2f bps | EXIT=%.2f bps | taker=%.4f",
-                 paper, per_leg_notional, entry_bps, exit_bps, taker_fee)
-    logging.info("ROTATE=%s | Δ%%=%.4f | min%%leg=%.4f | min%%cap=%.4f | hyst_bps=%.2f | z_adv=%.2f | hold=%ss",
-             rotate_on,
-             float(getenv_float("ROTATE_DELTA_PCT", 0.30)),
-             float(getenv_float("ROTATE_MIN_NOTIONAL_PCT", 0.20)),
-             float(getenv_float("ROTATE_MIN_CAP_PCT", 0.05)),
-             float(getenv_float("ROTATE_HYSTERESIS_BPS", 0.0)),
-             float(getenv_float("ROTATE_REQUIRE_Z_ADV", 0.0)),
-             int(getenv_float("ROTATE_MIN_HOLD_SEC", 0)))
-
-
     price_source = getenv_str("PRICE_SOURCE", "book").lower()
-    use_bulk = getenv_bool("USE_BULK_QUOTES", True)  # новый флаг
 
+    logging.info("PriceArb started | PAPER=%s | per-leg=$%.2f | ENTRY=%.2f bps | EXIT=%.2f bps | taker=%.4f",
+                 paper, per_leg_notional, entry_bps, exit_bps, taker_fee)
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
     while True:
         try:
-            # ============================================================
-            # A) ТОРГОВЫЙ СКАНЕР (bulk) — только он выбирает best и открывает
-            # ============================================================
-            spread_bps_min = entry_bps
-            spread_bps_max = float(getenv_float("SPREAD_BPS_MAX", 1e9))  # безопасный верхний потолок
-    
+            # ===================================================================
+            # A) ТОРГОВЫЙ СКАНЕР — ИЩЕТ КАНДИДАТЫ + МОЖЕТ ОТКРЫТЬ ИНСТАНТ-СДЕЛКУ
+            # ===================================================================
             best, quotes_df = scan_spreads_once(
                 exchanges=exchanges,
                 symbols=symbols,
-                spread_bps_min=spread_bps_min,
-                spread_bps_max=spread_bps_max,
+                spread_bps_min=entry_bps,
+                spread_bps_max=float(getenv_float("SPREAD_BPS_MAX", 1e9)),
                 per_leg_notional_usd=per_leg_notional,
                 taker_fee=taker_fee,
                 pos_path=pos_cross_path,
@@ -4573,23 +4563,40 @@ def main():
                 instant_open=True,
                 pos_path_for_instant=pos_cross_path,
                 paper=paper,
+                per_ex_symbols=per_ex_symbols,
             )
 
-            # ---- ОБНОВЛЯЕМ EMA-статистику из свежих котировок (на лету) ----
-            # Берём по каждому символу все доступные биржи в quotes_df и считаем лог-спред для каждой пары.
+            # ===================================================================
+            # B) ПАРАЛЛЕЛЬНЫЙ АЛЕРТНЫЙ СКАНЕР — НЕ ЗАТИРАЕТ quotes_df
+            # ===================================================================
+            scan_all_with_instant_alerts(
+                exchanges=exchanges,
+                symbols=symbols,
+                per_leg_notional_usd=per_leg_notional,
+                taker_fee=taker_fee,
+                price_source=price_source,
+                alert_spread_pct=ALERT_SPREAD_PCT,
+                cooldown_sec=ALERT_COOLDOWN_SEC,
+                instant_open=True,
+                pos_path_for_instant=pos_cross_path,
+                paper=paper,
+                per_ex_symbols=per_ex_symbols,
+            )
+
+            # ===================================================================
+            # C) ОБНОВЛЕНИЕ EMA-СТАТИСТИКИ
+            # ===================================================================
             try:
                 if quotes_df is not None and not quotes_df.empty:
                     df = quotes_df.copy()
+
                     if price_source == "book":
-                        # --- FIX: НЕ выходим из цикла while, если в bulk нет ask/bid ---
                         if "ask" not in df.columns or "bid" not in df.columns:
                             logging.warning("[STATS] skip inline update: no ask/bid in quotes_df")
                             stats_store.maybe_save(force=False)
                         else:
                             for sym in sorted(df["symbol"].unique()):
                                 sub = df[df["symbol"] == sym]
-
-                                # защита: в некоторых symbols вообще нет ask/bid
                                 if "ask" not in sub.columns or "bid" not in sub.columns:
                                     continue
 
@@ -4598,37 +4605,28 @@ def main():
                                 if sub_ask.empty or sub_bid.empty:
                                     continue
 
-                                # безопасное преобразование
                                 sub_ask["ask"] = pd.to_numeric(sub_ask["ask"], errors="coerce")
                                 sub_bid["bid"] = pd.to_numeric(sub_bid["bid"], errors="coerce")
                                 sub_ask = sub_ask.dropna(subset=["ask"])
                                 sub_bid = sub_bid.dropna(subset=["bid"])
+
                                 if sub_ask.empty or sub_bid.empty:
                                     continue
 
                                 row_low  = sub_ask.loc[sub_ask["ask"].idxmin()]
                                 row_high = sub_bid.loc[sub_bid["bid"].idxmax()]
+
                                 if str(row_low["exchange"]) == str(row_high["exchange"]):
                                     continue
 
                                 px_low  = float(row_low["ask"])
                                 px_high = float(row_high["bid"])
+
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
                                     stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
 
-                            # Для стабильности возьмём глобальный мин ASK и макс BID (реалистичнее не бывает)
-                            row_low  = sub_ask.loc[sub_ask["ask"].astype(float).idxmin()]
-                            row_high = sub_bid.loc[sub_bid["bid"].astype(float).idxmax()]
-                            if str(row_low["exchange"]) == str(row_high["exchange"]):
-                                continue
-                            px_low  = float(row_low["ask"]);  ex_low  = str(row_low["exchange"])
-                            px_high = float(row_high["bid"]); ex_high = str(row_high["exchange"])
-                            if px_low>0 and px_high>0:
-                                x = math.log(px_high/px_low)
-                                stats_store.update_pair(sym, ex_low, ex_high, x)
                     else:
-                        # как и было: EMA на основе выбранной единой цены (mid/last/mark/bid/ask)
                         def _sel(r):
                             ps = price_source
                             if ps == "last": return to_float(r.get("last"))
@@ -4636,26 +4634,30 @@ def main():
                             if ps == "bid":  return to_float(r.get("bid"))
                             if ps == "ask":  return to_float(r.get("ask"))
                             return to_float(r.get("mid"))
+
                         df["px"] = df.apply(_sel, axis=1)
                         df = df.dropna(subset=["px"])
+
                         for sym in sorted(df["symbol"].unique()):
                             sub = df[df["symbol"]==sym].sort_values("px")
-                            exs = list(sub["exchange"].values); pxs = list(sub["px"].values)
+                            exs = list(sub["exchange"].values)
+                            pxs = list(sub["px"].values)
                             n = len(pxs)
                             for i in range(n):
                                 for j in range(i+1, n):
                                     px_low, px_high = float(pxs[i]), float(pxs[j])
-                                    if px_low<=0 or px_high<=0: continue
-                                    ex_low, ex_high = str(exs[i]), str(exs[j])
+                                    if px_low <= 0 or px_high <= 0: 
+                                        continue
                                     x = math.log(px_high/px_low)
-                                    stats_store.update_pair(sym, ex_low, ex_high, x)
-                # сохраняем не чаще, чем раз в SAVE_EVERY_SEC
+                                    stats_store.update_pair(sym, str(exs[i]), str(exs[j]), x)
+
                 stats_store.maybe_save(force=False)
             except Exception as e:
                 logging.warning("Stats inline update error: %s", e)
-            # ============================================================
-            # B) ОСНОВНАЯ ЛОГИКА ПОЗИЦИЙ + TOP-3 В TELEGRAM
-            # ============================================================
+
+            # ===================================================================
+            # D) ЛОГИКА ПОЗИЦИЙ (open / close / rotate)
+            # ===================================================================
             try:
                 positions_once(
                     quotes_df=quotes_df,
@@ -4672,13 +4674,13 @@ def main():
                 )
             except Exception as e:
                 logging.exception("positions_once error: %s", e)
+
         except Exception as e:
-            # ФАТАЛЬНАЯ ошибка цикла — показываем полный traceback и падаем,
-            # чтобы Render точно вывел корень проблемы.
             logging.exception("FATAL ERROR IN MAIN LOOP")
             err = str(e)[:1600].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             maybe_send_telegram(f"❌ PriceArb cycle error: <code>{err}</code>")
             raise
+
         time.sleep(max(3, sleep_s))
 
 if __name__ == "__main__":
