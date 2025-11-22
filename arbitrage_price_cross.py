@@ -2966,6 +2966,22 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         "net_usd": net
     }
 
+def _coalesce_cols(df: pd.DataFrame, targets: List[str], candidates: List[str]) -> pd.DataFrame:
+     """
+     Берёт первый существующий столбец из candidates и кладёт в targets[0].
+     Если targets уже есть — не трогаем.
+     """
+     if df is None or df.empty:
+         return df
+     t = targets[0]
+     if t in df.columns:
+         return df
+     for c in candidates:
+         if c in df.columns:
+             df[t] = df[c]
+             return df
+     return df
+
 def build_price_arbitrage(
     df_raw: pd.DataFrame,
     per_leg_notional_usd: float,
@@ -2979,21 +2995,32 @@ def build_price_arbitrage(
     ps = (price_source or "mid").lower()
 
     # --- FIX: гарантируем наличие bid/ask для book-режима ---
-    if ps == "book":
-        for col in ("bid", "ask"):
-            if col not in use.columns:
-                use[col] = np.nan
+    # 1) нормализуем возможные названия из bulk
+    use = _coalesce_cols(use, ["ask"], ["ask", "bestAsk", "askPrice", "a", "sell", "offer", "ask_px"])
+    use = _coalesce_cols(use, ["bid"], ["bid", "bestBid", "bidPrice", "b", "buy", "bid_px"])
 
-        # мягкое восстановление из mid/px если bulk вернул только их
-        if use["ask"].isna().all() and "mid" in use.columns:
-            use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
-        if use["bid"].isna().all() and "mid" in use.columns:
-            use["bid"] = pd.to_numeric(use["mid"], errors="coerce")
+    # 2) если после коалесса всё равно нет — создаём
+    for col in ("bid", "ask"):
+        if col not in use.columns:
+            use[col] = np.nan
 
-        if use["ask"].isna().all() and "px" in use.columns:
-            use["ask"] = pd.to_numeric(use["px"], errors="coerce")
-        if use["bid"].isna().all() and "px" in use.columns:
-            use["bid"] = pd.to_numeric(use["px"], errors="coerce")
+    # 3) мягкое восстановление из mid/px если bulk вернул только их
+    if use["ask"].isna().all() and "mid" in use.columns:
+        use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
+    if use["bid"].isna().all() and "mid" in use.columns:
+        use["bid"] = pd.to_numeric(use["mid"], errors="coerce")
+
+    if use["ask"].isna().all() and "px" in use.columns:
+        use["ask"] = pd.to_numeric(use["px"], errors="coerce")
+    if use["bid"].isna().all() and "px" in use.columns:
+        use["bid"] = pd.to_numeric(use["px"], errors="coerce")
+
+    # 4) если bid/ask всё ещё пустые — логируем один раз на цикл
+    if use["ask"].isna().all() or use["bid"].isna().all():
+        logging.warning(
+            "build_price_arbitrage(book): bid/ask still empty after fallbacks. cols=%s",
+            list(use.columns)
+        )
 
     # обычные режимы: строим px
     if ps != "book":
@@ -3009,8 +3036,17 @@ def build_price_arbitrage(
             if "ask" not in sub.columns or "bid" not in sub.columns:
                 continue
 
-            sub_ask = sub.dropna(subset=["ask"]).copy()
-            sub_bid = sub.dropna(subset=["bid"]).copy()
+            # безопасно: если вдруг нет колонок — не падаем
+            try:
+                sub_ask = sub.dropna(subset=["ask"]).copy()
+                sub_bid = sub.dropna(subset=["bid"]).copy()
+            except KeyError:
+                # на всякий случай, если pandas всё-таки не видит ask/bid
+                logging.warning(
+                    "build_price_arbitrage(book): missing ask/bid in sub for %s. sub_cols=%s",
+                    sym, list(sub.columns)
+                )
+                continue
             if sub_ask.empty or sub_bid.empty:
                 continue
 
@@ -3773,520 +3809,6 @@ def _estimate_net_now(px_low: float, px_high: float, qty: float,
     slip_bps = float(getenv_float("DRYRUN_SLIPPAGE_BPS", getenv_float("SLIPPAGE_BPS", 15.0)))
     slip   = (slip_bps / 1e4) * 2.0 * per_leg_notional_usd  # простая оценка
     return gross - fees - slip
-
-# ----------------- Core loop: open/close/rotate -----------------
-
-def positions_once(
-    quotes_df: pd.DataFrame,
-    per_leg_notional_usd: float,
-    entry_bps: float,
-    exit_bps: float,
-    taker_fee: float,
-    pos_path: str,
-    paper: bool,
-    top3_to_tg: int,
-    rotate_on: bool,
-    rotate_delta_usd: float,
-    stats_df: pd.DataFrame,
-):
-    price_source = getenv_str("PRICE_SOURCE", "mid")
-    cands = build_price_arbitrage(quotes_df, per_leg_notional_usd, taker_fee, price_source)
-
-    # --- Жёсткая фильтрация по качеству статистики (до расчёта Z) ---
-    stats = stats_df if stats_df is not None else pd.DataFrame(columns=STATS_COLS)
-
-    # Отсекаем редкие/шумные пары: требуем минимум наблюдений и разумную дисперсию лог-спреда
-    MIN_SPREAD_COUNT = int(getenv_float("MIN_SPREAD_COUNT", 20))   # можно вынести в .env
-    MAX_SPREAD_VAR   = float(getenv_float("MAX_SPREAD_VAR", 1.5e-5))
-
-    if cands is not None and not cands.empty and stats is not None and not stats.empty:
-        qual = (
-            stats[["symbol", "ex_low", "ex_high", "ema_var", "count"]]
-            .drop_duplicates()
-            .rename(columns={"ex_low": "long_ex", "ex_high": "short_ex"})
-        )
-        cands = cands.merge(qual, on=["symbol", "long_ex", "short_ex"], how="left")
-
-        # Применяем «маску качества»
-        cands = cands[
-            (cands["count"].fillna(0) >= MIN_SPREAD_COUNT) &
-            (cands["ema_var"].fillna(9e9) <= MAX_SPREAD_VAR)
-        ].copy()
-
-    # --- читаем статистику спредов и считаем z для кандидатов ---
-    Z_IN  = float(getenv_float("Z_IN", 2.5))
-    Z_OUT = float(getenv_float("Z_OUT", 0.8))
-    SLIPPAGE_BPS = float(getenv_float("SLIPPAGE_BPS", 1.0))  # консервативный запас
-    # Дефолт выравниваем с bulk-сканером: по умолчанию режим price
-    ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
-    if ENTRY_MODE not in ("zscore", "price"):
-        ENTRY_MODE = "price"
-    STD_MIN_FOR_OPEN = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-
-    stats = stats_df if stats_df is not None else pd.DataFrame(columns=STATS_COLS)
-    if cands is not None and not cands.empty:
-        zs=[]; xs=[]; stds=[]
-        for _, r in cands.iterrows():
-            x, z, std = get_z_for_pair(
-                stats, symbol=str(r["symbol"]),
-                ex_low=str(r["long_ex"]), ex_high=str(r["short_ex"]),
-                px_low=float(r["px_low"]), px_high=float(r["px_high"])
-            )
-            xs.append(x); zs.append(z); stds.append(std)
-        cands["log_spread"] = xs; cands["z"] = zs; cands["std"] = stds
-        # штраф за проскальзывание (4 ноги round-trip)
-        cands["net_usd_adj"] = cands["net_usd"] - (4.0 * (SLIPPAGE_BPS/1e4) * per_leg_notional_usd)
-        # фильтр по входу — режимно
-        if ENTRY_MODE == "zscore":
-            capital = float(getenv_float("CAPITAL", 1000.0))
-            min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
-            cands = cands[(cands["net_usd_adj"]>min_net_abs) & (cands["z"]>=Z_IN) & (cands["std"].fillna(0.0) >= STD_MIN_FOR_OPEN)].copy()
-            cands = cands.sort_values(
-                ["net_usd_adj", "spread_bps", "z"],
-                ascending=[False, False, False]
-            ).reset_index(drop=True)
-        else:  # price
-            capital = float(getenv_float("CAPITAL", 1000.0))
-            min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1))/100.0) * capital
-            cands = cands[(cands["net_usd_adj"]>min_net_abs) & (cands["spread_bps"]>=entry_bps)].copy()
-            cands = cands.sort_values(
-                ["net_usd_adj", "spread_bps"],
-                ascending=[False, False]
-            ).reset_index(drop=True)
-
-    best = None
-    if cands is not None and not cands.empty:
-        # отправим топ-N для наглядности
-        topN = cands.head(top3_to_tg).copy()
-        for _, r in topN.iterrows():
-            maybe_send_telegram(format_signal_card(r, per_leg_notional_usd, price_source))
-        # выбираем наиболее прибыльный сигнал (а не самый большой Z)
-        best = cands.iloc[0]
-    else:
-        logging.info(f"No {ENTRY_MODE}-filtered candidates this cycle.")
-
-    df_pos = load_positions(pos_path)
-    now_ms = utc_ms_now()
-    has_open = (not df_pos.empty) and any(df_pos["status"]=="open")
-    if has_open:
-        do_close = False
-        reason = ""
-        i = df_pos.index[df_pos["status"]=="open"][0]
-        
-        sym = str(df_pos.at[i,"symbol"]).upper()
-        long_ex = str(df_pos.at[i,"long_ex"])
-        short_ex = str(df_pos.at[i,"short_ex"])
-
-        # --- 1) Пытаемся взять котировки из текущего скана (в т.ч. bulk) ---
-        sub = quotes_df[(quotes_df["symbol"] == sym)]
-        row_low = None
-        row_high = None
-
-        if not sub.empty:
-            try:
-                row_low = sub[sub["exchange"] == long_ex].iloc[0]
-            except Exception:
-                row_low = None
-            try:
-                row_high = sub[sub["exchange"] == short_ex].iloc[0]
-            except Exception:
-                row_high = None
-
-        # --- 2) Если одной из ног нет в quotes_df (типичная ситуация при USE_BULK_QUOTES),
-        #         подтягиваем актуальный BBO прямым запросом только для этой пары.
-        if row_low is None or row_high is None:
-            ps = getenv_str("PRICE_SOURCE", "mid")
-
-            def _single_quote(ex: str, symbol: str):
-                try:
-                    ex_l = ex.lower()
-                    if ex_l == "binance":
-                        return binance_quote(symbol, ps)
-                    if ex_l == "bybit":
-                        return bybit_quote(symbol, ps)
-                    if ex_l == "okx":
-                        return okx_quote(symbol, ps)
-                    if ex_l == "gate":
-                        return gate_quote(symbol, ps)
-                    if ex_l == "mexc":
-                        return mexc_quote(symbol, ps)
-                except Exception as e:
-                    logging.debug(
-                        "positions_once: direct quote failed for %s@%s: %s",
-                        symbol, ex, e
-                    )
-                return None
-
-            if row_low is None:
-                q = _single_quote(long_ex, sym)
-                if q:
-                    # превращаем dict в Series с нужными полями
-                    row_low = pd.Series({"exchange": long_ex, "symbol": sym, **q})
-
-            if row_high is None:
-                q = _single_quote(short_ex, sym)
-                if q:
-                    row_high = pd.Series({"exchange": short_ex, "symbol": sym, **q})
-
-        # --- 3) Если и после фоллбэка котировок нет — пропускаем exit в этом цикле ---
-        px_low = None
-        px_high = None
-        if row_low is None or row_high is None:
-            logging.debug(
-                "positions_once: no quotes for %s (%s/%s) in this cycle — skip exit check",
-                sym, long_ex, short_ex
-            )
-        else:
-            try:
-                ps = getenv_str("PRICE_SOURCE", "mid")
-                px_low = float(select_px(row_low, ps) or 0.0)
-                px_high = float(select_px(row_high, ps) or 0.0)
-            except Exception as e:
-                logging.debug("positions_once: failed to select_px for %s: %s", sym, e)
-                px_low = None
-                px_high = None
-
-
-        spread_bps_now = None
-        z_now = None
-        if px_low is not None and px_high is not None:
-            spread_bps_now = ((px_high - px_low)/px_low)*1e4 if px_low > 0 else 0.0
-            _, z_now, _ = get_z_for_pair(stats, sym, long_ex, short_ex, px_low, px_high)
-
-        EXIT_HYST_BPS = float(getenv_float("EXIT_HYST_BPS", 3.0))
-        exit_thr = max(0.0, exit_bps - EXIT_HYST_BPS)
-
-        # --- Режим выхода: 'zscore' (по умолчанию) или 'price' ---
-        EXIT_MODE = getenv_str("EXIT_MODE", "zscore").lower()
-        if EXIT_MODE not in ("zscore","price"):
-            EXIT_MODE = "zscore"
-
-        EXIT_REQUIRE_POSITIVE = os.getenv("EXIT_REQUIRE_POSITIVE", "0").lower() in ("1","true","yes")
-
-        if EXIT_MODE == "zscore":
-            if (z_now is not None and z_now == z_now and z_now <= Z_OUT):
-                if EXIT_REQUIRE_POSITIVE:
-                    stored_qty = float(df_pos.at[i,"validated_qty"] or 0.0)
-                    net_now = _estimate_net_now(px_low or 0.0, px_high or 0.0,
-                                                stored_qty, per_leg_notional_usd, taker_fee)
-                    if net_now >= 0:
-                        do_close = True; reason = f"Z-out: z={z_now:.2f} ≤ {Z_OUT:.2f} (>=breakeven)"
-                    else:
-                        # ждём price-exit/стоп/время — Z-out проигнорирован из-за отриц. экономики
-                        pass
-                else:
-                    do_close = True; reason = f"Z-out: z={z_now:.2f} ≤ {Z_OUT:.2f}"
-            elif (spread_bps_now is not None) and (spread_bps_now <= exit_thr):
-                do_close = True; reason = f"Spread converged: {spread_bps_now:.2f} bps ≤ {exit_thr:.2f} bps"
-        else:  # price
-            if (spread_bps_now is not None) and (spread_bps_now <= exit_thr):
-                do_close = True; reason = f"Spread converged: {spread_bps_now:.2f} bps ≤ {exit_thr:.2f} bps (price-arb mode)"
-
-                # --- страховки (необязательно, но очень рекомендуется) ---
-        try:
-            max_hold = int(getenv_float("MAX_HOLD_SEC", 0))
-            if (not do_close) and max_hold > 0:
-                opened_ms = int(df_pos.at[i,"opened_ms"] or 0)
-                if opened_ms and (utc_ms_now() - opened_ms) >= max_hold*1000:
-                    do_close = True; reason = f"Time stop: {max_hold}s"
-            stop_bps = float(getenv_float("STOP_LOSS_BPS", 0.0))
-            if (not do_close) and stop_bps < 0 and (spread_bps_now is not None):
-                if spread_bps_now <= stop_bps:
-                    do_close = True; reason = f"Hard stop: spread {spread_bps_now:.2f} bps ≤ {stop_bps:.2f} bps"
-        except Exception:
-            pass
-
-        if rotate_on and (not do_close) and best is not None:
-            try:
-                # 1) Базовые числа (текущее ожидание по открытой позиции и новое по лучшему сигналу)
-                current_expected = float(df_pos.at[i, "note_net_usd"] or 0.0)
-                new_expected = float(best.get("net_usd") or 0.0)
-                delta_abs = new_expected - current_expected
-
-                # 2) Порог в USD, масштабируемый с капиталом/ногой/текущим net
-                need_abs = _rotate_need_abs(current_expected, per_leg_notional_usd)
-
-                # 3) Доп. фильтры против «дребезга» (включите/настройте в .env при желании)
-                #    - требование улучшения Z на ROTATE_REQUIRE_Z_ADV
-                #    - требование увеличения текущего спреда на ROTATE_HYSTERESIS_BPS
-                z_adv_req = float(getenv_float("ROTATE_REQUIRE_Z_ADV", 0.0))
-                hyst_bps  = float(getenv_float("ROTATE_HYSTERESIS_BPS", 0.0))
-
-                z_best = float(best.get("z") or 0.0)
-                ok_z_adv = True
-                if z_adv_req > 0 and (z_now is not None and z_now == z_now):
-                    ok_z_adv = (z_best - float(z_now)) >= z_adv_req
-
-                spread_best_bps = float(best.get("spread_bps") or 0.0)
-                ok_hyst = True
-                if hyst_bps > 0 and (spread_bps_now is not None):
-                    ok_hyst = (spread_best_bps - float(spread_bps_now)) >= hyst_bps
-
-                # 4) Минимальное время удержания позиции (чтобы не «ёрзать»)
-                min_hold = int(getenv_float("ROTATE_MIN_HOLD_SEC", 0))
-                age_sec = max(0, int((now_ms - int(df_pos.at[i, "opened_ms"] or now_ms)) / 1000))
-                ok_age = (age_sec >= min_hold)
-
-                # 5) Общая проверка ротации
-                if (delta_abs >= need_abs) and ok_z_adv and ok_hyst and ok_age:
-                    do_close = True
-                    reason = (f"Rotate: +${delta_abs:.2f} (need ≥ ${need_abs:.2f})"
-                            + (f", ΔZ≥{z_adv_req:.2f}" if z_adv_req > 0 else "")
-                            + (f", Δbps≥{hyst_bps:.2f}" if hyst_bps > 0 else "")
-                            + (f", age≥{min_hold}s" if min_hold > 0 else ""))
-            except Exception as _e:
-                logging.debug("rotate eval skipped: %s", _e)
-
-        if do_close:
-            px_any = px_low or px_high or 1.0
-            stored_qty = df_pos.at[i,"validated_qty"]
-            qty = float(stored_qty) if (stored_qty is not None and not pd.isna(stored_qty) and float(stored_qty)>0) else per_leg_notional_usd/px_any
-            # проставим client ids для закрытия
-            cl_close_long  = _gen_cloid("CLOSEA", str(df_pos.at[i,"attempt_id"]), "A")
-            cl_close_short = _gen_cloid("CLOSEB", str(df_pos.at[i,"attempt_id"]), "B")
-            close_long_oid = close_short_oid = None
-            close_long_px = close_short_px = 0.0
-            fees_close_total = 0.0
-            if not paper:
-                try:
-                    oa = _place_perp_market_order(long_ex,  sym, "SELL", qty, paper=False, cl_oid=cl_close_long)
-                    ob = _place_perp_market_order(short_ex, sym, "BUY",  qty, paper=False, cl_oid=cl_close_short)
-                    close_long_oid  = oa.get("order_id");  close_short_oid = ob.get("order_id")
-                    close_long_px   = float(oa.get("avg_price") or 0.0); close_short_px = float(ob.get("avg_price") or 0.0)
-                    fees_close_total= float(oa.get("fee_usd") or 0.0) + float(ob.get("fee_usd") or 0.0)
-                except Exception as e:
-                    logging.warning("Close error %s: %s", sym, e)
-            # Попытка добрать фактические цены/комиссии по открытию и закрытию (если поддержано)
-            start_ms_for_trades = utc_ms_now() - int(getenv_float("FILL_LOOKBACK_MS", 180_000))
-            open_long_oid  = str(df_pos.at[i,"open_long_order_id"]  or "")
-            open_short_oid = str(df_pos.at[i,"open_short_order_id"] or "")
-            open_long_cl   = str(df_pos.at[i,"open_long_cloid"] or "")
-            open_short_cl  = str(df_pos.at[i,"open_short_cloid"] or "")
-
-            # Сводки по ногам
-            sum_long  = summarize_fills(long_ex,  sym, "BUY",  open_long_oid,  open_long_cl,  "SELL", close_long_oid,  cl_close_long,  start_ms_for_trades)
-            sum_short = summarize_fills(short_ex, sym, "SELL", open_short_oid, open_short_cl, "BUY",  close_short_oid, cl_close_short, start_ms_for_trades)
-            
-            #  Окончательные цены/комиссии: приоритет — из сводок, иначе — из мгновенных ответов
-            open_long_px   = float(df_pos.at[i,"open_long_px"]  or 0.0) or sum_long["avg_open_px"]
-            open_short_px  = float(df_pos.at[i,"open_short_px"] or 0.0) or sum_short["avg_open_px"]
-
-            # если Bybit demo не вернуло execPrice — подставляем цены входа из меты
-            used_snapshot_open = False
-
-            if open_long_px == 0.0:
-                open_long_px = float(df_pos.at[i, "entry_px_low"] or 0.0)
-                used_snapshot_open = True
-            if open_short_px == 0.0:
-                open_short_px = float(df_pos.at[i, "entry_px_high"] or 0.0)
-                used_snapshot_open = True
-
-            close_long_px  = close_long_px  or sum_long["avg_close_px"]
-            close_short_px = close_short_px or sum_short["avg_close_px"]
-
-            # если закрытие тоже нулевое — берём актуальные котировки из цикла (px_low/px_high)
-            # (для long-SELL — реалистично близко к bid; у нас это выбранный PRICE_SOURCE,
-            # поэтому безопасно подставить px_low/px_high соответствующих бирж)
-            if (not close_long_px) and (px_low is not None):
-                close_long_px = float(px_low)
-            if (not close_short_px) and (px_high is not None):
-                close_short_px = float(px_high)
-
-            fees_open_total  = float(df_pos.at[i,"open_fees_usd"] or 0.0) + sum_long["fees_open_usd"] + sum_short["fees_open_usd"]
-            fees_close_total = fees_close_total + sum_long["fees_close_usd"] + sum_short["fees_close_usd"]
-            # Реализованный PnL: LONG (BUY->SELL) + SHORT (SELL->BUY)
-            realized_long  = (close_long_px  - open_long_px ) * qty if (close_long_px and open_long_px) else 0.0
-            realized_short = (open_short_px  - close_short_px) * qty if (close_short_px and open_short_px) else 0.0
-            realized_total = realized_long + realized_short - (fees_open_total + fees_close_total)
-
-            # --- защита от NaN перед сохранением
-            if realized_total != realized_total:
-                realized_total = 0.0
-
-            # Запись в positions
-            df_pos.at[i,"status"]="closed"
-            df_pos.at[i,"closed_at"]=iso_utc(now_ms)
-            df_pos.at[i,"close_reason"]=reason
-            df_pos.at[i,"last_ms"]=now_ms
-            df_pos.at[i,"close_long_order_id"]  = close_long_oid or ""
-            df_pos.at[i,"close_short_order_id"] = close_short_oid or ""
-            df_pos.at[i,"close_long_px"]  = close_long_px
-            df_pos.at[i,"close_short_px"] = close_short_px
-            df_pos.at[i,"close_fees_usd"] = fees_close_total
-            df_pos.at[i,"close_long_cloid"]  = cl_close_long
-            df_pos.at[i,"close_short_cloid"] = cl_close_short            
-            df_pos.at[i,"realized_pnl_usd"] = realized_total
-
-            globals().setdefault("_LAST_CLOSED", {})[sym] = time.time()
-
-            maybe_send_telegram(f"✅ <b>Closed</b> {sym}\n{_anchor(long_ex,sym)} / {_anchor(short_ex,sym)}\nReason: {reason}")
-            # Доп. карточка с фактом PnL
-            try:
-                pnl_lines = [
-                    f"💰 <b>Realized PnL</b>: <b>${realized_total:.2f}</b>",
-                    f"   Long: open {open_long_px:.6f} → close {close_long_px:.6f}",
-                    f"   Short: open {open_short_px:.6f} → close {close_short_px:.6f}",
-                    f"   Fees: open ${fees_open_total:.2f} + close ${fees_close_total:.2f}",
-                ]
-
-                # --- Балансы после закрытия (только если не PAPER)  # NEW
-                if not paper:
-                    try:
-                        all_exchanges = getenv_list("EXCHANGES", DEFAULT_EXCHANGES)
-                        balances = get_post_close_balances(all_exchanges)
-                        if balances:
-                            pnl_lines.append("🏦 <b>Балансы после закрытия</b>:")
-                            bn = balances.get("BINANCE", {})
-                            by = balances.get("BYBIT",   {})
-                            ok = balances.get("OKX",     {})
-                            gt = balances.get("GATE",    {})
-
-                            if bn:
-                                pnl_lines.append(
-                                    f"   BINANCE (USDT): wallet ${bn.get('wallet',0):.2f}, "
-                                    f"available ${bn.get('available',0):.2f}"
-                                )
-                            if by:
-                                demo_tag = " (demo)" if _is_true("BYBIT_DEMO", False) else ""
-                                pnl_lines.append(
-                                    f"   BYBIT{demo_tag} (USDT): equity ${by.get('equity',0):.2f}, "
-                                    f"wallet ${by.get('wallet',0):.2f}, available ${by.get('available',0):.2f}"
-                                )
-                            if ok:
-                                sim_tag = " (paper)" if _is_true("OKX_PAPER", False) or _is_true("OKX_TESTNET", False) else ""
-                                pnl_lines.append(
-                                    f"   OKX{sim_tag} (USDT): equity ${ok.get('equity',0):.2f}, "
-                                    f"wallet ${ok.get('wallet',0):.2f}, available ${ok.get('available',0):.2f}"
-                                )
-                            if gt:
-                                sim_tag = " (testnet)" if _is_true("GATE_TESTNET", False) or _is_true("GATE_PAPER", False) else ""
-                                pnl_lines.append(
-                                    f"   GATE{sim_tag} (USDT): equity ${gt.get('equity',0):.2f}, "
-                                    f"wallet ${gt.get('wallet',0):.2f}, available ${gt.get('available',0):.2f}"
-                                )
-
-                            # --- ИТОГО по всем биржам ---
-                            total_equity = 0.0
-                            for name, b in balances.items():
-                                eq = b.get("equity")
-                                if eq is None:
-                                    eq = (b.get("wallet", 0.0) or 0.0) + float(b.get("uPnL", 0.0) or 0.0)
-                                total_equity += float(eq or 0.0)
-                            if total_equity > 0:
-                                pnl_lines.append(f"   TOTAL ≈ ${total_equity:.2f}")
-                    except Exception as e:
-                        logging.debug("post-close balances fetch skipped: %s", e)
-
-                snap_tag = " (snapshot)" if used_snapshot_open else ""
-                pnl_lines.append(
-                    f"   Long: open {open_long_px:.6f}{snap_tag} → close {close_long_px:.6f}\n"
-                    f"   Short: open {open_short_px:.6f}{snap_tag} → close {close_short_px:.6f}"
-                )
-
-                maybe_send_telegram("\n".join(pnl_lines))
-            except Exception:
-                pass            
-            save_positions(pos_path, df_pos)
-            has_open = False
-
-    if (not has_open) and best is not None:
-        spread_bps = float(best["spread_bps"])
-        if float(best.get("z", 0.0)) >= Z_IN and float(best.get("net_usd_adj", 0.0))>0.0:
-            sym = str(best["symbol"]).upper()
-            cheap_ex = str(best["long_ex"]); rich_ex=str(best["short_ex"])
-            px_low = float(best["px_low"]); px_high=float(best["px_high"])
-            # Базовая оценка из кандидата
-            qty = float(best["qty_est"]) if best["qty_est"] and best["qty_est"]>0 else per_leg_notional_usd/max(px_low,1.0)
-            # Жёсткий лимит от капитала и шага лота (для обеих бирж)
-            try:
-                # шаг на Bybit
-                by_tick, _, _, by_qty_step = bybit_get_filters(sym)
-            except Exception:
-                by_qty_step = 0.0
-            # для Binance шаг возьмём из exchangeInfo
-            bn_info = _binance_symbol_info(sym) or {}
-            lot_f = {f["filterType"]: f for f in bn_info.get("filters", [])}.get("LOT_SIZE") or {}
-            bn_qty_step = float(lot_f.get("stepSize") or 0.0)
-            qty_capA = cap_qty_by_capital(px_low,  by_qty_step or bn_qty_step or 0.0, float(getenv_float("CAPITAL",1000.0)), float(getenv_float("PERP_LEVERAGE",5.0)))
-            qty_capB = cap_qty_by_capital(px_high, by_qty_step or bn_qty_step or 0.0, float(getenv_float("CAPITAL",1000.0)), float(getenv_float("PERP_LEVERAGE",5.0)))
-            qty = max(0.0, min(qty, qty_capA, qty_capB))
-            if qty <= 0:
-                logging.debug("Qty capped to 0 by capital limits — skip %s", sym)
-                return
-            
-            COOLDOWN_AFTER_CLOSE_SEC = int(getenv_float("COOLDOWN_AFTER_CLOSE_SEC", 30))
-            _LAST_CLOSED: dict[str, float] = globals().setdefault("_LAST_CLOSED", {})
-
-            # проверяем кулдаун до установки pair-lock
-            if COOLDOWN_AFTER_CLOSE_SEC > 0 and sym in _LAST_CLOSED:
-                if (time.time() - _LAST_CLOSED[sym]) < COOLDOWN_AFTER_CLOSE_SEC:
-                    logging.debug("Skip open %s due to cooldown after close", sym)
-                    return
-
-            # Pair-lock: не даём начать открытие другого тикера
-            if not open_lock_check_or_set(sym):
-                return
-                
-            ok, attempt_id, meta = atomic_cross_open(
-                symbol=sym, cheap_ex=cheap_ex, rich_ex=rich_ex,
-                qty=qty, price_low=px_low, price_high=px_high, paper=paper
-            )
-            if ok:
-                cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max() if not df_pos.empty else None
-                next_id = int(cur_max)+1 if cur_max==cur_max and cur_max is not None else 1
-                new = {
-                    "id": next_id, "attempt_id": attempt_id, "symbol": sym,
-                    "long_ex": cheap_ex, "short_ex": rich_ex,
-                    "opened_ms": now_ms, "last_ms": now_ms, "held_h": 0.0,
-                    "size_usd": per_leg_notional_usd,
-                    "entry_spread_bps": spread_bps,
-                    "entry_px_low": px_low, "entry_px_high": px_high,
-                    "status":"open",
-                    "opened_at": iso_utc(now_ms), "closed_at":"", "close_reason":"",
-                    "validated_qty": meta.get("qty", qty),
-                    "note_net_usd": float(best["net_usd"]),
-                    "open_long_order_id":  meta.get("open_long_order_id",""),
-                    "open_short_order_id": meta.get("open_short_order_id",""),
-                    "open_long_px":  meta.get("open_long_px", 0.0),
-                    "open_short_px": meta.get("open_short_px", 0.0),
-                    "open_fees_usd": meta.get("open_fees_usd", 0.0),
-                    "open_long_cloid": meta.get("open_long_cloid",""),
-                    "open_short_cloid":meta.get("open_short_cloid","")
-                }
-                df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
-                # --- NEW: подменяем снапшотные цены на реальные fill-цены для карточки OPENED
-                best_opened = dict(best)
-                if meta.get("open_long_px"):
-                    best_opened["px_low"] = float(meta["open_long_px"])
-                if meta.get("open_short_px"):
-                    best_opened["px_high"] = float(meta["open_short_px"])
-
-                best_opened["spread_bps"] = (
-                    (best_opened["px_high"] - best_opened["px_low"]) / max(best_opened["px_low"], 1e-12) * 1e4
-                )
-
-                maybe_send_telegram("✅ <b>OPENED</b>\n" + format_signal_card(best_opened, per_leg_notional_usd, price_source))
-                open_lock_clear()
-            else:
-                err = str(meta.get("error") or "unknown")
-                logging.warning("Open failed: %s", err)
-
-                if getenv_bool("DEBUG_INSTANT_OPEN", False):
-                    try:
-                        card = format_signal_card(best, per_leg_notional_usd, price_source)
-                    except Exception:
-                        card = ""
-                    msg = (
-                        "⚠️ <b>OPEN FAILED</b>\n"
-                        f"{sym} {cheap_ex.upper()} ↔ {rich_ex.upper()}\n"
-                        f"Причина: <code>{err}</code>"
-                    )
-                    if card:
-                        msg = msg + "\n\n" + card
-                    maybe_send_telegram(msg)
-
-                open_lock_clear()
-    save_positions(pos_path, df_pos)
 
 def positions_once(
     quotes_df: pd.DataFrame,
