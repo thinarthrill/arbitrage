@@ -2396,7 +2396,8 @@ def scan_spreads_once(
     # ==== 9. Если нет кандидатов ====
     if not candidates:
         logging.info("No price-filtered candidates this cycle.")
-        return None
+        quotes_df = pd.DataFrame(records)
+        return None, quotes_df
 
     # ==== 10. Выбираем лучший сигнал ====
     best = max(candidates, key=lambda x: x["spread_bps"])
@@ -3907,7 +3908,11 @@ def positions_once(
                     msg = ">" + format_signal_card(rec, per_leg_notional_usd, price_source)
                     maybe_send_telegram(msg)
                 except Exception:
-                    pass
+                    # НЕ глушим! иначе TG молчит навсегда
+                    logging.exception(
+                        "format_signal_card / telegram failed for %s %s↔%s",
+                        rec.get("symbol"), rec.get("long_ex"), rec.get("short_ex")
+                    )
         except Exception as e:
             logging.debug("positions_once: topN TG failed: %s", e)
 
