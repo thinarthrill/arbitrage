@@ -2966,18 +2966,25 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         "net_usd": net
     }
 
-def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, taker_fee: float, price_source: str) -> pd.DataFrame:
-    if df_raw.empty: return pd.DataFrame()
+def build_price_arbitrage(
+    df_raw: pd.DataFrame,
+    per_leg_notional_usd: float,
+    taker_fee: float,
+    price_source: str
+) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
+
     use = df_raw.copy()
-    ps = price_source.lower()
-        # --- PATCH: make sure bid/ask columns exist for book mode ---
+    ps = (price_source or "mid").lower()
+
+    # --- FIX: гарантируем наличие bid/ask для book-режима ---
     if ps == "book":
-        # иногда quotes_df приезжает без bid/ask (после bulk/legacy путей)
         for col in ("bid", "ask"):
             if col not in use.columns:
                 use[col] = np.nan
 
-        # попытка мягко восстановить bid/ask из mid/px, если они есть
+        # мягкое восстановление из mid/px если bulk вернул только их
         if use["ask"].isna().all() and "mid" in use.columns:
             use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
         if use["bid"].isna().all() and "mid" in use.columns:
@@ -2988,58 +2995,76 @@ def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, tak
         if use["bid"].isna().all() and "px" in use.columns:
             use["bid"] = pd.to_numeric(use["px"], errors="coerce")
 
-    if ps == "book":
-        # Для книги заявок работаем сразу с bid/ask, не создаём единую "px"
-        pass
-    else:
+    # обычные режимы: строим px
+    if ps != "book":
         use["px"] = use.apply(lambda r: select_px(r, price_source), axis=1)
         use = use.dropna(subset=["px"])
-    out_rows=[]
+
+    out_rows = []
     for sym in sorted(use["symbol"].unique()):
-        sub = use[use["symbol"]==sym]
+        sub = use[use["symbol"] == sym]
+
         if ps == "book":
-            # если колонок нет/все NaN — просто пропускаем символ
+            # защита от отсутствующих колонок/NaN
             if "ask" not in sub.columns or "bid" not in sub.columns:
                 continue
 
-            sub_ask = sub.dropna(subset=["ask"])
-            sub_bid = sub.dropna(subset=["bid"])
+            sub_ask = sub.dropna(subset=["ask"]).copy()
+            sub_bid = sub.dropna(subset=["bid"]).copy()
             if sub_ask.empty or sub_bid.empty:
                 continue
 
-            cheapest = sub_ask.loc[pd.to_numeric(sub_ask["ask"], errors="coerce").idxmin()]
-            priciest = sub_bid.loc[pd.to_numeric(sub_bid["bid"], errors="coerce").idxmax()]
+            sub_ask["ask"] = pd.to_numeric(sub_ask["ask"], errors="coerce")
+            sub_bid["bid"] = pd.to_numeric(sub_bid["bid"], errors="coerce")
+            sub_ask = sub_ask.dropna(subset=["ask"])
+            sub_bid = sub_bid.dropna(subset=["bid"])
+            if sub_ask.empty or sub_bid.empty:
+                continue
+
+            cheapest = sub_ask.loc[sub_ask["ask"].idxmin()]
+            priciest = sub_bid.loc[sub_bid["bid"].idxmax()]
+
             if str(cheapest["exchange"]) == str(priciest["exchange"]):
                 continue
 
-            px_low, ex_low   = float(cheapest["ask"]),  str(cheapest["exchange"])
-            px_high, ex_high = float(priciest["bid"]),  str(priciest["exchange"])
+            px_low, ex_low   = float(cheapest["ask"]), str(cheapest["exchange"])
+            px_high, ex_high = float(priciest["bid"]), str(priciest["exchange"])
+
         else:
-            if len(sub) < 2: continue
+            if len(sub) < 2:
+                continue
             cheapest = sub.loc[sub["px"].idxmin()]
             priciest = sub.loc[sub["px"].idxmax()]
-            px_low, ex_low = float(cheapest["px"]), str(cheapest["exchange"])
+            px_low, ex_low   = float(cheapest["px"]), str(cheapest["exchange"])
             px_high, ex_high = float(priciest["px"]), str(priciest["exchange"])
 
         spread = px_high - px_low
-        spread_pct = (spread/px_low)*100.0 if px_low>0 else 0.0
-        spread_bps = spread_pct*100.0
-        qty = per_leg_notional_usd / px_low if px_low>0 else 0.0
+        spread_pct = (spread / px_low) * 100.0 if px_low > 0 else 0.0
+        spread_bps = spread_pct * 100.0
+
+        qty = per_leg_notional_usd / px_low if px_low > 0 else 0.0
         gross = spread * qty
         fees_rt = 4.0 * taker_fee * per_leg_notional_usd
         net = gross - fees_rt
+
         out_rows.append({
             "symbol": sym,
-            "long_ex": ex_low, "short_ex": ex_high,
-            "px_low": px_low, "px_high": px_high,
-            "spread": spread, "spread_pct": spread_pct, "spread_bps": spread_bps,
-            "qty_est": qty, "gross_usd": gross,
+            "long_ex": ex_low,
+            "short_ex": ex_high,
+            "px_low": px_low,
+            "px_high": px_high,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "spread_bps": spread_bps,
+            "qty_est": qty,
+            "gross_usd": gross,
             "fees_roundtrip_usd": fees_rt,
-            "net_usd": net
+            "net_usd": net,
         })
+
     out = pd.DataFrame(out_rows)
     if not out.empty:
-        out = out.sort_values(["net_usd","spread_bps"], ascending=[False,False]).reset_index(drop=True)
+        out = out.sort_values(["net_usd", "spread_bps"], ascending=[False, False]).reset_index(drop=True)
     return out
 
 # ----------------- Z-score: reading spread stats -----------------
