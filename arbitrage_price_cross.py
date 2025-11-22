@@ -2903,6 +2903,10 @@ def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, tak
     if df_raw.empty: return pd.DataFrame()
     use = df_raw.copy()
     ps = price_source.lower()
+    if "bid" not in use.columns:
+        use["bid"] = np.nan
+    if "ask" not in use.columns:
+        use["ask"] = np.nan
     if ps == "book":
         # Для книги заявок работаем сразу с bid/ask, не создаём единую "px"
         pass
