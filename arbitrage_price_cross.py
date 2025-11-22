@@ -39,6 +39,8 @@ def _public_base(exchange: str) -> str:
 # === BULK PATCH START ===
 import time
 import traceback
+import sys
+
 def ensure_gcs_credentials_from_env():
     """
     Использует именно твои env-переменные:
@@ -82,10 +84,6 @@ def ensure_gcs_credentials_from_env():
         logging.info("[GCS] Credentials loaded from GCS_KEY_JSON into %s", path)
     except Exception as e:
         logging.error("[GCS] Failed to write temp credentials file: %s", e)
-
-
-# вызови один раз при старте
-ensure_gcs_credentials_from_env()
 
 def _bulk_binance():
     url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
@@ -4336,11 +4334,25 @@ def dryrun_log_close(ex_long: str, sym_long: str, qty_long: float,
 
 # ----------------- Main loop -----------------
 def main():
+    # ----- глобальный traceback в лог -----
+    def _global_excepthook(exc_type, exc, tb):
+        try:
+            logging.critical("FATAL EXCEPTION", exc_info=(exc_type, exc, tb))
+        finally:
+            traceback.print_exception(exc_type, exc, tb)
+    sys.excepthook = _global_excepthook
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
     # Проверка коннектов перед запуском цикла
     must_check = _is_true("CHECK_EXCHANGES_AT_START", True)
     must_quit  = _is_true("QUIT_ON_CONNECTIVITY_FAIL", True)
     probe_sym  = os.getenv("CONNECTIVITY_PROBE_SYMBOL", "BTCUSDT").upper()
+
+    # ----- GCS creds теперь безопасно тут -----
+    try:
+        ensure_gcs_credentials_from_env()
+    except Exception as e:
+        logging.exception("[GCS] ensure_gcs_credentials_from_env failed: %s", e)
+
     if must_check:
         # определяем окружение для каждой биржи (mainnet / testnet / demo)
         per_env = {}
@@ -4358,7 +4370,7 @@ def main():
         price_feed_env = "mainnet"
         logging.info(f"[ENV] price_feed_env={price_feed_env}  order_env_per_exchange={per_env}")
 
-                # ===== ЖЁСТКАЯ ПРОВЕРКА BYBIT ПРИ СТАРТЕ =====
+        # ===== ЖЁСТКАЯ ПРОВЕРКА BYBIT ПРИ СТАРТЕ =====
         try:
             logging.info("[DEBUG] Startup Bybit balance via bybit_unified_usdt_balance()")
             bal = bybit_unified_usdt_balance()
