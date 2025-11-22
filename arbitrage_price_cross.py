@@ -2271,16 +2271,12 @@ def scan_all_with_instant_alerts(
     cols = ["exchange","symbol","bid","ask","mid","last","mark","ts"]
     return pd.DataFrame(rows_all) if rows_all else pd.DataFrame(columns=cols)
 
-# ============================================================
-# =========== BULK-OPTIMIZED SCAN_SPREADS_ONCE ===============
-# ============================================================
-
 def scan_spreads_once(
     exchanges,
     symbols,
     spread_bps_min,
     spread_bps_max,
-    per_leg_notional_usd,  # <-- имя параметра совпадает с вызовом
+    per_leg_notional_usd,
     taker_fee,
     pos_path,
     price_stats_path,
@@ -2291,177 +2287,146 @@ def scan_spreads_once(
     cooldown_sec: int = 60,
     instant_open: bool = True,
     pos_path_for_instant: Optional[str] = None,
-    paper: Optional[bool] = None,
+    paper: bool = True,
+    per_ex_symbols: Optional[dict] = None,   # <-- чтобы main не падал
 ):
     """
-    Быстрый цикл сканирования, использующий bulk-тickers для Binance, Bybit, OKX, Gate.
-    Возвращает:
-      best: dict | None  (лучший спред-кандидат)
-      quotes_df: DataFrame (per-exchange котировки для downstream EMA + positions_once)
+    Bulk-оптимизированный сканер:
+    1) грузит bulk-котировки со всех бирж
+    2) строит quotes_df
+    3) считает price-arb кандидатов
+    4) подмешивает z-score (если есть stats)
+    5) шлёт instant-alert + может открыть сделку
+    Возвращает: best_row_dict | None, quotes_df
     """
-    start_ts = time.time()
 
-    # ==== 1. Загружаем котировки одним bulk-запросом ====
-    bulk = load_all_bulk_quotes(exchanges)
-    # bulk[ex][symbol] = {"bid":..,"ask":..,"last":..,"mark":..}
+    # ---------- 1) грузим bulk quotes ----------
+    use_bulk = getenv_bool("USE_BULK_QUOTES", True)
+    bulk_quotes = load_all_bulk_quotes(exchanges) if use_bulk else {}
 
-    # --- локальный безопасный float ---
-    def _f(x, default=0.0):
-        try:
-            v = float(x)
-            if math.isnan(v) or math.isinf(v):
-                return default
-            return v
-        except Exception:
-            return default
-
-    now_ms = utc_ms_now()
-
-    # ==== 2. Собираем per-exchange quotes (ВОЗВРАЩАЕМ ИХ НАРУЖУ) ====
     rows_all = []
-    for sym in symbols:
-        su = sym.upper()
-        for ex in exchanges:
-            q = bulk.get(ex, {}).get(su)
-            if not q:
+    now = time.time()
+
+    # ---------- 2) flatten bulk -> quotes_df ----------
+    for ex in exchanges:
+        ex_l = ex.lower()
+        ex_quotes = bulk_quotes.get(ex_l, {}) or {}
+
+        allowed_syms = None
+        if per_ex_symbols and ex_l in per_ex_symbols:
+            # per_ex_symbols хранит UPPERCASE; приводим так же
+            allowed_syms = set(s.upper() for s in per_ex_symbols[ex_l])
+
+        for sym, q in ex_quotes.items():
+            sym_u = str(sym).upper()
+            if symbols and sym_u not in set(symbols):
                 continue
-            bid  = _f(q.get("bid"), 0.0)
-            ask  = _f(q.get("ask"), 0.0)
-            last = _f(q.get("last"), 0.0)
-            mark = _f(q.get("mark"), 0.0)
+            if allowed_syms is not None and sym_u not in allowed_syms:
+                continue
+
+            bid  = to_float(q.get("bid"))
+            ask  = to_float(q.get("ask"))
+            last = to_float(q.get("last"))
+            mark = to_float(q.get("mark"))
 
             mid = None
-            if bid > 0 and ask > 0:
-                mid = 0.5 * (bid + ask)
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
 
             rows_all.append({
-                "exchange": ex,
-                "symbol": su,
+                "exchange": ex_l,
+                "symbol": sym_u,
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,
                 "last": last,
                 "mark": mark,
-                "ts": now_ms,
+                "ts": q.get("ts", now),
             })
 
-    cols_quotes = ["exchange","symbol","bid","ask","mid","last","mark","ts"]
-    quotes_df = pd.DataFrame(rows_all) if rows_all else pd.DataFrame(columns=cols_quotes)
-
-    records = []     # для расчёта статистики спредов
-    candidates = []  # для сигналов
-
-    # ==== 3. Проходим по каждому символу и ищем min/max по биржам ====
-    for sym in symbols:
-        su = sym.upper()
-
-        best_long_ex  = None
-        best_short_ex = None
-        best_low_px   = 1e18
-        best_high_px  = 0.0
-
-        for ex in exchanges:
-            q = bulk.get(ex, {}).get(su)
-            if not q:
-                continue
-
-            bid  = _f(q.get("bid"), 0.0)
-            ask  = _f(q.get("ask"), 0.0)
-            last = _f(q.get("last"), 0.0)
-            mark = _f(q.get("mark"), 0.0)
-
-            # выбираем цену в зависимости от источника
-            if price_source in ("book", "mid"):
-                low_px  = ask if ask > 0 else 0.0
-                high_px = bid if bid > 0 else 0.0
-                px_for_min = low_px
-                px_for_max = high_px
-            elif price_source == "last":
-                px = last if last > 0 else (0.5*(bid+ask) if bid>0 and ask>0 else 0.0)
-                px_for_min = px_for_max = px
-            elif price_source == "mark":
-                px = mark if mark > 0 else (0.5*(bid+ask) if bid>0 and ask>0 else 0.0)
-                px_for_min = px_for_max = px
-            else:
-                px = (0.5*(bid+ask) if bid>0 and ask>0 else last or mark or 0.0)
-                px_for_min = px_for_max = px
-
-            if px_for_min > 0 and px_for_min < best_low_px:
-                best_low_px = px_for_min
-                best_long_ex = ex
-
-            if px_for_max > 0 and px_for_max > best_high_px:
-                best_high_px = px_for_max
-                best_short_ex = ex
-
-        # если нет нормальных цен — пропускаем
-        if not best_long_ex or not best_short_ex:
-            continue
-        if best_long_ex == best_short_ex:
-            continue
-        if best_low_px <= 0 or best_high_px <= 0:
-            continue
-
-        # ==== 4. Считаем спред ====
-        spread = best_high_px - best_low_px
-        spread_pct = spread / best_low_px
-        spread_bps = spread_pct * 1e4  # bps
-
-        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-        # ==== 5. Пишем историю для stats ====
-        records.append({
-            "symbol": su,
-            "long_ex": best_long_ex,
-            "short_ex": best_short_ex,
-            "px_low": best_low_px,
-            "px_high": best_high_px,
-            "spread_bps": spread_bps,
-            "timestamp": ts_str
-        })
-
-        # ==== 6. Фильтруем кандидатов по диапазону bps ====
-        if spread_bps < spread_bps_min or spread_bps > spread_bps_max:
-            continue
-
-        candidates.append({
-            "symbol": su,
-            "long_ex": best_long_ex,
-            "short_ex": best_short_ex,
-            "px_low": best_low_px,
-            "px_high": best_high_px,
-            "spread_bps": spread_bps
-        })
-
-    # ==== 7. Записываем статистику spread_stats.csv ====
-    if records:
-        try:
-            df = pd.DataFrame(records)
-            if os.path.exists(price_stats_path):
-                df0 = pd.read_csv(price_stats_path)
-                df = pd.concat([df0, df], ignore_index=True)
-            df.to_csv(price_stats_path, index=False)
-            logging.info(f"Spread stats saved: rows={len(df)}")
-        except Exception as e:
-            logging.warning(f"Stats save error: {e}")
-
-    # ==== 8. Логи цикла ====
-    if debug:
-        logging.info(
-            f"[SCAN] done in {time.time()-start_ts:.2f}s "
-            f"| symbols={len(symbols)} records={len(records)} candidates={len(candidates)} "
-            f"| price_source={price_source}"
-        )
-
-    # ==== 9. Если кандидатов нет — возвращаем None и нормальный quotes_df ====
-    if not candidates:
-        logging.info("No price-filtered candidates this cycle.")
+    cols = ["exchange", "symbol", "bid", "ask", "mid", "last", "mark", "ts"]
+    quotes_df = pd.DataFrame(rows_all, columns=cols)
+    if quotes_df.empty:
         return None, quotes_df
 
-    # ==== 10. Лучший спред ====
-    best = max(candidates, key=lambda x: x["spread_bps"])
-    if debug:
-        logging.info(f"Best candidate: {best}")
+    # ---------- 3) price-arb кандидаты ----------
+    price_source = (price_source or "mid").lower()
+    cands = build_price_arbitrage(quotes_df, per_leg_notional_usd, taker_fee, price_source)
+
+    if cands is None or cands.empty:
+        return None, quotes_df
+
+    # фильтр по спреду (на всякий, build_price_arbitrage не всегда режет)
+    cands = cands[
+        (cands["spread_bps"] >= float(spread_bps_min)) &
+        (cands["spread_bps"] <= float(spread_bps_max))
+    ].copy()
+
+    if cands.empty:
+        return None, quotes_df
+
+    # ---------- 4) подмешиваем z-score из EMA stats ----------
+    try:
+        stats_df = read_spread_stats(price_stats_path)
+    except Exception:
+        stats_df = pd.DataFrame(columns=STATS_COLS)
+
+    if not stats_df.empty:
+        stats_df = stats_df.copy()
+        stats_df["std"] = np.sqrt(stats_df["ema_var"].clip(lower=0.0))
+        stats_key = stats_df.set_index(["symbol", "ex_low", "ex_high"])
+
+        z_list, std_list, n_list = [], [], []
+        for _, r in cands.iterrows():
+            key = (str(r["symbol"]).upper(), str(r["ex_low"]).lower(), str(r["ex_high"]).lower())
+            if key in stats_key.index:
+                st = stats_key.loc[key]
+                mu = float(st["ema_mean"])
+                sd = float(st["std"])
+                n  = float(st.get("n", 0))
+                x  = float(r["log_spread"])
+                z  = (x - mu) / sd if sd > 0 else np.nan
+                z_list.append(z)
+                std_list.append(sd)
+                n_list.append(n)
+            else:
+                z_list.append(np.nan)
+                std_list.append(np.nan)
+                n_list.append(0)
+
+        cands["z"] = z_list
+        cands["std"] = std_list
+        cands["n"] = n_list
+    else:
+        cands["z"] = np.nan
+        cands["std"] = np.nan
+        cands["n"] = 0
+
+    # ---------- 5) выбираем best ----------
+    best = cands.iloc[0].to_dict()
+
+    # ---------- 6) instant alert в TG ----------
+    try:
+        if INSTANT_ALERT and best.get("spread_pct") is not None:
+            if float(best["spread_pct"]) >= float(alert_spread_pct):
+                last_ts = _LAST_ALERT_TS.get(best["symbol"], 0.0)
+                if (now - last_ts) >= float(cooldown_sec):
+                    card = format_signal_card(best, per_leg_notional_usd, price_source)
+                    maybe_send_telegram("⚡ <b>INSTANT ALERT</b>\n\n" + card)
+                    _LAST_ALERT_TS[best["symbol"]] = now
+    except Exception as e:
+        logging.warning("[ALERT] instant alert failed: %s", e)
+
+    # ---------- 7) instant open ----------
+    try:
+        if instant_open:
+            try_instant_open(
+                best=best,
+                pos_path=(pos_path_for_instant or pos_path),
+                paper=paper,
+            )
+    except Exception as e:
+        logging.warning("[OPEN] instant open failed: %s", e)
 
     return best, quotes_df
 
@@ -4403,61 +4368,37 @@ def dryrun_log_close(ex_long: str, sym_long: str, qty_long: float,
 
 # ----------------- Main loop -----------------
 def main():
-    # --------------------------------------------------------
-    # Глобальный traceback в лог
-    # --------------------------------------------------------
+    # ----- глобальный traceback в лог -----
     def _global_excepthook(exc_type, exc, tb):
         try:
             logging.critical("FATAL EXCEPTION", exc_info=(exc_type, exc, tb))
         finally:
             traceback.print_exception(exc_type, exc, tb)
-
     sys.excepthook = _global_excepthook
 
-    # --------------------------------------------------------
-    # Чтение конфигов
-    # --------------------------------------------------------
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
+
     must_check = _is_true("CHECK_EXCHANGES_AT_START", True)
     must_quit  = _is_true("QUIT_ON_CONNECTIVITY_FAIL", True)
     probe_sym  = os.getenv("CONNECTIVITY_PROBE_SYMBOL", "BTCUSDT").upper()
 
-    # --------------------------------------------------------
-    # GCS credentials
-    # --------------------------------------------------------
+    # ----- GCS creds -----
     try:
         ensure_gcs_credentials_from_env()
     except Exception as e:
         logging.exception("[GCS] ensure_gcs_credentials_from_env failed: %s", e)
 
-    # --------------------------------------------------------
-    # Connectivity checks
-    # --------------------------------------------------------
     if must_check:
         per_env = {}
         for ex in exchanges:
             base = _private_base(ex)
             env = "testnet" if "testnet" in base else ("demo" if "api-demo" in base else "mainnet")
-
             if ex.lower() == "okx":
                 if _is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False):
                     env = "demo"
-
             per_env[ex] = env
 
         logging.info(f"[ENV] price_feed_env=mainnet  order_env_per_exchange={per_env}")
-
-        try:
-            bal = bybit_unified_usdt_balance()
-            logging.info("[DEBUG] Bybit balance startup = %s", bal)
-        except Exception as e:
-            logging.exception("[DEBUG] bybit_unified_usdt_balance() startup error: %s", e)
-
-        try:
-            ok = _check_bybit_auth()
-            logging.info("[DEBUG] Bybit auth startup = %s", ok)
-        except Exception as e:
-            logging.exception("[DEBUG] _check_bybit_auth() startup error: %s", e)
 
         if not check_connectivity(exchanges, probe_symbol=probe_sym):
             msg = "Startup connectivity check failed — one or more exchanges unavailable."
@@ -4465,8 +4406,6 @@ def main():
             if must_quit:
                 maybe_send_telegram(f"❌ {msg}")
                 return
-            else:
-                logging.warning("Continuing despite failed connectivity")
 
         if _is_true("AUTH_CHECK_AT_START", True):
             logging.info("Running private API auth checks...")
@@ -4476,12 +4415,8 @@ def main():
                 if must_quit:
                     maybe_send_telegram(f"❌ {msg}")
                     return
-                else:
-                    logging.warning("Continuing despite auth failure")
 
-    # --------------------------------------------------------
-    # SYMBOL SOURCES
-    # --------------------------------------------------------
+    # ---------------- Symbols ----------------
     src = getenv_str("SYMBOLS_SOURCE", "common").lower()
     symbols_env = getenv_list("SYMBOLS", [])
     top_n = int(getenv_float("TOP_N", 200))
@@ -4496,8 +4431,6 @@ def main():
         symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote)
     elif src == "union":
         symbols = symbols_from_matrix(matrix_path, exchanges, mode="union") if matrix_path else COMMON_SYMBOLS
-    elif src == "common":
-        symbols = COMMON_SYMBOLS
     elif src == "matrix":
         symbols = symbols_from_matrix(matrix_path, exchanges, mode=matrix_mode) if matrix_path else COMMON_SYMBOLS
     else:
@@ -4506,24 +4439,20 @@ def main():
     per_ex_symbols = None
     if matrix_path and use_per_ex:
         per_ex_symbols = matrix_per_exchange_symbols(matrix_path, exchanges)
-        logging.info(
-            "Per-exchange symbol filter enabled (matrix): %s",
-            {ex: len(s) for ex, s in per_ex_symbols.items()}
-        )
+        logging.info("Per-exchange symbol filter enabled (matrix): %s",
+                     {ex: len(s) for ex, s in per_ex_symbols.items()})
 
     logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
 
-    # --------------------------------------------------------
-    # PARAMETERS
-    # --------------------------------------------------------
     pos_cross_path = bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
+
     entry_bps = float(getenv_float("ENTRY_SPREAD_BPS", getenv_float("ENTRY_APR", 10.0)))
-    exit_bps  = float(getenv_float("EXIT_SPREAD_BPS", getenv_float("EXIT_APR", 2.0)))
+    exit_bps  = float(getenv_float("EXIT_SPREAD_BPS",  getenv_float("EXIT_APR", 2.0)))
     taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
     paper = getenv_bool("PAPER", True)
     sleep_s = int(getenv_float("SLEEP_SEC", 3))
 
-    notional_env = getenv_str("NOTIONAL", "")
+    notional_env = getenv_str("NOTIONAL","")
     notional = float(notional_env) if notional_env else None
     capital = float(getenv_float("CAPITAL", 1000.0))
     leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
@@ -4539,14 +4468,12 @@ def main():
     logging.info("PriceArb started | PAPER=%s | per-leg=$%.2f | ENTRY=%.2f bps | EXIT=%.2f bps | taker=%.4f",
                  paper, per_leg_notional, entry_bps, exit_bps, taker_fee)
 
-    # --------------------------------------------------------
-    # MAIN LOOP
-    # --------------------------------------------------------
+    # ==================== MAIN LOOP ====================
     while True:
         try:
-            # ===================================================================
-            # A) ТОРГОВЫЙ СКАНЕР — ИЩЕТ КАНДИДАТЫ + МОЖЕТ ОТКРЫТЬ ИНСТАНТ-СДЕЛКУ
-            # ===================================================================
+            # ============================================================
+            # A) ТОРГОВЫЙ СКАНЕР — ищет кандидаты и обрабатывает entry
+            # ============================================================
             best, quotes_df = scan_spreads_once(
                 exchanges=exchanges,
                 symbols=symbols,
@@ -4566,66 +4493,56 @@ def main():
                 per_ex_symbols=per_ex_symbols,
             )
 
-            # ===================================================================
-            # B) ПАРАЛЛЕЛЬНЫЙ АЛЕРТНЫЙ СКАНЕР — НЕ ЗАТИРАЕТ quotes_df
-            # ===================================================================
-            scan_all_with_instant_alerts(
-                exchanges=exchanges,
-                symbols=symbols,
-                per_leg_notional_usd=per_leg_notional,
-                taker_fee=taker_fee,
-                price_source=price_source,
-                alert_spread_pct=ALERT_SPREAD_PCT,
-                cooldown_sec=ALERT_COOLDOWN_SEC,
-                instant_open=True,
-                pos_path_for_instant=pos_cross_path,
-                paper=paper,
-                per_ex_symbols=per_ex_symbols,
-            )
+            # ============================================================
+            # B) (опционально) чисто алерт-сканер, НЕ трогаем quotes_df
+            # ============================================================
+            if getenv_bool("RUN_PARALLEL_ALERT_SCANNER", False):
+                try:
+                    scan_all_with_instant_alerts(
+                        exchanges=exchanges,
+                        symbols=symbols,
+                        per_leg_notional_usd=per_leg_notional,
+                        taker_fee=taker_fee,
+                        price_source=price_source,
+                        alert_spread_pct=ALERT_SPREAD_PCT,
+                        cooldown_sec=ALERT_COOLDOWN_SEC,
+                        instant_open=False,
+                        pos_path_for_instant=pos_cross_path,
+                        paper=paper,
+                        per_ex_symbols=per_ex_symbols,
+                    )
+                except Exception as e:
+                    logging.warning("[ALERT_SCANNER] error: %s", e)
 
-            # ===================================================================
-            # C) ОБНОВЛЕНИЕ EMA-СТАТИСТИКИ
-            # ===================================================================
+            # ============================================================
+            # C) inline-обновление stats_store (как у тебя)
+            # ============================================================
             try:
                 if quotes_df is not None and not quotes_df.empty:
                     df = quotes_df.copy()
-
                     if price_source == "book":
-                        if "ask" not in df.columns or "bid" not in df.columns:
-                            logging.warning("[STATS] skip inline update: no ask/bid in quotes_df")
-                            stats_store.maybe_save(force=False)
-                        else:
+                        if "ask" in df.columns and "bid" in df.columns:
                             for sym in sorted(df["symbol"].unique()):
                                 sub = df[df["symbol"] == sym]
-                                if "ask" not in sub.columns or "bid" not in sub.columns:
-                                    continue
-
                                 sub_ask = sub.dropna(subset=["ask"])
                                 sub_bid = sub.dropna(subset=["bid"])
                                 if sub_ask.empty or sub_bid.empty:
                                     continue
-
                                 sub_ask["ask"] = pd.to_numeric(sub_ask["ask"], errors="coerce")
                                 sub_bid["bid"] = pd.to_numeric(sub_bid["bid"], errors="coerce")
                                 sub_ask = sub_ask.dropna(subset=["ask"])
                                 sub_bid = sub_bid.dropna(subset=["bid"])
-
                                 if sub_ask.empty or sub_bid.empty:
                                     continue
-
                                 row_low  = sub_ask.loc[sub_ask["ask"].idxmin()]
                                 row_high = sub_bid.loc[sub_bid["bid"].idxmax()]
-
                                 if str(row_low["exchange"]) == str(row_high["exchange"]):
                                     continue
-
                                 px_low  = float(row_low["ask"])
                                 px_high = float(row_high["bid"])
-
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
                                     stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
-
                     else:
                         def _sel(r):
                             ps = price_source
@@ -4634,30 +4551,27 @@ def main():
                             if ps == "bid":  return to_float(r.get("bid"))
                             if ps == "ask":  return to_float(r.get("ask"))
                             return to_float(r.get("mid"))
-
                         df["px"] = df.apply(_sel, axis=1)
                         df = df.dropna(subset=["px"])
-
                         for sym in sorted(df["symbol"].unique()):
                             sub = df[df["symbol"]==sym].sort_values("px")
-                            exs = list(sub["exchange"].values)
-                            pxs = list(sub["px"].values)
-                            n = len(pxs)
-                            for i in range(n):
-                                for j in range(i+1, n):
+                            exs = list(sub["exchange"].values); pxs = list(sub["px"].values)
+                            for i in range(len(pxs)):
+                                for j in range(i+1, len(pxs)):
                                     px_low, px_high = float(pxs[i]), float(pxs[j])
-                                    if px_low <= 0 or px_high <= 0: 
+                                    if px_low<=0 or px_high<=0: 
                                         continue
+                                    ex_low, ex_high = str(exs[i]), str(exs[j])
                                     x = math.log(px_high/px_low)
-                                    stats_store.update_pair(sym, str(exs[i]), str(exs[j]), x)
+                                    stats_store.update_pair(sym, ex_low, ex_high, x)
 
                 stats_store.maybe_save(force=False)
             except Exception as e:
                 logging.warning("Stats inline update error: %s", e)
 
-            # ===================================================================
-            # D) ЛОГИКА ПОЗИЦИЙ (open / close / rotate)
-            # ===================================================================
+            # ============================================================
+            # D) позиции + top-3 в TG
+            # ============================================================
             try:
                 positions_once(
                     quotes_df=quotes_df,
