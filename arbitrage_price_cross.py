@@ -3830,8 +3830,18 @@ def positions_once(
     rotate_delta_usd: float,
     stats_df: pd.DataFrame,
 ):
-    price_source = getenv_str("PRICE_SOURCE", "mid")
-    cands = build_price_arbitrage(quotes_df, per_leg_notional_usd, taker_fee, price_source)
+    try:
+        price_source = getenv_str("PRICE_SOURCE", "mid")
+        cands = build_price_arbitrage(quotes_df, per_leg_notional_usd, taker_fee, price_source)
+        logging.info(
+            "[CYCLE] positions_once: quotes=%s cands=%s price_source=%s ENTRY_MODE=%s top3=%s",
+            0 if quotes_df is None else len(quotes_df),
+            0 if cands is None else len(cands),
+            price_source, getenv_str("ENTRY_MODE", "zscore"), top3_to_tg
+        )
+    except Exception:
+        logging.exception("[CYCLE] positions_once failed at build_price_arbitrage")
+        return
 
     # ------------------------------
     # 1) квалификация (ema/std/z)
@@ -3901,20 +3911,16 @@ def positions_once(
         best = dict(cands.iloc[0])
 
     if top3_to_tg and top3_to_tg > 0 and not cands.empty:
-        try:
-            topN = cands.head(int(top3_to_tg)).to_dict("records")
-            for rec in topN:
-                try:
-                    msg = ">" + format_signal_card(rec, per_leg_notional_usd, price_source)
-                    maybe_send_telegram(msg)
-                except Exception:
-                    # НЕ глушим! иначе TG молчит навсегда
-                    logging.exception(
-                        "format_signal_card / telegram failed for %s %s↔%s",
-                        rec.get("symbol"), rec.get("long_ex"), rec.get("short_ex")
-                    )
-        except Exception as e:
-            logging.debug("positions_once: topN TG failed: %s", e)
+        topN = cands.head(int(top3_to_tg)).to_dict("records")
+        for rec in topN:
+            msg = ">" + format_signal_card(rec, per_leg_notional_usd, price_source)
+            try:
+                maybe_send_telegram(msg)
+            except Exception:
+                logging.exception(
+                    "[TG] send failed for %s %s↔%s",
+                    rec.get("symbol"), rec.get("long_ex"), rec.get("short_ex")
+                )
 
     # ------------------------------
     # 3) загрузка/обновление позиций
@@ -4516,16 +4522,12 @@ def main():
             try:
                 if quotes_df is not None and not quotes_df.empty:
                     df = quotes_df.copy()
-                    # выбираем использованную цену согласно PRICE_SOURCE
                     if price_source == "book":
-                        # Обновляем EMA на основе BBO: ask как дешёвая цена, bid как дорогая
-                        if price_source == "book":
-                            # --- PATCH: пропускаем, если нет ask/bid ---
-                            if "ask" not in df.columns or "bid" not in df.columns:
-                                # нечего обновлять — нет реального BBO
-                                stats_store.maybe_save(force=False)
-                                continue
-
+                        # --- FIX: НЕ выходим из цикла while, если в bulk нет ask/bid ---
+                        if "ask" not in df.columns or "bid" not in df.columns:
+                            logging.warning("[STATS] skip inline update: no ask/bid in quotes_df")
+                            stats_store.maybe_save(force=False)
+                        else:
                             for sym in sorted(df["symbol"].unique()):
                                 sub = df[df["symbol"] == sym]
 
@@ -4593,20 +4595,25 @@ def main():
                 stats_store.maybe_save(force=False)
             except Exception as e:
                 logging.warning("Stats inline update error: %s", e)
-
-            positions_once(
-                quotes_df=quotes_df,
-                per_leg_notional_usd=per_leg_notional,
-                entry_bps=entry_bps,
-                exit_bps=exit_bps,
-                taker_fee=taker_fee,
-                pos_path=pos_cross_path,
-                paper=paper,
-                top3_to_tg=int(getenv_float("TOP_N_TELEGRAM",5)),
-                rotate_on=rotate_on,
-                rotate_delta_usd=rotate_delta_usd,
-                stats_df=stats_store.df
-            )
+            # ============================================================
+            # B) ОСНОВНАЯ ЛОГИКА ПОЗИЦИЙ + TOP-3 В TELEGRAM
+            # ============================================================
+            try:
+                positions_once(
+                    quotes_df=quotes_df,
+                    per_leg_notional_usd=per_leg_notional,
+                    entry_bps=entry_bps,
+                    exit_bps=exit_bps,
+                    taker_fee=taker_fee,
+                    pos_path=pos_cross_path,
+                    paper=paper,
+                    top3_to_tg=getenv_float("TOP_N_TELEGRAM", 3),
+                    rotate_on=rotate_on,
+                    rotate_delta_usd=rotate_delta_usd,
+                    stats_df=stats_store.df,
+                )
+            except Exception as e:
+                logging.exception("positions_once error: %s", e)
         except Exception:
             # ФАТАЛЬНАЯ ошибка цикла — показываем полный traceback и падаем,
             # чтобы Render точно вывел корень проблемы.
