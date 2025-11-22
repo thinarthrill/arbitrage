@@ -4607,7 +4607,7 @@ def main():
                     taker_fee=taker_fee,
                     pos_path=pos_cross_path,
                     paper=paper,
-                    top3_to_tg=getenv_float("TOP_N_TELEGRAM", 3),
+                    top3_to_tg=int(getenv_float("TOP_N_TELEGRAM", 3)),
                     rotate_on=rotate_on,
                     rotate_delta_usd=rotate_delta_usd,
                     stats_df=stats_store.df,
