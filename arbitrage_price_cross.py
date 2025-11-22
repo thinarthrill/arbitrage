@@ -2295,93 +2295,145 @@ def scan_spreads_once(
 ):
     """
     Быстрый цикл сканирования, использующий bulk-тickers для Binance, Bybit, OKX, Gate.
-    Ускорение 50–200X по сравнению с прежней реализацией.
+    Возвращает:
+      best: dict | None  (лучший спред-кандидат)
+      quotes_df: DataFrame (per-exchange котировки для downstream EMA + positions_once)
     """
     start_ts = time.time()
 
     # ==== 1. Загружаем котировки одним bulk-запросом ====
     bulk = load_all_bulk_quotes(exchanges)
-    # bulk = {
-    #    "binance": { "BTCUSDT": {bid, ask, mark, last}, ... },
-    #    "bybit":   { ... },
-    #    "okx":     { ... },
-    #    "gate":    { ... }
-    # }
+    # bulk[ex][symbol] = {"bid":..,"ask":..,"last":..,"mark":..}
+
+    # --- локальный безопасный float ---
+    def _f(x, default=0.0):
+        try:
+            v = float(x)
+            if math.isnan(v) or math.isinf(v):
+                return default
+            return v
+        except Exception:
+            return default
+
+    now_ms = utc_ms_now()
+
+    # ==== 2. Собираем per-exchange quotes (ВОЗВРАЩАЕМ ИХ НАРУЖУ) ====
+    rows_all = []
+    for sym in symbols:
+        su = sym.upper()
+        for ex in exchanges:
+            q = bulk.get(ex, {}).get(su)
+            if not q:
+                continue
+            bid  = _f(q.get("bid"), 0.0)
+            ask  = _f(q.get("ask"), 0.0)
+            last = _f(q.get("last"), 0.0)
+            mark = _f(q.get("mark"), 0.0)
+
+            mid = None
+            if bid > 0 and ask > 0:
+                mid = 0.5 * (bid + ask)
+
+            rows_all.append({
+                "exchange": ex,
+                "symbol": su,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "last": last,
+                "mark": mark,
+                "ts": now_ms,
+            })
+
+    cols_quotes = ["exchange","symbol","bid","ask","mid","last","mark","ts"]
+    quotes_df = pd.DataFrame(rows_all) if rows_all else pd.DataFrame(columns=cols_quotes)
 
     records = []     # для расчёта статистики спредов
     candidates = []  # для сигналов
 
-    # ==== 2. Проходим по каждому символу ====
+    # ==== 3. Проходим по каждому символу и ищем min/max по биржам ====
     for sym in symbols:
         su = sym.upper()
+
         best_long_ex  = None
         best_short_ex = None
-        best_bid = 0
-        best_ask = 10 ** 12
+        best_low_px   = 1e18
+        best_high_px  = 0.0
 
-        # ==== 3. Ищем лучшую биржу для LONG (где дешевле купить) ====
         for ex in exchanges:
             q = bulk.get(ex, {}).get(su)
             if not q:
                 continue
-            if q["ask"] < best_ask and q["ask"] > 0:
-                best_ask = q["ask"]
+
+            bid  = _f(q.get("bid"), 0.0)
+            ask  = _f(q.get("ask"), 0.0)
+            last = _f(q.get("last"), 0.0)
+            mark = _f(q.get("mark"), 0.0)
+
+            # выбираем цену в зависимости от источника
+            if price_source in ("book", "mid"):
+                low_px  = ask if ask > 0 else 0.0
+                high_px = bid if bid > 0 else 0.0
+                px_for_min = low_px
+                px_for_max = high_px
+            elif price_source == "last":
+                px = last if last > 0 else (0.5*(bid+ask) if bid>0 and ask>0 else 0.0)
+                px_for_min = px_for_max = px
+            elif price_source == "mark":
+                px = mark if mark > 0 else (0.5*(bid+ask) if bid>0 and ask>0 else 0.0)
+                px_for_min = px_for_max = px
+            else:
+                px = (0.5*(bid+ask) if bid>0 and ask>0 else last or mark or 0.0)
+                px_for_min = px_for_max = px
+
+            if px_for_min > 0 and px_for_min < best_low_px:
+                best_low_px = px_for_min
                 best_long_ex = ex
 
-        # ==== 4. Лучшая биржа для SHORT (где дороже продать) ====
-        for ex in exchanges:
-            q = bulk.get(ex, {}).get(su)
-            if not q:
-                continue
-            if q["bid"] > best_bid and q["bid"] > 0:
-                best_bid = q["bid"]
+            if px_for_max > 0 and px_for_max > best_high_px:
+                best_high_px = px_for_max
                 best_short_ex = ex
 
-        # Если нет цен — пропускаем
+        # если нет нормальных цен — пропускаем
         if not best_long_ex or not best_short_ex:
             continue
-
-        # ==== 5. Считаем mid и спред ====
-        px_low  = best_ask
-        px_high = best_bid
-
-        if px_low <= 0 or px_high <= 0:
+        if best_long_ex == best_short_ex:
+            continue
+        if best_low_px <= 0 or best_high_px <= 0:
             continue
 
-        mid_low  = px_low
-        mid_high = px_high
+        # ==== 4. Считаем спред ====
+        spread = best_high_px - best_low_px
+        spread_pct = spread / best_low_px
+        spread_bps = spread_pct * 1e4  # bps
 
-        spread = mid_high - mid_low
-        spread_pct = spread / mid_low if mid_low > 0 else 0
-        spread_bps = spread_pct * 1e4  # в bps
+        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        # ==== 6. Добавляем в историю (для статистики) ====
-        records.append(
-            {
-                "symbol": su,
-                "long_ex": best_long_ex,
-                "short_ex": best_short_ex,
-                "px_low": px_low,
-                "px_high": px_high,
-                "spread_bps": spread_bps,
-                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            }
-        )
+        # ==== 5. Пишем историю для stats ====
+        records.append({
+            "symbol": su,
+            "long_ex": best_long_ex,
+            "short_ex": best_short_ex,
+            "px_low": best_low_px,
+            "px_high": best_high_px,
+            "spread_bps": spread_bps,
+            "timestamp": ts_str
+        })
 
-        # ==== 7. Проверяем фильтры для сигналов ====
-        if spread_bps_min <= spread_bps <= spread_bps_max:
-            candidates.append(
-                {
-                    "symbol": su,
-                    "long_ex": best_long_ex,
-                    "short_ex": best_short_ex,
-                    "px_low": px_low,
-                    "px_high": px_high,
-                    "spread_bps": spread_bps
-                }
-            )
+        # ==== 6. Фильтруем кандидатов по диапазону bps ====
+        if spread_bps < spread_bps_min or spread_bps > spread_bps_max:
+            continue
 
-    # ==== 8. Записываем статистику ====
+        candidates.append({
+            "symbol": su,
+            "long_ex": best_long_ex,
+            "short_ex": best_short_ex,
+            "px_low": best_low_px,
+            "px_high": best_high_px,
+            "spread_bps": spread_bps
+        })
+
+    # ==== 7. Записываем статистику spread_stats.csv ====
     if records:
         try:
             df = pd.DataFrame(records)
@@ -2391,20 +2443,26 @@ def scan_spreads_once(
             df.to_csv(price_stats_path, index=False)
             logging.info(f"Spread stats saved: rows={len(df)}")
         except Exception as e:
-            logging.error(f"Failed to write stats: {e}")
+            logging.warning(f"Stats save error: {e}")
 
-    # ==== 9. Если нет кандидатов ====
+    # ==== 8. Логи цикла ====
+    if debug:
+        logging.info(
+            f"[SCAN] done in {time.time()-start_ts:.2f}s "
+            f"| symbols={len(symbols)} records={len(records)} candidates={len(candidates)} "
+            f"| price_source={price_source}"
+        )
+
+    # ==== 9. Если кандидатов нет — возвращаем None и нормальный quotes_df ====
     if not candidates:
         logging.info("No price-filtered candidates this cycle.")
-        quotes_df = pd.DataFrame(records)
         return None, quotes_df
 
-    # ==== 10. Выбираем лучший сигнал ====
+    # ==== 10. Лучший спред ====
     best = max(candidates, key=lambda x: x["spread_bps"])
     if debug:
         logging.info(f"Best candidate: {best}")
 
-    quotes_df = pd.DataFrame(records)
     return best, quotes_df
 
 # ----------------- Trading API (Binance/Bybit) -----------------
