@@ -244,21 +244,88 @@ def _bulk_okx():
         return {}
 
 def load_all_bulk_quotes(exchanges):
+    """
+    Bulk loader for top-of-book quotes.
+    Returns dict: {ex: {symbol: {"bid","ask","mid","last","mark"}}}
+
+    ВАЖНО:
+    - Ничего не падает, даже если bulk-функция одной биржи умерла.
+    - Вычищаем записи без bid/ask (иначе потом DF пустой или без колонок).
+    - Пишем статистику в лог: сколько котировок реально пришло.
+    """
     quotes = {}
-    for ex in exchanges:
-        ex = ex.lower()
-        if ex == "binance":
-            quotes["binance"] = _bulk_binance()
-        elif ex == "bybit":
-            quotes["bybit"] = _bulk_bybit()
-        elif ex == "okx":
-            quotes["okx"] = _bulk_okx()
-        elif ex == "gate":
-            quotes["gate"] = _bulk_gate()
+    total = 0
+
+    def _safe_bulk_call(ex: str, fn_name: str):
+        fn = globals().get(fn_name)
+        if not callable(fn):
+            logging.warning("[BULK] %s: function %s not found", ex, fn_name)
+            return {}
+
+        try:
+            data = fn() or {}
+            if not isinstance(data, dict):
+                logging.warning("[BULK] %s: %s returned non-dict (%s)", ex, fn_name, type(data))
+                return {}
+            return data
+        except Exception as e:
+            logging.exception("[BULK] %s: %s failed: %s", ex, fn_name, e)
+            return {}
+
+    for ex in (exchanges or []):
+        ex_l = str(ex).lower()
+
+        if ex_l == "binance":
+            raw = _safe_bulk_call("binance", "_bulk_binance")
+        elif ex_l == "bybit":
+            raw = _safe_bulk_call("bybit", "_bulk_bybit")
+        elif ex_l == "okx":
+            raw = _safe_bulk_call("okx", "_bulk_okx")
+        elif ex_l == "gate":
+            raw = _safe_bulk_call("gate", "_bulk_gate")
         else:
-            quotes[ex] = {}
+            raw = {}
+
+        # --- normalize & validate ---
+        clean = {}
+        bad = 0
+        for sym_u, q in (raw or {}).items():
+            if not isinstance(q, dict):
+                bad += 1
+                continue
+            bid = q.get("bid")
+            ask = q.get("ask")
+            if bid is None or ask is None:
+                bad += 1
+                continue
+            try:
+                bid_f = float(bid)
+                ask_f = float(ask)
+            except Exception:
+                bad += 1
+                continue
+            if bid_f <= 0 or ask_f <= 0:
+                bad += 1
+                continue
+
+            clean[str(sym_u).upper()] = {
+                "bid": bid_f,
+                "ask": ask_f,
+                "mid": float(q.get("mid") or (bid_f + ask_f) / 2.0),
+                "last": q.get("last"),
+                "mark": q.get("mark"),
+            }
+
+        quotes[ex_l] = clean
+        total += len(clean)
+
+        logging.info(
+            "[BULK] %s loaded=%d bad=%d",
+            ex_l.upper(), len(clean), bad
+        )
+
+    logging.info("[BULK] total quotes loaded=%d", total)
     return quotes
-# === BULK PATCH END ===
 
 # === Per-exchange private base ===
 def _private_base(exchange: str) -> str:
@@ -2903,10 +2970,6 @@ def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, tak
     if df_raw.empty: return pd.DataFrame()
     use = df_raw.copy()
     ps = price_source.lower()
-    if "bid" not in use.columns:
-        use["bid"] = np.nan
-    if "ask" not in use.columns:
-        use["ask"] = np.nan
     if ps == "book":
         # Для книги заявок работаем сразу с bid/ask, не создаём единую "px"
         pass
