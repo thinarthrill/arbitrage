@@ -2970,6 +2970,24 @@ def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, tak
     if df_raw.empty: return pd.DataFrame()
     use = df_raw.copy()
     ps = price_source.lower()
+        # --- PATCH: make sure bid/ask columns exist for book mode ---
+    if ps == "book":
+        # иногда quotes_df приезжает без bid/ask (после bulk/legacy путей)
+        for col in ("bid", "ask"):
+            if col not in use.columns:
+                use[col] = np.nan
+
+        # попытка мягко восстановить bid/ask из mid/px, если они есть
+        if use["ask"].isna().all() and "mid" in use.columns:
+            use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
+        if use["bid"].isna().all() and "mid" in use.columns:
+            use["bid"] = pd.to_numeric(use["mid"], errors="coerce")
+
+        if use["ask"].isna().all() and "px" in use.columns:
+            use["ask"] = pd.to_numeric(use["px"], errors="coerce")
+        if use["bid"].isna().all() and "px" in use.columns:
+            use["bid"] = pd.to_numeric(use["px"], errors="coerce")
+
     if ps == "book":
         # Для книги заявок работаем сразу с bid/ask, не создаём единую "px"
         pass
@@ -2980,13 +2998,20 @@ def build_price_arbitrage(df_raw: pd.DataFrame, per_leg_notional_usd: float, tak
     for sym in sorted(use["symbol"].unique()):
         sub = use[use["symbol"]==sym]
         if ps == "book":
+            # если колонок нет/все NaN — просто пропускаем символ
+            if "ask" not in sub.columns or "bid" not in sub.columns:
+                continue
+
             sub_ask = sub.dropna(subset=["ask"])
             sub_bid = sub.dropna(subset=["bid"])
-            if len(sub_ask) < 1 or len(sub_bid) < 1: continue
-            cheapest = sub_ask.loc[sub_ask["ask"].astype(float).idxmin()]
-            priciest = sub_bid.loc[sub_bid["bid"].astype(float).idxmax()]
+            if sub_ask.empty or sub_bid.empty:
+                continue
+
+            cheapest = sub_ask.loc[pd.to_numeric(sub_ask["ask"], errors="coerce").idxmin()]
+            priciest = sub_bid.loc[pd.to_numeric(sub_bid["bid"], errors="coerce").idxmax()]
             if str(cheapest["exchange"]) == str(priciest["exchange"]):
                 continue
+
             px_low, ex_low   = float(cheapest["ask"]),  str(cheapest["exchange"])
             px_high, ex_high = float(priciest["bid"]),  str(priciest["exchange"])
         else:
