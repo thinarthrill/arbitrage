@@ -4672,7 +4672,7 @@ def main():
                 )
             except Exception as e:
                 logging.exception("positions_once error: %s", e)
-        except Exception:
+        except Exception as e:
             # ФАТАЛЬНАЯ ошибка цикла — показываем полный traceback и падаем,
             # чтобы Render точно вывел корень проблемы.
             logging.exception("FATAL ERROR IN MAIN LOOP")
