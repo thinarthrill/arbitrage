@@ -4978,12 +4978,44 @@ def main():
                     # выбираем использованную цену согласно PRICE_SOURCE
                     if price_source == "book":
                         # Обновляем EMA на основе BBO: ask как дешёвая цена, bid как дорогая
-                        for sym in sorted(df["symbol"].unique()):
-                            sub = df[df["symbol"]==sym]
-                            sub_ask = sub.dropna(subset=["ask"])
-                            sub_bid = sub.dropna(subset=["bid"])
-                            if sub_ask.empty or sub_bid.empty:
+                        if price_source == "book":
+                            # --- PATCH: пропускаем, если нет ask/bid ---
+                            if "ask" not in df.columns or "bid" not in df.columns:
+                                # нечего обновлять — нет реального BBO
+                                stats_store.maybe_save(force=False)
                                 continue
+
+                            for sym in sorted(df["symbol"].unique()):
+                                sub = df[df["symbol"] == sym]
+
+                                # защита: в некоторых symbols вообще нет ask/bid
+                                if "ask" not in sub.columns or "bid" not in sub.columns:
+                                    continue
+
+                                sub_ask = sub.dropna(subset=["ask"])
+                                sub_bid = sub.dropna(subset=["bid"])
+                                if sub_ask.empty or sub_bid.empty:
+                                    continue
+
+                                # безопасное преобразование
+                                sub_ask["ask"] = pd.to_numeric(sub_ask["ask"], errors="coerce")
+                                sub_bid["bid"] = pd.to_numeric(sub_bid["bid"], errors="coerce")
+                                sub_ask = sub_ask.dropna(subset=["ask"])
+                                sub_bid = sub_bid.dropna(subset=["bid"])
+                                if sub_ask.empty or sub_bid.empty:
+                                    continue
+
+                                row_low  = sub_ask.loc[sub_ask["ask"].idxmin()]
+                                row_high = sub_bid.loc[sub_bid["bid"].idxmax()]
+                                if str(row_low["exchange"]) == str(row_high["exchange"]):
+                                    continue
+
+                                px_low  = float(row_low["ask"])
+                                px_high = float(row_high["bid"])
+                                if px_low > 0 and px_high > 0:
+                                    x = math.log(px_high / px_low)
+                                    stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
+
                             # Для стабильности возьмём глобальный мин ASK и макс BID (реалистичнее не бывает)
                             row_low  = sub_ask.loc[sub_ask["ask"].astype(float).idxmin()]
                             row_high = sub_bid.loc[sub_bid["bid"].astype(float).idxmax()]
