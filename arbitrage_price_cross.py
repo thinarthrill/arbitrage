@@ -4618,10 +4618,9 @@ def main():
             # ФАТАЛЬНАЯ ошибка цикла — показываем полный traceback и падаем,
             # чтобы Render точно вывел корень проблемы.
             logging.exception("FATAL ERROR IN MAIN LOOP")
-            raise
             err = str(e)[:1600].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             maybe_send_telegram(f"❌ PriceArb cycle error: <code>{err}</code>")
-
+            raise
         time.sleep(max(3, sleep_s))
 
 if __name__ == "__main__":
