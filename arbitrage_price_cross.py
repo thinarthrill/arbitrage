@@ -2418,7 +2418,10 @@ def binance_sync_time():
         if r.status_code==200:
             srv = int(r.json().get("serverTime")); now = int(time.time()*1000)
             _BINANCE_TIME_OFFSET_MS = srv - now; _BINANCE_TIME_SYNCED_AT = now
-    except: pass
+    except Exception:
+        logging.exception("binance_sync_time failed")
+        # не роняем бот, просто оставляем старый оффсет
+        return
 
 from urllib.parse import urlencode
 def _fmt_val(v):
@@ -2517,7 +2520,10 @@ def _bybit_symbol_info(symbol: str) -> Optional[dict]:
         if lst:
             _BYBIT_SYMBOL_META[symbol.upper()] = lst[0]
             return lst[0]
-    except: pass
+    except Exception:
+        logging.exception("_bybit_symbol_info failed for %s", symbol)
+        # не роняем торговлю — просто вернём кеш/None
+        return None
     return _BYBIT_SYMBOL_META.get(symbol.upper())
 
 def bybit_feasible(symbol: str, qty: float, price: float) -> Tuple[bool,str,float]:
@@ -2547,8 +2553,10 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         j = r.json()
         if r.status_code==200:
             px = 0.0
-            try: px = float((j.get("fills") or [{}])[0].get("price") or 0.0)
-            except: pass
+            try:
+                px = float((j.get("fills") or [{}])[0].get("price") or 0.0)
+            except Exception:
+                logging.exception("Binance fills price parse failed (will continue)")
             # Среднюю цену и комиссии лучше добрать из userTrades позже, но попробуем из fills:
             fills = j.get("fills") or []
             prices = [float(f.get("price",0)) for f in fills if f]
@@ -2627,8 +2635,8 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
                 avg = 0.0
                 try:
                     avg = float((j["result"].get("avgPrice") or 0.0))
-                except:
-                    pass
+                except Exception:
+                    logging.exception("Bybit avgPrice parse failed (will continue)")
                 return {"status": "FILLED", "avg_price": avg, "order_id": j["result"].get("orderId"), "client_order_id": payload_mkt.get("orderLinkId"), "fee_usd": 0.0}
             # если это MPP/границы цены — уйдём во fallback
             if j.get("retCode") not in (30209, 176001, 176002, 176003):
@@ -2675,8 +2683,8 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             avg = 0.0
             try:
                 avg = float((j2["result"].get("avgPrice") or 0.0))
-            except:
-                pass
+            except Exception:
+                logging.exception("Bybit IOC avgPrice parse failed (will continue)")
             return {"status": "FILLED", "avg_price": avg, "order_id": j2["result"].get("orderId"), "client_order_id": payload_lim.get("orderLinkId"), "fee_usd": 0.0}
 
         raise RuntimeError(f"Bybit IOC-limit fallback failed: retCode={j2.get('retCode')} retMsg={j2.get('retMsg')} req={payload_lim} resp={str(j2)[:400]}")
@@ -4366,12 +4374,6 @@ def main():
             logging.exception("[DEBUG] _check_bybit_auth() startup error: %s", e)
         # ==============================================
 
-        # === проверка согласованности окружений ===
-        #if len(set(per_env.values())) > 1:
-        #    msg = f"❌ Mixed order environments detected: {per_env}. Use either all-mainnet or all-testnet/demo."
-        #    logging.error(msg)
-        #    maybe_send_telegram(msg)
-        #    return
     # === проверка коннектов ===
         if not check_connectivity(exchanges, probe_symbol=probe_sym):
             msg = "Startup connectivity check failed — one or more exchanges unavailable."
@@ -4588,8 +4590,11 @@ def main():
                 rotate_delta_usd=rotate_delta_usd,
                 stats_df=stats_store.df
             )
-        except Exception as e:
-            logging.exception("Cycle error: %s", e)
+        except Exception:
+            # ФАТАЛЬНАЯ ошибка цикла — показываем полный traceback и падаем,
+            # чтобы Render точно вывел корень проблемы.
+            logging.exception("FATAL ERROR IN MAIN LOOP")
+            raise
             err = str(e)[:1600].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             maybe_send_telegram(f"❌ PriceArb cycle error: <code>{err}</code>")
 
