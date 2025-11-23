@@ -4654,7 +4654,7 @@ def main():
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
                                     if not sym or not str(row_low["exchange"]) or not str(row_high["exchange"]) or not x:
-                                        logging.warning("Stats inline update error: %s", e)
+                                        logging.warning("Stats inline update error")
                                         return
                                         
                                     stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
@@ -4679,7 +4679,7 @@ def main():
                                     ex_low, ex_high = str(exs[i]), str(exs[j])
                                     x = math.log(px_high/px_low)
                                     if not sym or not ex_low or not ex_high or not x:
-                                        logging.warning("Stats inline update error: %s", e)
+                                        logging.warning("Stats inline update error")
                                         return
                                     stats_store.update_pair(sym, ex_low, ex_high, x)
 
