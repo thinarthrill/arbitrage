@@ -3233,8 +3233,7 @@ STATS_COLS = [
     "Z_IN_suggested","entry_spread_bps_suggested"
 ]
 
-def read_spread_stats() -> pd.DataFrame:
-    return read_csv(SPREAD_STATS_PATH, STATS_COLS)
+
 ALPHA = float(getenv_float("SPREAD_EMA_ALPHA", 0.05))
 SAVE_EVERY_SEC = int(getenv_float("SAVE_EVERY_SEC", 30))
 
@@ -3246,9 +3245,19 @@ STATS_COLS = [
     "mean_bps","std_bps","required_spread_bps","z_req_profit",
     "Z_IN_suggested","entry_spread_bps_suggested"
 ]
-
 def read_spread_stats() -> pd.DataFrame:
-    return read_csv(SPREAD_STATS_PATH, STATS_COLS)
+    df = read_csv(SPREAD_STATS_PATH, STATS_COLS)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=STATS_COLS)
+
+    # --- normalization for reliable matching in get_z_for_pair ---
+    try:
+        df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+        for c in ["ex_low", "ex_high"]:
+            df[c] = df[c].astype(str).str.lower().str.strip()
+    except Exception:
+        pass
+    return df
 
 ALPHA = float(getenv_float("SPREAD_EMA_ALPHA", 0.05))
 SAVE_EVERY_SEC = int(getenv_float("SAVE_EVERY_SEC", 30))
