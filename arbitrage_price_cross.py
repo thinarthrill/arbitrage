@@ -837,6 +837,85 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             return "✅" if ok else "❌"
 
         lines.append("\n\n⚙️ <b>ENTRY FILTERS</b>")
+        # --- NEW: показываем пороги из env / локальные reco + фактические метрики ---
+        capital_env      = float(getenv_float("CAPITAL", 1000.0))
+        entry_net_pct    = float(getenv_float("ENTRY_NET_PCT", 1.0))
+        entry_spread_env = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+        z_in_env         = float(getenv_float("Z_IN", 2.5))
+        std_min_env      = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        slip_bps_env     = float(getenv_float("SLIPPAGE_BPS", 1.0))
+
+        # min_net_abs уже посчитан выше, но на всякий явно покажем от чего он
+        lines.append(
+            "\n🧷 <b>THRESHOLDS (env / reco)</b>\n"
+            f"   ENTRY_MODE: <code>{entry_mode}</code>\n"
+            f"   CAPITAL: <code>{capital_env:.2f}$</code>\n"
+            f"   ENTRY_NET_PCT: <code>{entry_net_pct:.3f}%</code> → min_net_abs=<code>{min_net_abs:.4f}$</code>\n"
+            f"   ENTRY_SPREAD_BPS: env=<code>{entry_spread_env:.0f}</code>, used=<code>{entry_bps:.0f}</code>\n"
+            f"   Z_IN: env=<code>{z_in_env:.2f}</code>, used=<code>{z_in_loc:.2f}</code>\n"
+            f"   STD_MIN_FOR_OPEN: <code>{std_min_env:.6f}</code>\n"
+            f"   SLIPPAGE_BPS: <code>{slip_bps_env:.2f}</code>"
+        )
+
+        # фактические значения (даже если None/NaN)
+        z_fact   = z if (z is not None and z == z) else None
+        std_fact = std if (std is not None and std == std) else None
+        net_fact = net_usd_adj if net_usd_adj is not None else None
+
+        # ---------- lazy-fix: если алёрт пришёл без метрик ----------
+        if net_usd_adj is None:
+            # считаем так же, как в positions_once
+            sl_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
+            net_usd_adj = net_usd - (4.0 * (sl_bps/1e4) * per_leg_notional_usd)
+
+        if (z is None or std is None or (z != z) or (std != std)):
+            try:
+                stats_df = read_spread_stats()
+                _, z_calc, std_calc = get_z_for_pair(
+                    stats_df, symbol=sym,
+                    ex_low=long_ex.lower(), ex_high=short_ex.lower(),
+                    px_low=px_low, px_high=px_high
+                )
+                if (z is None) or (z != z):
+                    z = z_calc
+                if (std is None) or (std != std):
+                    std = std_calc
+            except Exception:
+                pass
+        # -----------------------------------------------------------
+
+        lines.append(
+            "\n📌 <b>FACT (current tick)</b>\n"
+            f"   spread_bps=<code>{sp_bps:.2f}</code>\n"
+            f"   net_usd_adj=<code>{'None' if net_fact is None else f'{float(net_fact):.4f}'}</code>\n"
+            f"   z=<code>{'NaN' if z_fact is None else f'{float(z_fact):.4f}'}</code>\n"
+            f"   std=<code>{'NaN' if std_fact is None else f'{float(std_fact):.6f}'}</code>"
+        )
+
+        # если в best пришли метаданные статистики — покажем их (помогает понять, почему NaN)
+        if "count" in r or "ema_var" in r or "updated_ms" in r or "stats_ok" in r:
+            try:
+                cnt = r.get("count", None)
+                ev  = r.get("ema_var", None)
+                upd = r.get("updated_ms", None)
+                okf = r.get("stats_ok", None)
+
+                upd_age = None
+                if upd is not None:
+                    try:
+                        upd_age = (time.time()*1000 - float(upd)) / 1000.0
+                    except Exception:
+                        upd_age = None
+
+                lines.append(
+                    "\n🧪 <b>STATS META</b>\n"
+                    f"   stats_ok=<code>{okf}</code>\n"
+                    f"   count=<code>{cnt}</code>\n"
+                    f"   ema_var=<code>{ev}</code>\n"
+                    f"   updated_ms_age=<code>{'None' if upd_age is None else f'{upd_age:.0f}s'}</code>"
+                )
+            except Exception:
+                pass
 
         # eco_ok
         if net_usd_adj is not None:
@@ -845,7 +924,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 f"{'>' if eco_ok else '<='} {min_net_abs:.2f}"
             )
         else:
-            lines.append(f"{_flag(False)} eco_ok   · net_adj is None")
+            lines.append(f"{_flag(False)} eco_ok   · net_adj={net_usd_adj} , min_net=${min_net_abs:.2f}")
 
         # spread_ok
         lines.append(
@@ -859,14 +938,14 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                     f"{_flag(z_ok)} z_ok      · z={float(z):.2f} ≥ {z_in_loc:.2f}"
                 )
             else:
-                lines.append(f"{_flag(False)} z_ok      · z is NaN")
+                lines.append(f"{_flag(False)} z_ok      · z={z} , need ≥ {z_in_loc:.2f}")
 
             if std is not None and std == std:
                 lines.append(
                     f"{_flag(std_ok)} std_ok    · σ={float(std):.4f} ≥ {std_min_for_open:.4f}"
                 )
             else:
-                lines.append(f"{_flag(False)} std_ok    · σ is NaN")
+                lines.append(f"{_flag(False)} std_ok    · σ={std} , need ≥ {std_min_for_open:g}")
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
@@ -1770,7 +1849,14 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
 
     # фильтры качества статистики
     # синхронизируемся с MIN_SPREAD_COUNT из .env (мягче/жестче на твой выбор)
-    min_cnt = int(getenv_float("MIN_SPREAD_COUNT", SPREAD_MIN_COUNT))
+    # Берём единый порог: сначала SPREAD_MIN_COUNT (новый/правильный),
+    # если его нет — MIN_SPREAD_COUNT (старый), потом дефолт.
+    min_cnt = int(
+        getenv_float("SPREAD_MIN_COUNT",
+            getenv_float("MIN_SPREAD_COUNT", SPREAD_MIN_COUNT)
+        )
+    )
+
     if cnt < min_cnt or (upd > 0 and (now - upd) > SPREAD_STALE_SEC):
         return x, float('nan'), float('nan')
 
