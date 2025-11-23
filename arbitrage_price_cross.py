@@ -4654,11 +4654,28 @@ def main():
                                 px_high = float(row_high["bid"])
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
-                                    if not sym or not str(row_low["exchange"]) or not str(row_high["exchange"]) or not x:
-                                        logging.warning("Stats inline update error. Mode: book")
-                                        return
-                                        
-                                    stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
+
+                                    # --- SAFE GUARDS ---
+                                    ex_low  = str(row_low.get("exchange", "")).lower()
+                                    ex_high = str(row_high.get("exchange", "")).lower()
+                                    sym_u   = str(sym).upper()
+
+                                    # x может быть 0.0 — это нормально; фильтруем только nan/inf
+                                    if (not sym_u) or (not ex_low) or (not ex_high):
+                                        logging.warning(
+                                            "Stats inline update skip (missing fields). sym=%s ex_low=%s ex_high=%s px_low=%s px_high=%s",
+                                            sym_u, ex_low, ex_high, px_low, px_high
+                                        )
+                                        continue
+
+                                    if not np.isfinite(x):
+                                        logging.warning(
+                                            "Stats inline update skip (bad x). sym=%s ex_low=%s ex_high=%s px_low=%s px_high=%s x=%s",
+                                            sym_u, ex_low, ex_high, px_low, px_high, x
+                                        )
+                                        continue
+
+                                    stats_store.update_pair(sym_u, ex_low, ex_high, float(x))
                     else:
                         def _sel(r):
                             ps = price_source
