@@ -2367,6 +2367,13 @@ def scan_all_with_instant_alerts(
         if float(best["spread_pct"]) >= float(alert_spread_pct):
             last_ts = _LAST_ALERT_TS.get(best["symbol"], 0.0)
             if (now - last_ts) >= cooldown_sec:
+                if "net_usd_adj" not in best or best.get("net_usd_adj") is None:
+                    try:
+                        best["net_usd_adj"] = float(best.get("net_usd")) - (
+                            4.0 * (SLIPPAGE_BPS / 1e4) * per_leg_notional_usd
+                        )
+                    except Exception:
+                        best["net_usd_adj"] = None
                 card = format_signal_card(best, per_leg_notional_usd, price_source)
                 if INSTANT_ALERT:
                     maybe_send_telegram("🚨 <b>INSTANT ALERT</b>\n" + card)
