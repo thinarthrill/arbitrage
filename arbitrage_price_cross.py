@@ -767,9 +767,9 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     price_lbl = {"mid":"MID","last":"LAST","mark":"MARK","bid":"BID","ask":"ASK","book":"BBO"}.get(price_source.lower(),"MID")
-    z          = r.get("z", None)
-    std        = r.get("std", None)
-    net_usd_adj = r.get("net_usd_adj", None)
+    z           = r.get("z", None)
+    std         = r.get("std", None)
+    net_usd_adj = r.get("net_usd_adj", None)  # НЕ пересчитываем тут, только отображаем
 
     lines = [
         "──────────────",
@@ -777,8 +777,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"{_anchor(long_ex, sym)} BUY  ↔  {_anchor(short_ex, sym)} SELL",
     ]
 
-    # Net after slippage
-    if net_usd_adj is not None:
+    # Net after slippage (только если реально посчитан апстримом)
+    if net_usd_adj is not None and net_usd_adj == net_usd_adj:
         lines.append(f"🧮 Net after slippage: ${float(net_usd_adj):.2f}")
 
     # Z / σ
@@ -826,9 +826,10 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             entry_bps = sp_bps
 
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-        min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * float(getenv_float("CAPITAL", 100))  # 1% от капитала
+        capital_env = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0)) / 100.0) * capital_env
         # условия
-        eco_ok = (net_usd_adj is not None) and (float(net_usd_adj) > min_net_abs)
+        eco_ok = (net_usd_adj is not None) and (net_usd_adj == net_usd_adj) and (float(net_usd_adj) > min_net_abs)
         spread_ok = sp_bps >= entry_bps
         z_ok = (z is not None) and (z == z) and (float(z) >= z_in_loc)
         std_ok = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
