@@ -919,12 +919,14 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # eco_ok
         if net_usd_adj is not None:
+            cmp = ">" if eco_ok else "≤"
             lines.append(
-                f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} "
-                f"{'>' if eco_ok else '≤'} 0" {min_net_abs:.2f}"
+                f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} {cmp} {min_net_abs:.2f}"
             )
         else:
-            lines.append(f"{_flag(False)} eco_ok   · net_adj={net_usd_adj} , min_net=${min_net_abs:.2f}")
+            lines.append(
+                f"{_flag(False)} eco_ok   · net_adj=None , min_net=${min_net_abs:.2f}"
+            )
 
         # spread_ok
         lines.append(
@@ -3261,6 +3263,17 @@ class StatsStore:
         self.path = path
         self.alpha = alpha
         self.df = read_csv(self.path, STATS_COLS)
+        # --- CLEANUP: удаляем пустые/битые строки из spread_stats ---
+        if self.df is not None and not self.df.empty:
+            for c in ["symbol", "ex_low", "ex_high"]:
+                if c in self.df.columns:
+                    self.df[c] = self.df[c].astype("string").fillna("").str.strip()
+
+            self.df = self.df[
+                (self.df["symbol"] != "") &
+                (self.df["ex_low"] != "") &
+                (self.df["ex_high"] != "")
+            ].reset_index(drop=True)
         self._last_save = time.time()
 
     def _mask(self, symbol: str, ex_low: str, ex_high: str):
@@ -4025,7 +4038,7 @@ def positions_once(
     if top3_to_tg and top3_to_tg > 0 and not cands.empty:
         topN = cands.head(int(top3_to_tg)).to_dict("records")
         for rec in topN:
-            msg = ">" + format_signal_card(rec, per_leg_notional_usd, price_source)
+            msg = format_signal_card(rec, per_leg_notional_usd, price_source)
             try:
                 maybe_send_telegram(msg)
             except Exception:
@@ -4631,6 +4644,10 @@ def main():
                                 px_high = float(row_high["bid"])
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
+                                    if not sym or not str(row_low["exchange"]) or not str(row_high["exchange"]) or not x:
+                                        logging.warning("Stats inline update error: %s", e)
+                                        return
+                                        
                                     stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
                     else:
                         def _sel(r):
@@ -4652,6 +4669,9 @@ def main():
                                         continue
                                     ex_low, ex_high = str(exs[i]), str(exs[j])
                                     x = math.log(px_high/px_low)
+                                    if not sym or not ex_low or not ex_high or not x:
+                                        logging.warning("Stats inline update error: %s", e)
+                                        return
                                     stats_store.update_pair(sym, ex_low, ex_high, x)
 
                 stats_store.maybe_save(force=False)
