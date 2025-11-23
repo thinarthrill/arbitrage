@@ -805,34 +805,25 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"🕒 {ts}",
     ])
 
-    # ==============================
-    #  Блок с галочками и крестиками
-    # ==============================
     if getenv_bool("SHOW_ENTRY_FILTERS", False):
         # режим открытия
         entry_mode = getenv_str("ENTRY_MODE", "price").lower()
         if entry_mode not in ("zscore", "price"):
             entry_mode = "price"
 
-        # локальные пороги
-        try:
-            z_in_loc = float(r.get("z_in_loc") or getenv_float("Z_IN", 2.5))
-        except Exception:
-            z_in_loc = float(getenv_float("Z_IN", 2.5))
-
-        try:
-            entry_bps = float(entry_bps_sugg or getenv_float("ENTRY_SPREAD_BPS", 0.0))
-        except Exception:
-            entry_bps = sp_bps
-
+        # пороги ТОЛЬКО из env (как в try_instant_open)
+        z_in_loc         = float(getenv_float("Z_IN", 2.0))
+        entry_bps        = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-        capital_env = float(getenv_float("CAPITAL", 1000.0))
-        min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0)) / 100.0) * capital_env
-        # условия
-        eco_ok = (net_usd_adj is not None) and (net_usd_adj == net_usd_adj) and (float(net_usd_adj) > min_net_abs)
+        capital_env      = float(getenv_float("CAPITAL", 1000.0))
+        entry_net_pct    = float(getenv_float("ENTRY_NET_PCT", 1.0))
+        min_net_abs      = (entry_net_pct / 100.0) * capital_env
+
+        # условия (1:1 с try_instant_open)
+        eco_ok    = (net_usd_adj is not None) and (net_usd_adj == net_usd_adj) and (float(net_usd_adj) > min_net_abs)
         spread_ok = sp_bps >= entry_bps
-        z_ok = (z is not None) and (z == z) and (float(z) >= z_in_loc)
-        std_ok = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
+        z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
+        std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
 
         def _flag(ok: bool) -> str:
             return "✅" if ok else "❌"
@@ -934,14 +925,13 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             f"{_flag(spread_ok)} spread_ok · {sp_bps:.0f} bps ≥ {entry_bps:.0f} bps"
         )
 
-        # только в режиме zscore имеет смысл показывать z_ok и std_ok как фильтры
         if entry_mode == "zscore":
             if z is not None and z == z:
                 lines.append(
                     f"{_flag(z_ok)} z_ok      · z={float(z):.2f} ≥ {z_in_loc:.2f}"
                 )
             else:
-                lines.append(f"{_flag(False)} z_ok      · z={z} , need ≥ {z_in_loc:.2f}")
+               lines.append(f"{_flag(False)} z_ok      · z={z} , need ≥ {z_in_loc:.2f}")
 
             if std is not None and std == std:
                 lines.append(
