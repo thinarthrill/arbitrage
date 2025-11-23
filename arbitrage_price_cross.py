@@ -921,7 +921,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         if net_usd_adj is not None:
             lines.append(
                 f"{_flag(eco_ok)} eco_ok   · net_adj={float(net_usd_adj):.2f} "
-                f"{'>' if eco_ok else '<='} {min_net_abs:.2f}"
+                f"{'>' if eco_ok else '≤'} 0" {min_net_abs:.2f}"
             )
         else:
             lines.append(f"{_flag(False)} eco_ok   · net_adj={net_usd_adj} , min_net=${min_net_abs:.2f}")
