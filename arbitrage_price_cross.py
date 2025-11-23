@@ -3250,13 +3250,14 @@ def read_spread_stats() -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=STATS_COLS)
 
-    # --- normalization for reliable matching in get_z_for_pair ---
+    # нормализация регистров — ключевой фикс
     try:
         df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-        for c in ["ex_low", "ex_high"]:
-            df[c] = df[c].astype(str).str.lower().str.strip()
-    except Exception:
-        pass
+        df["ex_low"]  = df["ex_low"].astype(str).str.lower().str.strip()
+        df["ex_high"] = df["ex_high"].astype(str).str.lower().str.strip()
+    except Exception as e:
+        logging.warning(f"[STATS] normalization error: {e}")
+
     return df
 
 ALPHA = float(getenv_float("SPREAD_EMA_ALPHA", 0.05))
@@ -4654,7 +4655,7 @@ def main():
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
                                     if not sym or not str(row_low["exchange"]) or not str(row_high["exchange"]) or not x:
-                                        logging.warning("Stats inline update error")
+                                        logging.warning("Stats inline update error. Mode: book")
                                         return
                                         
                                     stats_store.update_pair(sym, str(row_low["exchange"]), str(row_high["exchange"]), x)
