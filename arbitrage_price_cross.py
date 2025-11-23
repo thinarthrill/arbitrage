@@ -3366,77 +3366,77 @@ class StatsStore:
         self.df.at[i,"entry_spread_bps_suggested"] = entry_bps
 
         def update_pair(self, symbol: str, ex_low: str, ex_high: str, x: float, now_ms: int | None = None):
-        """
-        Обновить (или создать) строку статистики для пары symbol/ex_low/ex_high.
-        x = log-spread (в долях), например (high/low - 1).
-        """
-        if now_ms is None:
-            now_ms = int(time.time() * 1000)
+            """
+            Обновить (или создать) строку статистики для пары symbol/ex_low/ex_high.
+            x = log-spread (в долях), например (high/low - 1).
+            """
+            if now_ms is None:
+                now_ms = int(time.time() * 1000)
 
-        symbol_u = (symbol or "").upper()
-        ex_low_l = (ex_low or "").lower()
-        ex_high_l = (ex_high or "").lower()
+            symbol_u = (symbol or "").upper()
+            ex_low_l = (ex_low or "").lower()
+            ex_high_l = (ex_high or "").lower()
 
-        if not math.isfinite(x):
-            return
+            if not math.isfinite(x):
+                return
 
-        # гарантируем колонки
-        if self.df is None or self.df.empty:
-            self.df = pd.DataFrame(columns=STATS_COLS)
+            # гарантируем колонки
+            if self.df is None or self.df.empty:
+                self.df = pd.DataFrame(columns=STATS_COLS)
 
-        mask = (
-            (self.df["symbol"].astype(str).str.upper() == symbol_u) &
-            (self.df["ex_low"].astype(str).str.lower() == ex_low_l) &
-            (self.df["ex_high"].astype(str).str.lower() == ex_high_l)
-        )
-        sub = self.df[mask]
+            mask = (
+                (self.df["symbol"].astype(str).str.upper() == symbol_u) &
+                (self.df["ex_low"].astype(str).str.lower() == ex_low_l) &
+                (self.df["ex_high"].astype(str).str.lower() == ex_high_l)
+            )
+            sub = self.df[mask]
 
-        if not sub.empty:
-            i = int(sub.index[0])
+            if not sub.empty:
+                i = int(sub.index[0])
 
-            old_mean = to_float(self.df.at[i, "ema_mean"]) or 0.0
-            old_var  = to_float(self.df.at[i, "ema_var"])  or 0.0
-            old_cnt  = to_float(self.df.at[i, "count"])    or 0.0
+                old_mean = to_float(self.df.at[i, "ema_mean"]) or 0.0
+                old_var  = to_float(self.df.at[i, "ema_var"])  or 0.0
+                old_cnt  = to_float(self.df.at[i, "count"])    or 0.0
 
-            # EMA mean
-            new_mean = (1.0 - ALPHA) * old_mean + ALPHA * x
+                # EMA mean
+                new_mean = (1.0 - ALPHA) * old_mean + ALPHA * x
 
-            # EMA variance (простая и стабильная формула)
-            dx = x - old_mean
-            new_var = (1.0 - ALPHA) * old_var + ALPHA * (dx * dx)
+                # EMA variance (простая и стабильная формула)
+                dx = x - old_mean
+                new_var = (1.0 - ALPHA) * old_var + ALPHA * (dx * dx)
 
-            self.df.at[i, "ema_mean"] = new_mean
-            self.df.at[i, "ema_var"]  = max(new_var, 0.0)
-            self.df.at[i, "count"]    = old_cnt + 1.0
-            self.df.at[i, "updated_ms"] = now_ms
+                self.df.at[i, "ema_mean"] = new_mean
+                self.df.at[i, "ema_var"]  = max(new_var, 0.0)
+                self.df.at[i, "count"]    = old_cnt + 1.0
+                self.df.at[i, "updated_ms"] = now_ms
 
-            # обновляем рекомендации
-            self._recompute_reco(i)
+                # обновляем рекомендации
+                self._recompute_reco(i)
 
-        else:
-            # ---- СОЗДАНИЕ НОВОЙ СТРОКИ ----
-            row = {
-                "symbol": symbol_u,
-                "ex_low": ex_low_l,
-                "ex_high": ex_high_l,
-                "ema_mean": float(x),
-                "ema_var": 0.0,
-                "count": 1.0,
-                "updated_ms": now_ms,
+            else:
+                # ---- СОЗДАНИЕ НОВОЙ СТРОКИ ----
+                row = {
+                    "symbol": symbol_u,
+                    "ex_low": ex_low_l,
+                    "ex_high": ex_high_l,
+                    "ema_mean": float(x),
+                    "ema_var": 0.0,
+                    "count": 1.0,
+                    "updated_ms": now_ms,
 
-                # поля рекомендаций — заполним ниже
-                "mean_bps": np.nan,
-                "std_bps": np.nan,
-                "required_spread_bps": np.nan,
-                "z_req_profit": np.nan,
-                "Z_IN_suggested": np.nan,
-                "entry_spread_bps_suggested": np.nan,
-            }
+                    # поля рекомендаций — заполним ниже
+                    "mean_bps": np.nan,
+                    "std_bps": np.nan,
+                    "required_spread_bps": np.nan,
+                    "z_req_profit": np.nan,
+                    "Z_IN_suggested": np.nan,
+                    "entry_spread_bps_suggested": np.nan,
+                }
 
-            self.df = pd.concat([self.df, pd.DataFrame([row], columns=STATS_COLS)], ignore_index=True)
+                self.df = pd.concat([self.df, pd.DataFrame([row], columns=STATS_COLS)], ignore_index=True)
 
-            i = int(self.df.index[-1])
-            self._recompute_reco(i)
+                i = int(self.df.index[-1])
+                self._recompute_reco(i)
 
     def maybe_save(self, force: bool=False):
         if not self.path:
