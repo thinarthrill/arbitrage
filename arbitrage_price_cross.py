@@ -1839,7 +1839,17 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
 
     x = math.log(px_high/px_low)
     s, a, b = symbol.upper(), ex_low.lower(), ex_high.lower()
+
     sub = stats[(stats["symbol"]==s) & (stats["ex_low"]==a) & (stats["ex_high"]==b)]
+
+    flipped = False
+    if sub.empty:
+        # пробуем обратное направление
+        sub = stats[(stats["symbol"]==s) & (stats["ex_low"]==b) & (stats["ex_high"]==a)]
+        if not sub.empty:
+            flipped = True
+            x = -x  # лог-спред меняет знак при развороте
+
     if sub.empty:
         return x, float('nan'), float('nan')
 
@@ -1849,10 +1859,6 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
     upd  = float(sub.iloc[0].get("updated_ms") or 0.0) / 1000.0
     now  = time.time()
 
-    # фильтры качества статистики
-    # синхронизируемся с MIN_SPREAD_COUNT из .env (мягче/жестче на твой выбор)
-    # Берём единый порог: сначала SPREAD_MIN_COUNT (новый/правильный),
-    # если его нет — MIN_SPREAD_COUNT (старый), потом дефолт.
     min_cnt = int(
         getenv_float("SPREAD_MIN_COUNT",
             getenv_float("MIN_SPREAD_COUNT", SPREAD_MIN_COUNT)
@@ -1863,7 +1869,12 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
         return x, float('nan'), float('nan')
 
     std = max(math.sqrt(max(var or 0.0, 0.0)), SPREAD_STD_FLOOR)
-    z   = (x - (mean or 0.0)) / std if std > 0 else float('nan')
+
+    # если направление было flipped — mean тоже должен поменять знак
+    if flipped and (mean is not None):
+        mean = -mean
+
+    z = (x - (mean or 0.0)) / std if std > 0 else float('nan')
     return x, z, std
 
 def get_pair_reco(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str) -> tuple[float, float]:
@@ -4655,27 +4666,21 @@ def main():
                                 if px_low > 0 and px_high > 0:
                                     x = math.log(px_high / px_low)
 
-                                    # --- SAFE GUARDS ---
-                                    ex_low  = str(row_low.get("exchange", "")).lower()
-                                    ex_high = str(row_high.get("exchange", "")).lower()
-                                    sym_u   = str(sym).upper()
+                                    ex_low  = str(row_low["exchange"]).strip().lower()
+                                    ex_high = str(row_high["exchange"]).strip().lower()
+                                    sym_u   = str(sym).strip().upper()
 
-                                    # x может быть 0.0 — это нормально; фильтруем только nan/inf
-                                    if (not sym_u) or (not ex_low) or (not ex_high):
+                                    # x может быть 0.0 — это нормально. Проверяем только None/NaN.
+                                    if (not sym_u) or (not ex_low) or (not ex_high) or (x != x):
                                         logging.warning(
-                                            "Stats inline update skip (missing fields). sym=%s ex_low=%s ex_high=%s px_low=%s px_high=%s",
-                                            sym_u, ex_low, ex_high, px_low, px_high
+                                            "Stats inline update error. Mode: book | sym=%r ex_low=%r ex_high=%r x=%r "
+                                            "| px_low=%r px_high=%r",
+                                            sym_u, ex_low, ex_high, x, px_low, px_high
                                         )
-                                        continue
+                                        continue  # НЕ return, чтобы не ронять цикл
 
-                                    if not np.isfinite(x):
-                                        logging.warning(
-                                            "Stats inline update skip (bad x). sym=%s ex_low=%s ex_high=%s px_low=%s px_high=%s x=%s",
-                                            sym_u, ex_low, ex_high, px_low, px_high, x
-                                        )
-                                        continue
+                                    stats_store.update_pair(sym_u, ex_low, ex_high, x)
 
-                                    stats_store.update_pair(sym_u, ex_low, ex_high, float(x))
                     else:
                         def _sel(r):
                             ps = price_source
