@@ -1866,6 +1866,10 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
     )
 
     if cnt < min_cnt or (upd > 0 and (now - upd) > SPREAD_STALE_SEC):
+        logging.debug(
+            "[Z_MISS] no stats row for %s (%s->%s) nor flipped (%s->%s). x=%.6f",
+            s, a, b, b, a, x
+        )
         return x, float('nan'), float('nan')
 
     std = max(math.sqrt(max(var or 0.0, 0.0)), SPREAD_STD_FLOOR)
