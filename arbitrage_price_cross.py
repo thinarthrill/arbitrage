@@ -980,7 +980,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 f"σ={to_float(r.get('std')):.6f} ≥ {to_float(r.get('std_min_for_open_used') or 0.0):.6f}"
             )
     except Exception:
-        pass
+        lines.append("\n🚫 <b>Ошибка</b>NEW: show confirm snapshot from try_instant_open\n")
 
     # --- NEW: show exact open skip reasons (if any) ---
     try:
@@ -991,7 +991,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 + "\n".join([f"   • {str(x)}" for x in rs])
             )
     except Exception:
-        pass
+        lines.append("\n🚫 <b>Ошибка</b>NEW: show exact open skip reasons\n")
     return "\n".join(lines)
 
 def maybe_send_telegram(text: str) -> None:
