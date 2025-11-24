@@ -828,7 +828,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         def _flag(ok: bool) -> str:
             return "✅" if ok else "❌"
 
-        lines.append("\n\n⚙️ <b>ENTRY FILTERS</b>")
+        #lines.append("\n\n⚙️ <b>ENTRY FILTERS</b>")
         # --- NEW: показываем пороги из env / локальные reco + фактические метрики ---
         capital_env      = float(getenv_float("CAPITAL", 1000.0))
         entry_net_pct    = float(getenv_float("ENTRY_NET_PCT", 1.0))
@@ -2015,8 +2015,9 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             best["_open_skip_reasons"] = skip_reasons
         except Exception:
             pass
-        if getenv_bool("DEBUG_INSTANT_OPEN", False):
+        if getenv_bool("DEBUG_INSTANT_OPEN", False) and not best.get("_open_skip_logged"):
             logging.info("[OPEN_SKIP] %s %s", sym, msg)
+            best["_open_skip_logged"] = True
         return False
 
     if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
@@ -2034,6 +2035,23 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     z   = float(z_raw)   if (z_raw is not None and z_raw == z_raw) else float("nan")
     std = float(std_raw) if (std_raw is not None and std_raw == std_raw) else float("nan")
+
+    # --- FIX: если net_usd_adj не посчитан в кандиде — считаем здесь на тех же формулах ---
+    if net_adj_raw is None or not (net_adj_raw == net_adj_raw):
+        try:
+            slippage_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
+            spread_pct = (px_high - px_low) / max(px_low, 1e-12)
+            gross_usd  = spread_pct * float(per_leg_notional_usd)
+            fees_rt    = 2.0 * float(taker_fee) * float(per_leg_notional_usd)
+            slip_usd   = 4.0 * (slippage_bps / 1e4) * float(per_leg_notional_usd)
+            net_adj_raw = gross_usd - fees_rt - slip_usd
+            best["net_usd_adj"] = net_adj_raw
+        except Exception as e:
+            net_adj_raw = float("nan")
+            best["net_usd_adj"] = None
+            # и заодно сохраним причину в skip-лог
+            return _reject(f"net_usd_adj calc failed: {e}")
+
     net_adj = float(net_adj_raw) if net_adj_raw is not None else float("nan")
 
     ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
