@@ -849,11 +849,6 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             f"   SLIPPAGE_BPS: <code>{slip_bps_env:.2f}</code>"
         )
 
-        # фактические значения (даже если None/NaN)
-        z_fact   = z if (z is not None and z == z) else None
-        std_fact = std if (std is not None and std == std) else None
-        net_fact = net_usd_adj if net_usd_adj is not None else None
-
         # ---------- lazy-fix: если алёрт пришёл без метрик ----------
         if net_usd_adj is None:
             # считаем так же, как в positions_once
@@ -875,6 +870,24 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             except Exception:
                 pass
         # -----------------------------------------------------------
+        # !!! ВАЖНО: факты и флаги считаем ПОСЛЕ lazy-fix,
+        # иначе карточка показывает одно, а условия — другое.
+        z_fact   = z if (z is not None and z == z) else None
+        std_fact = std if (std is not None and std == std) else None
+        net_fact = net_usd_adj if net_usd_adj is not None else None
+
+        # пересчёт ok-флагов после lazy-fix (1:1 как в try_instant_open)
+        std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        capital_env      = float(getenv_float("CAPITAL", 1000.0))
+        entry_net_pct    = float(getenv_float("ENTRY_NET_PCT", 1.0))
+        min_net_abs      = (entry_net_pct / 100.0) * capital_env
+        entry_bps        = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+        z_in_loc         = float(getenv_float("Z_IN", 2.0))
+
+        eco_ok    = (net_usd_adj is not None) and (net_usd_adj == net_usd_adj) and (float(net_usd_adj) > min_net_abs)
+        spread_ok = sp_bps >= entry_bps
+        z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
+        std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
 
         lines.append(
             "\n📌 <b>FACT (current tick)</b>\n"
@@ -1825,29 +1838,49 @@ def gate_quote(symbol: str, price_source: str = "mid"):
 def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
                    px_low: float, px_high: float) -> Tuple[float,float,float]:
     """Возвращает (x, z, std). Если статданные недостоверны — z=nan."""
+    # --- 0) sanity check ---
     if px_low <= 0 or px_high <= 0:
-        return float('nan'), float('nan'), float('nan')
+        return float("nan"), float("nan"), float("nan")
 
-    x = math.log(px_high/px_low)
-    s, a, b = symbol.upper(), ex_low.lower(), ex_high.lower()
+    # текущий лог-спред
+    try:
+        x = math.log(px_high / px_low)
+    except Exception:
+        return float("nan"), float("nan"), float("nan")
 
-    sub = stats[(stats["symbol"]==s) & (stats["ex_low"]==a) & (stats["ex_high"]==b)]
+    s = symbol.upper()
+    a = ex_low.lower()
+    b = ex_high.lower()
+
+    # --- 1) сначала ищем статистику в прямом направлении ---
+    sub = stats[
+        (stats["symbol"] == s) &
+        (stats["ex_low"]  == a) &
+        (stats["ex_high"] == b)
+    ]
 
     flipped = False
+    # --- 1b) если нет — пробуем зеркальную пару ---
     if sub.empty:
-        # пробуем обратное направление
-        sub = stats[(stats["symbol"]==s) & (stats["ex_low"]==b) & (stats["ex_high"]==a)]
-        if not sub.empty:
+        sub2 = stats[
+            (stats["symbol"] == s) &
+            (stats["ex_low"]  == b) &
+            (stats["ex_high"] == a)
+        ]
+        if not sub2.empty:
+            sub = sub2
             flipped = True
-            x = -x  # лог-спред меняет знак при развороте
+            x = -x     # знак лог-спреда тоже переворачивается
 
     if sub.empty:
-        return x, float('nan'), float('nan')
+        # нет статистики ни в прямом, ни в обратном порядке
+        return x, float("nan"), float("nan")
 
-    mean = to_float(sub.iloc[0].get("ema_mean"))
-    var  = to_float(sub.iloc[0].get("ema_var"))
-    cnt  = int(sub.iloc[0].get("count") or 0)
-    upd  = float(sub.iloc[0].get("updated_ms") or 0.0) / 1000.0
+    row  = sub.iloc[-1]   # всегда берём последнюю статистику
+    mean = to_float(row.get("ema_mean"))
+    var  = to_float(row.get("ema_var"))
+    cnt  = int(row.get("count") or 0)
+    upd  = float(row.get("updated_ms") or 0.0) / 1000.0
     now  = time.time()
 
     min_cnt = int(
@@ -1856,20 +1889,42 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
         )
     )
 
-    if cnt < min_cnt or (upd > 0 and (now - upd) > SPREAD_STALE_SEC):
-        logging.debug(
-            "[Z_MISS] no stats row for %s (%s->%s) nor flipped (%s->%s). x=%.6f",
-            s, a, b, b, a, x
-        )
-        return x, float('nan'), float('nan')
+    # --- 2) проверка свежести и количества наблюдений ---
+    if cnt < min_cnt:
+        logging.debug("[ZMISS] count too low for %s (%s->%s): cnt=%s < %s",
+                      s, a, b, cnt, min_cnt)
+        return x, float("nan"), float("nan")
 
-    std = max(math.sqrt(max(var or 0.0, 0.0)), SPREAD_STD_FLOOR)
+    if upd > 0 and (now - upd) > SPREAD_STALE_SEC:
+        logging.debug("[ZMISS] stats stale for %s (%s->%s): age=%.1fs > %ss",
+                      s, a, b, now - upd, SPREAD_STALE_SEC)
+        return x, float("nan"), float("nan")
 
-    # если направление было flipped — mean тоже должен поменять знак
-    if flipped and (mean is not None):
-        mean = -mean
+    # --- 3) считаем std ---
+    try:
+        std = math.sqrt(max(var or 0.0, 0.0))
+    except Exception:
+        std = float("nan")
 
-    z = (x - (mean or 0.0)) / std if std > 0 else float('nan')
+    if std != std or std <= 0:
+        return x, float("nan"), float("nan")
+
+    std = max(std, SPREAD_STD_FLOOR)
+
+    if flipped:
+        if mean is not None:
+            mean = -mean
+
+    # --- 4) z-score ---
+    try:
+        z = (x - (mean or 0.0)) / std
+    except Exception:
+        z = float("nan")
+
+    # при flipped — z тоже должен менять знак
+    if flipped and z == z:
+        z = -z
+
     return x, z, std
 
 def get_pair_reco(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str) -> tuple[float, float]:
