@@ -956,6 +956,16 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
 
+    # --- NEW: show exact open skip reasons (if any) ---
+    try:
+        rs = r.get("_open_skip_reasons") or []
+        if isinstance(rs, (list, tuple)) and len(rs) > 0:
+            lines.append(
+                "\n🚫 <b>OPEN SKIPPED</b>\n"
+                + "\n".join([f"   • {str(x)}" for x in rs])
+            )
+    except Exception:
+        pass
     return "\n".join(lines)
 
 def maybe_send_telegram(text: str) -> None:
@@ -1970,6 +1980,19 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     cheap_ex = str(best.get("long_ex") or best.get("cheap_ex") or "").lower()
     rich_ex  = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
+
+    # --- NEW: collect reject reasons for TG card ---
+    skip_reasons: list[str] = []
+    def _reject(msg: str) -> bool:
+        try:
+            skip_reasons.append(str(msg))
+            best["_open_skip_reasons"] = skip_reasons
+        except Exception:
+            pass
+        if getenv_bool("DEBUG_INSTANT_OPEN", False):
+            logging.info("[OPEN_SKIP] %s %s", sym, msg)
+        return False
+
     if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
         return False
 
@@ -2002,10 +2025,14 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     if ENTRY_MODE == "zscore":
         if not (eco_ok and z_ok and std_ok):
-            return False
+            return _reject(
+                f"precheck failed (zscore): eco_ok={eco_ok}, z_ok={z_ok}, std_ok={std_ok}"
+            )
     else:
         if not (eco_ok and spread_ok):
-            return False
+            return _reject(
+                f"precheck failed (price): eco_ok={eco_ok}, spread_ok={spread_ok}"
+            )
 
     # --- 2) refresh-confirm (подтверждаем BBO на месте) ---
     REFRESH_CONFIRM = getenv_bool("REFRESH_CONFIRM", True)
@@ -2032,7 +2059,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
             if low_bid <= 0 or low_ask <= 0 or high_bid <= 0 or high_ask <= 0:
                 logging.debug("REFRESH_CONFIRM bad bbo -> skip %s", sym)
-                return False
+                return _reject("refresh_confirm: bad bbo after sleep")
 
             # обновляем цены в best на подтверждённые
             px_low  = float(low_ask)   # BUY по ask на дешёвой
@@ -2045,7 +2072,10 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                     "REFRESH_CONFIRM reject %s: old=%.2f bps new=%.2f bps",
                     sym, spread_bps, spread_bps_confirm
                 )
-                return False
+                return _reject(
+                    f"refresh_confirm: spread dropped old={spread_bps:.2f}bps "
+                    f"new={spread_bps_confirm:.2f}bps lag>{MAX_LAG_BPS_CONFIRM:.2f}bps"
+                )
 
             best["px_low"] = px_low
             best["px_high"] = px_high
@@ -2053,7 +2083,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
         except Exception as e:
             logging.debug("REFRESH_CONFIRM exception: %s", e)
-            return False
+            return _reject(f"refresh_confirm exception: {e}")
 
     # --- 3) Qty расчёт как в positions_once ---
     try:
@@ -2082,7 +2112,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     except Exception as e:
         logging.exception("Qty calc failed for %s: %s", sym, e)
-        return False
+        return _reject(f"qty calc failed: {e}")
 
     # --- 4) Кулдаун после закрытия ---
     COOLDOWN_AFTER_CLOSE_SEC = int(getenv_float("COOLDOWN_AFTER_CLOSE_SEC", 30))
@@ -2090,18 +2120,27 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     if COOLDOWN_AFTER_CLOSE_SEC > 0 and sym in _LAST_CLOSED:
         if (time.time() - _LAST_CLOSED[sym]) < COOLDOWN_AFTER_CLOSE_SEC:
             logging.debug("Skip open %s due to cooldown after close", sym)
-            return False
+            return _reject(
+                f"cooldown after close: {COOLDOWN_AFTER_CLOSE_SEC}s not passed"
+            )
 
     # --- 5) Pair-lock ---
     if not open_lock_check_or_set(sym):
-        return False
+        return _reject("open lock active (another open recently)")
 
     # --- 6) Открываем атомарно ---
     ok, attempt_id, meta = atomic_cross_open(
         symbol=sym, cheap_ex=cheap_ex, rich_ex=rich_ex,
         qty=qty, price_low=px_low, price_high=px_high, paper=paper
     )
-
+    if not ok:
+        # добавляем причину отказа атомарного открытия
+        try:
+            reason = meta.get("reason") if isinstance(meta, dict) else meta
+            skip_reasons.append(f"atomic_open failed: {reason}")
+            best["_open_skip_reasons"] = skip_reasons
+        except Exception:
+            pass
     now_ms = utc_ms_now()
 
     if ok:
