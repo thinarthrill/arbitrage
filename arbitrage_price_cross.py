@@ -955,7 +955,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.2</b>")
+    lines.append(f"\n<b> ver: 1.3</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2186,7 +2186,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
         if qty <= 0:
             logging.debug("Qty capped to 0 by capital limits — skip %s", sym)
-            return False
+            return _reject("qty capped to 0 by capital limits")
 
     except Exception as e:
         logging.exception("Qty calc failed for %s: %s", sym, e)
@@ -2486,12 +2486,15 @@ def scan_all_with_instant_alerts(
         eco_ok    = (net_usd_adj is not None) and (net_usd_adj > min_net_abs)
 
         entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+        # Открытие делаем только в positions_once (единый путь).
+        # Внутри сканера открываемся ТОЛЬКО если явно включили OPEN_IN_SCANNER=1.
+        open_in_scanner = getenv_bool("OPEN_IN_SCANNER", False)
         cond_open = (
-            instant_open
+            open_in_scanner
+            and instant_open
             and spread_ok
             and eco_ok
-            # в zscore-режиме открываемся по факту валидных z и std,
-            # а не по полю best["stats_ok"], которое может не проставляться в alert-path
+            # в zscore-режиме открываемся по факту валидных z и std
             and (entry_mode_loc != "zscore" or (z_ok and std_ok))
             and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
         )
@@ -2677,7 +2680,16 @@ def scan_spreads_once(
 
     # ---------- 5) выбираем best ----------
     best = cands.iloc[0].to_dict()
-
+    # ---- NEW: определяем has_open точно так же, как в positions_once ----
+    try
+        df_pos = load_positions(pos_path)
+        if df_pos is None or df_pos.empty:
+            has_open = False
+        else:
+            has_open = any(df_pos.get("status", "") == "open")
+    except Exception:
+        has_open = False
+    
     # ---------- 6) instant alert в TG ----------
     # 1) сначала пробуем instant open (он дописывает confirm/skip-поля в best)
     if instant_open and best is not None and not has_open:
@@ -4295,6 +4307,20 @@ def positions_once(
             "reason","pnl_usd"
         ])
 
+    # ------------------------------------------------------------------
+    # FIX: совместимость схемы positions_cross.csv между try_instant_open и positions_once
+    # try_instant_open пишет validated_qty / entry_px_low / entry_px_high
+    # ------------------------------------------------------------------
+    try:
+        if "qty" not in df_pos.columns and "validated_qty" in df_pos.columns:
+            df_pos["qty"] = pd.to_numeric(df_pos["validated_qty"], errors="coerce")
+        if "open_price_long" not in df_pos.columns and "entry_px_low" in df_pos.columns:
+            df_pos["open_price_long"] = pd.to_numeric(df_pos["entry_px_low"], errors="coerce")
+        if "open_price_short" not in df_pos.columns and "entry_px_high" in df_pos.columns:
+            df_pos["open_price_short"] = pd.to_numeric(df_pos["entry_px_high"], errors="coerce")
+    except Exception as e:
+        logging.debug("positions_once: schema normalize failed: %s", e)
+
     has_open = False
     try:
         has_open = any(df_pos.get("status","") == "open")
@@ -4462,6 +4488,16 @@ def positions_once(
             paper=paper,
             pos_path=pos_path,
         )
+        try:
+            if getenv_bool("DEBUG_INSTANT_OPEN", False):
+                if best.get("spread_bps_confirm") is not None or best.get("_open_skip_reasons"):
+                    maybe_send_telegram(
+                        "🧪 <b>OPEN ATTEMPT</b>\n" +
+                        format_signal_card(best, per_leg_notional_usd, price_source)
+                    )
+        except Exception:
+            pass
+
         if opened:
             # try_instant_open сам сохраняет позицию и отправляет OPENED
             df_pos = load_positions(pos_path)
