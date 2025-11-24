@@ -1838,6 +1838,7 @@ def gate_quote(symbol: str, price_source: str = "mid"):
 def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
                    px_low: float, px_high: float) -> Tuple[float,float,float]:
     """Возвращает (x, z, std). Если статданные недостоверны — z=nan."""
+
     # --- 0) sanity check ---
     if px_low <= 0 or px_high <= 0:
         return float("nan"), float("nan"), float("nan")
@@ -1870,7 +1871,7 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
         if not sub2.empty:
             sub = sub2
             flipped = True
-            x = -x     # знак лог-спреда тоже переворачивается
+            x = -x     # знак лог-спреда переворачивается
 
     if sub.empty:
         # нет статистики ни в прямом, ни в обратном порядке
@@ -1889,7 +1890,7 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
         )
     )
 
-    # --- 2) проверка свежести и количества наблюдений ---
+    # --- 2) проверка количества и свежести ---
     if cnt < min_cnt:
         logging.debug("[ZMISS] count too low for %s (%s->%s): cnt=%s < %s",
                       s, a, b, cnt, min_cnt)
@@ -1900,7 +1901,7 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
                       s, a, b, now - upd, SPREAD_STALE_SEC)
         return x, float("nan"), float("nan")
 
-    # --- 3) считаем std ---
+    # --- 3) std ---
     try:
         std = math.sqrt(max(var or 0.0, 0.0))
     except Exception:
@@ -1911,19 +1912,15 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
 
     std = max(std, SPREAD_STD_FLOOR)
 
-    if flipped:
-        if mean is not None:
-            mean = -mean
+    # при flipped — mean меняет знак, чтобы соответствовать перевёрнутому x
+    if flipped and (mean is not None):
+       mean = -mean
 
     # --- 4) z-score ---
     try:
         z = (x - (mean or 0.0)) / std
     except Exception:
         z = float("nan")
-
-    # при flipped — z тоже должен менять знак
-    if flipped and z == z:
-        z = -z
 
     return x, z, std
 
