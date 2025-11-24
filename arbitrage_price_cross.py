@@ -838,16 +838,16 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         slip_bps_env     = float(getenv_float("SLIPPAGE_BPS", 1.0))
 
         # min_net_abs уже посчитан выше, но на всякий явно покажем от чего он
-        lines.append(
-            "\n🧷 <b>THRESHOLDS (env / reco)</b>\n"
-            f"   ENTRY_MODE: <code>{entry_mode}</code>\n"
-            f"   CAPITAL: <code>{capital_env:.2f}$</code>\n"
-            f"   ENTRY_NET_PCT: <code>{entry_net_pct:.3f}%</code> → min_net_abs=<code>{min_net_abs:.4f}$</code>\n"
-            f"   ENTRY_SPREAD_BPS: env=<code>{entry_spread_env:.0f}</code>, used=<code>{entry_bps:.0f}</code>\n"
-            f"   Z_IN: env=<code>{z_in_env:.2f}</code>, used=<code>{z_in_loc:.2f}</code>\n"
-            f"   STD_MIN_FOR_OPEN: <code>{std_min_env:.6f}</code>\n"
-            f"   SLIPPAGE_BPS: <code>{slip_bps_env:.2f}</code>"
-        )
+        #lines.append(
+        #    "\n🧷 <b>THRESHOLDS (env / reco)</b>\n"
+        #    f"   ENTRY_MODE: <code>{entry_mode}</code>\n"
+        #    f"   CAPITAL: <code>{capital_env:.2f}$</code>\n"
+        #    f"   ENTRY_NET_PCT: <code>{entry_net_pct:.3f}%</code> → min_net_abs=<code>{min_net_abs:.4f}$</code>\n"
+        #    f"   ENTRY_SPREAD_BPS: env=<code>{entry_spread_env:.0f}</code>, used=<code>{entry_bps:.0f}</code>\n"
+        #    f"   Z_IN: env=<code>{z_in_env:.2f}</code>, used=<code>{z_in_loc:.2f}</code>\n"
+        #    f"   STD_MIN_FOR_OPEN: <code>{std_min_env:.6f}</code>\n"
+        #    f"   SLIPPAGE_BPS: <code>{slip_bps_env:.2f}</code>"
+        #)
 
         # ---------- lazy-fix: если алёрт пришёл без метрик ----------
         if net_usd_adj is None:
