@@ -919,8 +919,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                     f"   ema_var=<code>{ev}</code>\n"
                     f"   updated_ms_age=<code>{'None' if upd_age is None else f'{upd_age:.0f}s'}</code>"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                lines.append(f"\n🚫 <b>Error:</b> Ошибка в метаданных статистики %e")
 
         # eco_ok
         if net_usd_adj is not None:
@@ -955,7 +955,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.4</b>")
+    lines.append(f"\n<b> ver: 1.5</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -979,8 +979,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 f"{'✅' if r.get('std_ok_confirm') else '❌'} std_ok_confirm    · "
                 f"σ={to_float(r.get('std')):.6f} ≥ {to_float(r.get('std_min_for_open_used') or 0.0):.6f}"
             )
-    except Exception:
-        lines.append("\n🚫 <b>Ошибка</b>NEW: show confirm snapshot from try_instant_open\n")
+    except Exception as e:
+        lines.append("\n🚫 <b>Ошибка</b>NEW: show confirm snapshot from try_instant_open. %e\n")
 
     # --- NEW: show exact open skip reasons (if any) ---
     try:
@@ -990,8 +990,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 "\n🚫 <b>OPEN SKIPPED</b>\n"
                 + "\n".join([f"   • {str(x)}" for x in rs])
             )
-    except Exception:
-        lines.append("\n🚫 <b>Ошибка</b>NEW: show exact open skip reasons\n")
+    except Exception as e:
+        lines.append("\n🚫 <b>Ошибка</b>NEW: show exact open skip reasons. %e\n")
     return "\n".join(lines)
 
 def maybe_send_telegram(text: str) -> None:
