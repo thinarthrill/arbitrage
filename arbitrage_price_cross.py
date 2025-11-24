@@ -4289,7 +4289,7 @@ def positions_once(
         if "net_usd_adj" not in cands.columns:
             cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
         # 1) фильтруем только валидные сигналы
-        +        # --- гарантируем наличие нужных колонок ---
+        # --- гарантируем наличие нужных колонок ---
         if "z" not in cands.columns:
             cands["z"] = np.nan
         if "std" not in cands.columns:
