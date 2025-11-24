@@ -2368,11 +2368,14 @@ def scan_all_with_instant_alerts(
         min_net_abs =(float(getenv_float("ENTRY_NET_PCT", 1))/100) * capital  # 1% от капитала
         eco_ok    = (net_usd_adj is not None) and (net_usd_adj > min_net_abs)
 
+        entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
         cond_open = (
             instant_open
             and spread_ok
             and eco_ok
-            and (getenv_str("ENTRY_MODE", "price").lower() != "zscore" or best.get("stats_ok", False))
+            # в zscore-режиме открываемся по факту валидных z и std,
+            # а не по полю best["stats_ok"], которое может не проставляться в alert-path
+            and (entry_mode_loc != "zscore" or (z_ok and std_ok))
             and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
         )
 
