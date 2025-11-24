@@ -4273,13 +4273,42 @@ def positions_once(
             "ema_bps","std_bps","z"
         ])
 
-    # сортировка по net_usd_adj если есть, иначе net_usd
-    sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
-    cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+
+    if entry_mode_loc == "zscore":
+        # 1) фильтруем только валидные сигналы
+        if "z" in cands.columns:
+            cands = cands[
+                (cands["z"].notna()) &
+                (cands["z"] == cands["z"]) &      # не NaN
+                (cands["z_ok"] == True) &
+                (cands["std_ok"] == True) &
+                (cands["spread_ok"] == True) &
+                (cands["eco_ok"] == True)
+            ]
+            cands = cands.copy()
+
+        # 2) если после фильтра пусто — fallback
+        if cands.empty:
+            sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
+            cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+        else:
+            # 3) сортировка с приоритетом zscore
+            # сначала z (убывание), затем net_adj
+            cands["__score__"] = (
+                cands["z"] * 10000 +
+                cands["net_usd_adj"].fillna(0)
+            )
+            cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
+    else:
+        # price режим — как раньше
+        sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
+        cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
     best = None
     if not cands.empty:
         best = dict(cands.iloc[0])
+
 
     if top3_to_tg and top3_to_tg > 0 and not cands.empty:
         topN = cands.head(int(top3_to_tg)).to_dict("records")
