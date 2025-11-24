@@ -956,6 +956,32 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
 
+    # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
+    try:
+        if r.get("spread_bps_confirm") is not None:
+            lines.append("\n🧷 <b>CONFIRM CHECK (actual open attempt)</b>")
+            lines.append(
+                "📌 FACT (confirm)\n"
+                f"   spread_bps_confirm={to_float(r.get('spread_bps_confirm')):.2f}\n"
+                f"   net_usd_adj_confirm={to_float(r.get('net_usd_adj_confirm')):.4f}\n"
+                f"   px_low_confirm={to_float(r.get('px_low_confirm')):.6f}\n"
+                f"   px_high_confirm={to_float(r.get('px_high_confirm')):.6f}"
+            )
+            lines.append(
+                "⚙️ ENTRY FILTERS (confirm)\n"
+                f"{'✅' if r.get('eco_ok_confirm') else '❌'} eco_ok_confirm   · net_adj_confirm "
+                f"= {to_float(r.get('net_usd_adj_confirm')):.2f} "
+                f"{'>' if r.get('eco_ok_confirm') else '≤'} {to_float(r.get('min_net_abs_used') or 0.0):.2f}\n"
+                f"{'✅' if r.get('spread_ok_confirm') else '❌'} spread_ok_confirm · "
+                f"{to_float(r.get('spread_bps_confirm')):.0f} bps ≥ {to_float(r.get('entry_bps_used') or 0.0):.0f} bps\n"
+                f"{'✅' if r.get('z_ok_confirm') else '❌'} z_ok_confirm      · "
+                f"z={to_float(r.get('z')):.2f} ≥ {to_float(r.get('z_in_used') or 0.0):.2f}\n"
+                f"{'✅' if r.get('std_ok_confirm') else '❌'} std_ok_confirm    · "
+                f"σ={to_float(r.get('std')):.6f} ≥ {to_float(r.get('std_min_for_open_used') or 0.0):.6f}"
+            )
+    except Exception:
+        pass
+
     # --- NEW: show exact open skip reasons (if any) ---
     try:
         rs = r.get("_open_skip_reasons") or []
@@ -2081,6 +2107,29 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             best["px_high"] = px_high
             best["spread_bps"] = spread_bps_confirm
 
+            # --- NEW: store confirm snapshot for TG card ---
+            best["px_low_confirm"] = px_low
+            best["px_high_confirm"] = px_high
+            best["spread_bps_confirm"] = spread_bps_confirm
+
+            # пересчёт net_usd_adj на подтверждённых ценах (по той же идее, что в build_price_arbitrage)
+            slippage_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
+            spread_pct_confirm = (px_high - px_low) / max(px_low, 1e-12)
+            gross_usd_confirm = spread_pct_confirm * float(per_leg_notional_usd)
+            fees_rt_confirm = 2.0 * float(taker_fee) * float(per_leg_notional_usd)
+            slip_usd_confirm = 4.0 * (slippage_bps / 1e4) * float(per_leg_notional_usd)
+            net_usd_adj_confirm = gross_usd_confirm - fees_rt_confirm - slip_usd_confirm
+            best["net_usd_adj_confirm"] = net_usd_adj_confirm
+
+            # confirm-флаги (z/std берём текущие, т.к. mean/var здесь нет)
+            spread_ok_confirm = spread_bps_confirm >= ENTRY_SPREAD_BPS
+            eco_ok_confirm = (net_usd_adj_confirm == net_usd_adj_confirm) and (net_usd_adj_confirm > min_net_abs)
+            z_ok_confirm = (z == z) and (z >= Z_IN)
+            std_ok_confirm = (std == std) and (std >= std_min_for_open)
+            best["eco_ok_confirm"] = eco_ok_confirm
+            best["spread_ok_confirm"] = spread_ok_confirm
+            best["z_ok_confirm"] = z_ok_confirm
+            best["std_ok_confirm"] = std_ok_confirm
         except Exception as e:
             logging.debug("REFRESH_CONFIRM exception: %s", e)
             return _reject(f"refresh_confirm exception: {e}")
