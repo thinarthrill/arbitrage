@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.7</b>")
+    lines.append(f"\n<b> ver: 1.8</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2685,8 +2685,44 @@ def scan_spreads_once(
         cands["std"] = np.nan
         cands["n"] = 0
 
-    # ---------- 5) выбираем best ----------
+    # ---------- 5) правильный выбор best (как в positions_once) ----------
+    entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+    if entry_mode_loc == "zscore":
+        # гарантируем колонки
+        if "z" not in cands.columns:
+            cands["z"] = np.nan
+        if "std" not in cands.columns:
+            cands["std"] = np.nan
+        if "net_usd_adj" not in cands.columns:
+            cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
+
+        # фильтр валидных zscore-сигналов
+        Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+        std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        cands["z"] = pd.to_numeric(cands["z"], errors="coerce")
+        cands["std"] = pd.to_numeric(cands["std"], errors="coerce")
+        cands["net_usd_adj"] = pd.to_numeric(cands["net_usd_adj"], errors="coerce")
+
+        valid = cands[
+            cands["z"].notna() &
+            (cands["z"] >= Z_IN_LOC) &
+            cands["std"].notna() &
+            (cands["std"] >= std_min_for_open)
+        ].copy()
+
+        if not valid.empty:
+            valid["__score__"] = valid["z"] * 10000 + valid["net_usd_adj"].fillna(0)
+            cands = valid.sort_values("__score__", ascending=False).reset_index(drop=True)
+        else:
+            # fallback по прибыли
+            sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
+            cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    else:
+        sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
+        cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
     best = cands.iloc[0].to_dict()
+
     # ---- NEW: определяем has_open точно так же, как в positions_once ----
     try:
         df_pos = load_positions(pos_path)
