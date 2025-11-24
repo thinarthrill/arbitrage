@@ -955,7 +955,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.1</b>")
+    lines.append(f"\n<b> ver: 1.2</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2021,12 +2021,12 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         return False
 
     if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
-        return False
+        return _reject(f"bad exchanges: cheap_ex={cheap_ex}, rich_ex={rich_ex}")
 
     px_low  = float(best.get("px_low")  or 0.0)
     px_high = float(best.get("px_high") or 0.0)
     if px_low <= 0 or px_high <= 0:
-        return False
+        return _reject(f"bad prices: px_low={px_low}, px_high={px_high}")
 
     spread_bps = float(best.get("spread_bps") or 0.0)
     z_raw      = best.get("z")
@@ -2061,11 +2061,22 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
     capital = float(getenv_float("CAPITAL", 1000.0))
     min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1))/100.0) * capital
+    # --- NEW: store "used" thresholds for TG/debug so card == real precheck ---
+    best["entry_mode_used"] = ENTRY_MODE
+    best["z_in_used"] = Z_IN
+    best["entry_bps_used"] = ENTRY_SPREAD_BPS
+    best["std_min_for_open_used"] = std_min_for_open
+    best["min_net_abs_used"] = min_net_abs
 
     eco_ok = (net_adj == net_adj) and (net_adj > min_net_abs)
     spread_ok = spread_bps >= ENTRY_SPREAD_BPS
     z_ok = (z == z) and (z >= Z_IN)
     std_ok = (std == std) and (std >= std_min_for_open)
+
+    best["eco_ok"] = eco_ok
+    best["spread_ok"] = spread_ok
+    best["z_ok"] = z_ok
+    best["std_ok"] = std_ok
 
     if ENTRY_MODE == "zscore":
         if not (eco_ok and z_ok and std_ok):
@@ -2668,30 +2679,24 @@ def scan_spreads_once(
     best = cands.iloc[0].to_dict()
 
     # ---------- 6) instant alert в TG ----------
-    try:
-        if INSTANT_ALERT and best.get("spread_pct") is not None:
-            if float(best["spread_pct"]) >= float(alert_spread_pct):
-                last_ts = _LAST_ALERT_TS.get(best["symbol"], 0.0)
-                if (now - last_ts) >= float(cooldown_sec):
-                    card = format_signal_card(best, per_leg_notional_usd, price_source)
-                    maybe_send_telegram("⚡ <b>INSTANT ALERT</b>\n\n" + card)
-                    _LAST_ALERT_TS[best["symbol"]] = now
-    except Exception as e:
-        logging.warning("[ALERT] instant alert failed: %s", e)
-
-    # ---------- 7) instant open ----------
-    try:
-        if instant_open:
+    # 1) сначала пробуем instant open (он дописывает confirm/skip-поля в best)
+    if instant_open and best is not None and not has_open:
+        try:
             try_instant_open(
-                best=best,
+                best,
                 per_leg_notional_usd=per_leg_notional_usd,
                 taker_fee=taker_fee,
+                pos_path=pos_path,
                 paper=paper,
-                pos_path=(pos_path_for_instant or pos_path),
             )
-    except Exception as e:
-        logging.warning("[OPEN] instant open failed: %s", e)
+        except Exception as e:
+            logging.exception("[OPEN] instant open exception: %s", e)
+            # чтобы в TG тоже было видно
+            best.setdefault("_open_skip_reasons", []).append(f"instant_open exception: {e}")
 
+    # 2) и только ПОСЛЕ этого шлём карточку уже с confirm/skip
+    if best is not None:
+        maybe_send_telegram(format_signal_card(best, per_leg_notional_usd, price_source))
 
     return best, quotes_df
 
