@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.6</b>")
+    lines.append(f"\n<b> ver: 1.7</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4289,16 +4289,37 @@ def positions_once(
         if "net_usd_adj" not in cands.columns:
             cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
         # 1) фильтруем только валидные сигналы
-        if "z" in cands.columns:
-            cands = cands[
-                (cands["z"].notna()) &
-                (cands["z"] == cands["z"]) &      # не NaN
-                (cands["z_ok"] == True) &
-                (cands["std_ok"] == True) &
-                (cands["spread_ok"] == True) &
-                (cands["eco_ok"] == True)
-            ]
-            cands = cands.copy()
+        +        # --- гарантируем наличие нужных колонок ---
+        if "z" not in cands.columns:
+            cands["z"] = np.nan
+        if "std" not in cands.columns:
+            cands["std"] = np.nan
+        if "net_usd_adj" not in cands.columns:
+            cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
+
+        # --- NEW: считаем те же флаги, что и try_instant_open, но для всех строк cands ---
+        Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+        std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        capital = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
+
+        cands["spread_bps"]  = pd.to_numeric(cands.get("spread_bps"), errors="coerce")
+        cands["z"]           = pd.to_numeric(cands.get("z"), errors="coerce")
+        cands["std"]         = pd.to_numeric(cands.get("std"), errors="coerce")
+        cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd_adj"), errors="coerce")
+
+        cands["spread_ok"] = cands["spread_bps"] >= float(entry_bps)
+        cands["std_ok"]    = cands["std"].notna() & (cands["std"] >= std_min_for_open)
+        cands["z_ok"]      = cands["z"].notna() & (cands["z"] >= Z_IN_LOC)
+        cands["eco_ok"]    = cands["net_usd_adj"].notna() & (cands["net_usd_adj"] > min_net_abs)
+
+        # 1) фильтруем только валидные сигналы
+        cands = cands[
+            cands["z_ok"] &
+            cands["std_ok"] &
+            cands["spread_ok"] &
+            cands["eco_ok"]
+        ].copy()
 
         # 2) если после фильтра пусто — fallback
         if cands.empty or cands["z"].isna().all():
