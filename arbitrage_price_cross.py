@@ -2681,7 +2681,7 @@ def scan_spreads_once(
     # ---------- 5) выбираем best ----------
     best = cands.iloc[0].to_dict()
     # ---- NEW: определяем has_open точно так же, как в positions_once ----
-    try
+    try:
         df_pos = load_positions(pos_path)
         if df_pos is None or df_pos.empty:
             has_open = False
