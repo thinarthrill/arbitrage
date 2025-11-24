@@ -123,8 +123,15 @@ def _bulk_bybit():
             sym = j.get("symbol")
             if not sym:
                 continue
-            bid = float(j["bid1Price"])
-            ask = float(j["ask1Price"])
+            raw_bid = j.get("bid1Price")
+            raw_ask = j.get("ask1Price")
+            if not raw_bid or not raw_ask:
+                continue
+            try:
+                bid = float(raw_bid)
+                ask = float(raw_ask)
+            except (TypeError, ValueError):
+                continue
             mark = float(j.get("markPrice", 0)) if j.get("markPrice") else None
             last = float(j.get("lastPrice", 0)) if j.get("lastPrice") else None
             if bid <= 0 or ask <= 0:
@@ -955,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.5</b>")
+    lines.append(f"\n<b> ver: 1.6</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4276,6 +4283,11 @@ def positions_once(
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
     if entry_mode_loc == "zscore":
+        # --- FIX: гарантируем наличие z и net_usd_adj, иначе KeyError ---
+        if "z" not in cands.columns:
+            cands["z"] = np.nan
+        if "net_usd_adj" not in cands.columns:
+            cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
         # 1) фильтруем только валидные сигналы
         if "z" in cands.columns:
             cands = cands[
@@ -4289,7 +4301,7 @@ def positions_once(
             cands = cands.copy()
 
         # 2) если после фильтра пусто — fallback
-        if cands.empty:
+        if cands.empty or cands["z"].isna().all():
             sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
             cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
         else:
