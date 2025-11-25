@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 1.8</b>")
+    lines.append(f"\n<b> ver: 2.0</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2568,7 +2568,7 @@ def scan_spreads_once(
     price_source: str = "mid",
     alert_spread_pct: float = 0.5,
     cooldown_sec: int = 60,
-    instant_open: bool = True,
+    instant_open: bool = False,
     pos_path_for_instant: Optional[str] = None,
     paper: bool = True,
     per_ex_symbols: Optional[dict] = None,   # <-- чтобы main не падал
@@ -2732,22 +2732,6 @@ def scan_spreads_once(
             has_open = any(df_pos.get("status", "") == "open")
     except Exception:
         has_open = False
-    
-    # ---------- 6) instant alert в TG ----------
-    # 1) сначала пробуем instant open (он дописывает confirm/skip-поля в best)
-    if instant_open and best is not None and not has_open:
-        try:
-            try_instant_open(
-                best,
-                per_leg_notional_usd=per_leg_notional_usd,
-                taker_fee=taker_fee,
-                pos_path=pos_path,
-                paper=paper,
-            )
-        except Exception as e:
-            logging.exception("[OPEN] instant open exception: %s", e)
-            # чтобы в TG тоже было видно
-            best.setdefault("_open_skip_reasons", []).append(f"instant_open exception: {e}")
 
     # 2) и только ПОСЛЕ этого шлём карточку уже с confirm/skip
     if best is not None:
@@ -4319,17 +4303,17 @@ def positions_once(
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
     if entry_mode_loc == "zscore":
-        # --- FIX: гарантируем наличие z и net_usd_adj, иначе KeyError ---
+        # --- FIX: гарантируем наличие z/std/net_usd_adj и алиасы из stats ---
         if "z" not in cands.columns:
-            cands["z"] = np.nan
-        if "net_usd_adj" not in cands.columns:
-            cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
-        # 1) фильтруем только валидные сигналы
-        # --- гарантируем наличие нужных колонок ---
-        if "z" not in cands.columns:
-            cands["z"] = np.nan
+           cands["z"] = np.nan
+        # stats-мердж кладёт std_bps/ema_bps → делаем алиасы под try_instant_open
         if "std" not in cands.columns:
-            cands["std"] = np.nan
+            if "std_bps" in cands.columns:
+                cands["std"] = cands["std_bps"]
+            else:
+                cands["std"] = np.nan
+        if "ema" not in cands.columns and "ema_bps" in cands.columns:
+            cands["ema"] = cands["ema_bps"]
         if "net_usd_adj" not in cands.columns:
             cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
 
@@ -4567,38 +4551,86 @@ def positions_once(
                                 f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
                                 f"open_net={open_net:.2f} → best_net={best_net:.2f}"
                             )
-                            # открыть новый best единым механизмом
-                            try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path)
-                            df_pos = load_positions(pos_path)
+                            # открыть новый best тем же механизмом, что в блоке 6 (atomic_cross_open)
+                            entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+
+                            spread_bps = float(best.get("spread_bps") or 0.0)
+                            net_adj    = float(best.get("net_usd_adj") or 0.0)
+                            z          = float(best.get("z") or float("nan"))
+                            std        = float(best.get("std") or float("nan"))
+
+                            Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+                            std_min  = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+                            capital  = float(getenv_float("CAPITAL", 1000.0))
+                            min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
+
+                            spread_ok = spread_bps >= float(entry_bps)
+                            eco_ok    = net_adj > min_net_abs
+
+                            if entry_mode_loc == "zscore":
+                                z_ok   = (z == z) and (z >= Z_IN_LOC)
+                                std_ok = (std == std) and (std >= std_min)
+                            else:
+                                z_ok, std_ok = True, True
+
+                            if spread_ok and eco_ok and z_ok and std_ok:
+                                _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
+                                ok2, attempt_id2, meta2 = atomic_cross_open(
+                                    symbol=str(best["symbol"]).upper(),
+                                    cheap_ex=str(best["long_ex"]).lower(),
+                                    rich_ex=str(best["short_ex"]).lower(),
+                                    qty=float(best["qty_est"]),
+                                   price_low=float(best["px_low"]),
+                                    price_high=float(best["px_high"]),
+                                    paper=_paper
+                                )
+                                if not ok2:
+                                    logging.warning("[ROTATE_OPEN] failed %s: %s", best.get("symbol"), meta2)
+                                else:
+                                    df_pos = load_positions(pos_path)
         except Exception as e:
             logging.debug("positions_once: rotate failed: %s", e)
 
+    # 6) ЕДИНЫЙ путь ОТКРЫТИЯ (через atomic_cross_open)
     # ------------------------------
-    # 6) ЕДИНЫЙ путь ОТКРЫТИЯ (NEW)
-    # ------------------------------
-    # Важно: больше нет старого "второго" пути через atomic_cross_open внутри positions_once.
-    # Открываем только try_instant_open(), чтобы все фильтры/refresh-confirm были едиными.
     if (not has_open) and best is not None:
-        opened = try_instant_open(
-            best=best,
-            per_leg_notional_usd=per_leg_notional_usd,
-            taker_fee=taker_fee,
-            paper=paper,
-            pos_path=pos_path,
-        )
-        try:
-            if getenv_bool("DEBUG_INSTANT_OPEN", False):
-                if best.get("spread_bps_confirm") is not None or best.get("_open_skip_reasons"):
-                    maybe_send_telegram(
-                        "🧪 <b>OPEN ATTEMPT</b>\n" +
-                        format_signal_card(best, per_leg_notional_usd, price_source)
-                    )
-        except Exception:
-            pass
+        entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
-        if opened:
-            # try_instant_open сам сохраняет позицию и отправляет OPENED
-            df_pos = load_positions(pos_path)
+        spread_bps = float(best.get("spread_bps") or 0.0)
+        net_adj    = float(best.get("net_usd_adj") or 0.0)
+        z          = float(best.get("z") or float("nan"))
+        std        = float(best.get("std") or float("nan"))
+
+        Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+        std_min  = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        capital  = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
+
+        spread_ok = spread_bps >= float(entry_bps)
+        eco_ok    = net_adj > min_net_abs
+
+        if entry_mode_loc == "zscore":
+            z_ok   = (z == z) and (z >= Z_IN_LOC)
+            std_ok = (std == std) and (std >= std_min)
+        else:
+            z_ok, std_ok = True, True
+
+        if spread_ok and eco_ok and z_ok and std_ok:
+            _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
+            ok, attempt_id, meta = atomic_cross_open(
+                symbol=str(best["symbol"]).upper(),
+                cheap_ex=str(best["long_ex"]).lower(),
+                rich_ex=str(best["short_ex"]).lower(),
+                qty=float(best["qty_est"]),
+                price_low=float(best["px_low"]),
+                price_high=float(best["px_high"]),
+                paper=_paper
+            )
+            if not ok:
+                logging.warning("[OPEN] failed %s: %s", best.get("symbol"), meta)
+            else:
+                # обновим позиции после успеха
+                df_pos = load_positions(pos_path)
 
     save_positions(pos_path, df_pos)
 
@@ -4962,27 +4994,6 @@ def main():
                 paper=paper,
                 per_ex_symbols=per_ex_symbols,
             )
-
-            # ============================================================
-            # B) (опционально) чисто алерт-сканер, НЕ трогаем quotes_df
-            # ============================================================
-            if getenv_bool("RUN_PARALLEL_ALERT_SCANNER", False):
-                try:
-                    scan_all_with_instant_alerts(
-                        exchanges=exchanges,
-                        symbols=symbols,
-                        per_leg_notional_usd=per_leg_notional,
-                        taker_fee=taker_fee,
-                        price_source=price_source,
-                        alert_spread_pct=ALERT_SPREAD_PCT,
-                        cooldown_sec=ALERT_COOLDOWN_SEC,
-                        instant_open=False,
-                        pos_path_for_instant=pos_cross_path,
-                        paper=paper,
-                        per_ex_symbols=per_ex_symbols,
-                    )
-                except Exception as e:
-                    logging.warning("[ALERT_SCANNER] error: %s", e)
 
             # ============================================================
             # C) inline-обновление stats_store (как у тебя)
