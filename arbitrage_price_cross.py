@@ -761,16 +761,16 @@ def quote(ex: str, symbol: str, price_source: str = "mid"):
     }
 # ----------------- Telegram -----------------
 def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) -> str:
-    sym      = str(r["symbol"])
-    long_ex  = str(r["long_ex"]).upper()
-    short_ex = str(r["short_ex"]).upper()
-    px_low   = float(r["px_low"])
-    px_high  = float(r["px_high"])
-    sp_pct   = float(r["spread_pct"])
-    sp_bps   = float(r["spread_bps"])
-    net_usd  = float(r["net_usd"])
-    gross    = float(r["gross_usd"])
-    fees_rt  = float(r["fees_roundtrip_usd"])
+    sym      = str(r.get("symbol", ""))
+    long_ex  = str(r.get("long_ex", "")).upper()
+    short_ex = str(r.get("short_ex", "")).upper()
+    px_low   = float(to_float(r.get("px_low")) or 0.0)
+    px_high  = float(to_float(r.get("px_high")) or 0.0)
+    sp_pct   = float(to_float(r.get("spread_pct")) or 0.0)
+    sp_bps   = float(to_float(r.get("spread_bps")) or 0.0)
+    net_usd  = float(to_float(r.get("net_usd")) or 0.0)
+    gross    = float(to_float(r.get("gross_usd")) or 0.0)
+    fees_rt  = float(to_float(r.get("fees_roundtrip_usd")) or 0.0)
     ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     price_lbl = {"mid":"MID","last":"LAST","mark":"MARK","bid":"BID","ask":"ASK","book":"BBO"}.get(price_source.lower(),"MID")
@@ -2049,7 +2049,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             slippage_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
             spread_pct = (px_high - px_low) / max(px_low, 1e-12)
             gross_usd  = spread_pct * float(per_leg_notional_usd)
-            fees_rt    = 2.0 * float(taker_fee) * float(per_leg_notional_usd)
+            fees_rt    = 4.0 * float(taker_fee) * float(per_leg_notional_usd)
             slip_usd   = 4.0 * (slippage_bps / 1e4) * float(per_leg_notional_usd)
             net_adj_raw = gross_usd - fees_rt - slip_usd
             best["net_usd_adj"] = net_adj_raw
@@ -2607,8 +2607,8 @@ def scan_spreads_once(
             if allowed_syms is not None and sym_u not in allowed_syms:
                 continue
 
-            bid  = to_float(q.get("bid"))
-            ask  = to_float(q.get("ask"))
+            bid  = to_float(q.get("bid") or q.get("bestBid") or q.get("bidPx") or q.get("b")) or q.get("bestBid1")
+            ask  = to_float(q.get("ask") or q.get("bestAsk") or q.get("askPx") or q.get("a")) or q.get("bestAsk1")
             last = to_float(q.get("last"))
             mark = to_float(q.get("mark"))
 
@@ -2721,7 +2721,11 @@ def scan_spreads_once(
         sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
         cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
-    best = cands.iloc[0].to_dict()
+    best = None
+    if cands is not None and not cands.empty:
+        best = cands.iloc[0].to_dict()
+    else:
+        return None, quotes_df
 
     # ---- NEW: определяем has_open точно так же, как в positions_once ----
     try:
@@ -3441,19 +3445,6 @@ def build_price_arbitrage(
     if not out.empty:
         out = out.sort_values(["net_usd", "spread_bps"], ascending=[False, False]).reset_index(drop=True)
     return out
-
-# ----------------- Z-score: reading spread stats -----------------
-SPREAD_STATS_PATH = bucketize_path(getenv_str("SPREAD_STATS_PATH", "spread_stats.csv"))
-STATS_COLS = [
-    "symbol","ex_low","ex_high",
-    "ema_mean","ema_var","count","updated_ms",
-    "mean_bps","std_bps","required_spread_bps","z_req_profit",
-    "Z_IN_suggested","entry_spread_bps_suggested"
-]
-
-
-ALPHA = float(getenv_float("SPREAD_EMA_ALPHA", 0.05))
-SAVE_EVERY_SEC = int(getenv_float("SAVE_EVERY_SEC", 30))
 
 # ----------------- Z-score: reading spread stats -----------------
 SPREAD_STATS_PATH = bucketize_path(getenv_str("SPREAD_STATS_PATH", "spread_stats.csv"))
