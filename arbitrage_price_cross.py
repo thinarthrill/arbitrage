@@ -2763,8 +2763,6 @@ def scan_spreads_once(
     net_usd_adj = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
     z = to_float(best.get("z"))
     std = to_float(best.get("std"))
-    z = to_float(best.get("z"))
-    std = to_float(best.get("std"))
 
     # --- FIX: nan -> None, чтобы фильтры z_ok/std_ok работали корректно ---
     try:
@@ -2775,7 +2773,63 @@ def scan_spreads_once(
     except Exception:
         pass
 
-    # держим best синхронизированным с очищенными значениями
+    # --- LAZY-FIX: если z/std так и остались None, пересчитываем их как в карточке ---
+    if (z is None) or (std is None):
+        try:
+            stats_df2 = read_spread_stats()
+            px_low = float(best.get("px_low") or 0.0)
+            px_high = float(best.get("px_high") or 0.0)
+            sym = str(best.get("symbol") or "")
+            ex_low = str(best.get("long_ex") or best.get("cheap_ex") or "").lower()
+            ex_high = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
+
+            if sym and px_low > 0 and px_high > 0 and ex_low and ex_high:
+                _, z2, std2 = get_z_for_pair(
+                    stats_df2,
+                    symbol=sym,
+                    ex_low=ex_low,
+                    ex_high=ex_high,
+                    px_low=px_low,
+                    px_high=px_high,
+                )
+                if z2 == z2:   # not NaN
+                    z = float(z2)
+                if std2 == std2:
+                    std = float(std2)
+        except Exception:
+            pass
+
+    # держим best синхронизированным с очищенными/пересчитанными значениями
+    best["z"] = z
+    best["std"] = std
+
+    # --- LAZY-FIX: если z/std так и остались None, пересчитываем их как в карточке ---
+    if (z is None) or (std is None):
+        try:
+            stats_df2 = read_spread_stats()
+            px_low = float(best.get("px_low") or 0.0)
+            px_high = float(best.get("px_high") or 0.0)
+            sym = str(best.get("symbol") or "")
+            ex_low = str(best.get("long_ex") or best.get("cheap_ex") or "").lower()
+            ex_high = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
+
+            if sym and px_low > 0 and px_high > 0 and ex_low and ex_high:
+                _, z2, std2 = get_z_for_pair(
+                    stats_df2,
+                    symbol=sym,
+                    ex_low=ex_low,
+                    ex_high=ex_high,
+                    px_low=px_low,
+                    px_high=px_high,
+                )
+                if z2 == z2:   # not NaN
+                    z = float(z2)
+                if std2 == std2:
+                    std = float(std2)
+        except Exception:
+            pass
+
+    # держим best синхронизированным с очищенными/пересчитанными значениями
     best["z"] = z
     best["std"] = std
 
