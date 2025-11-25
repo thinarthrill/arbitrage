@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.3</b>")
+    lines.append(f"\n<b> ver: 2.4</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2763,6 +2763,21 @@ def scan_spreads_once(
     net_usd_adj = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
     z = to_float(best.get("z"))
     std = to_float(best.get("std"))
+    z = to_float(best.get("z"))
+    std = to_float(best.get("std"))
+
+    # --- FIX: nan -> None, чтобы фильтры z_ok/std_ok работали корректно ---
+    try:
+        if z is not None and isinstance(z, float) and np.isnan(z):
+            z = None
+        if std is not None and isinstance(std, float) and np.isnan(std):
+            std = None
+    except Exception:
+        pass
+
+    # держим best синхронизированным с очищенными значениями
+    best["z"] = z
+    best["std"] = std
 
     spread_ok = spread_bps >= float(spread_bps_min)
     eco_ok = net_usd_adj > 0
