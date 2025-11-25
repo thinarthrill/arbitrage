@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.13</b>")
+    lines.append(f"\n<b> ver: 2.14</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3282,7 +3282,10 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         if raw_qty <= 0:
             raise RuntimeError(f"Gate: qty={raw_qty} <= 0")
 
-        size = raw_qty
+        # Gate не принимает дробный size, только целые контракты
+        size = int(raw_qty)
+        if size == 0:
+            size = 1
         if side.upper() == "SELL":
             size = -size
 
