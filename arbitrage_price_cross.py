@@ -357,8 +357,10 @@ def _private_base(exchange: str) -> str:
         #   API domain for demo trading: https://api-testnet.gateapi.io/api/v4
         use_testnet = _is_true("GATE_TESTNET", False) or _is_true("GATE_PAPER", False)
         if use_testnet:
-            return "https://api-testnet.gateapi.io"
-        return "https://api.gateio.ws"
+            #return "https://api-testnet.gateapi.io"
+            return "https://fx-api-testnet.gateio.ws"
+        #return "https://api.gateio.ws"
+        return "https://fx-api.gateio.ws"
     if ex == "okx":
         # у OKX отдельного фьюч-тестнета для USDT-SWAP нет, «демо» режим делается заголовком x-simulated-trading
         # поэтому всегда используем основной хост
@@ -962,7 +964,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.11</b>")
+    lines.append(f"\n<b> ver: 2.12</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
