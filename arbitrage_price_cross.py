@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.2</b>")
+    lines.append(f"\n<b> ver: 2.3</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2726,6 +2726,20 @@ def scan_spreads_once(
         best = cands.iloc[0].to_dict()
     else:
         return None, quotes_df
+
+    # ---- FIX: если z/std NaN в cands, подставляем реальные из get_z_for_pair ----
+    if (best.get("z") is None or best.get("z") != best.get("z")) or \
+    (best.get("std") is None or best.get("std") != best.get("std")):
+
+        px_low  = float(best.get("px_low")  or 0)
+        px_high = float(best.get("px_high") or 0)
+        sym = best.get("symbol")
+        ex_low = best.get("long_ex")
+        ex_high = best.get("short_ex")
+
+        x2, z2, std2 = get_z_for_pair(stats_df, sym, ex_low, ex_high, px_low, px_high)
+        best["z"] = z2
+        best["std"] = std2
 
     # ---- has_open: проверяем открыто ли по ЭТОМУ символу ----
     has_open = False
