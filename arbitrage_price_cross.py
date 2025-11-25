@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.14</b>")
+    lines.append(f"\n<b> ver: 2.15</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2243,15 +2243,22 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             except Exception:
                 reason = str(meta)
 
-            if reason:
-                skip_reasons.append(f"atomic_open failed: {reason}")
+            # добавим в причину контекст по сделке
+            ctx = (
+                f"{cheap_ex.upper()}→{rich_ex.upper()} "
+                f"qty={qty:.4f} px_low={px_low:.6f} px_high={px_high:.6f}"
+            )
+
+            full_reason = f"{ctx}; error={reason}" if reason else ctx
+
+            skip_reasons.append(f"atomic_open failed: {full_reason}")
             try:
                 best["_open_skip_reasons"] = skip_reasons
             except Exception:
                 pass
 
             # отдадим через _reject, чтобы ушла OPEN SKIPPED-карточка
-            return _reject(f"atomic_open failed: {reason}")
+            return _reject(f"atomic_open failed: {full_reason}")
 
     now_ms = utc_ms_now()
 
