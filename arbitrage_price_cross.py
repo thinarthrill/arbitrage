@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.9</b>")
+    lines.append(f"\n<b> ver: 2.10</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3857,9 +3857,14 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         open_long_px = float(oa.get("avg_price") or 0.0)
         if open_long_px <= 0:
             # avg_price не пришёл => берём актуальный BBO ПОСЛЕ фактического открытия
-            q = get_bbo(symbol, cheap_ex) or {}
-            b = q.get("bid")
-            a = q.get("ask")
+            bbo = get_bbo(symbol, cheap_ex)
+            if isinstance(bbo, tuple):
+                b, a = bbo
+            elif isinstance(bbo, dict):
+                b = bbo.get("bid")
+                a = bbo.get("ask")
+            else:
+                b = a = None
             open_long_px = float(a or b or 0.0)
 
     except Exception as e:
@@ -3884,11 +3889,15 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         # --- NEW: фиксируем реальную цену открытия SHORT ---
         open_short_px = float(ob.get("avg_price") or 0.0)
         if open_short_px <= 0:
-            q = get_bbo(symbol, rich_ex) or {}
-            b = q.get("bid")
-            a = q.get("ask")
+            bbo = get_bbo(symbol, rich_ex)
+            if isinstance(bbo, tuple):
+                b, a = bbo
+            elif isinstance(bbo, dict):
+                b = bbo.get("bid")
+                a = bbo.get("ask")
+            else:
+                b = a = None
             open_short_px = float(b or a or 0.0)
-
 
     except Exception as e:
         # откат первой ноги (продаём то, что купили)
@@ -4065,6 +4074,172 @@ def bybit_exec_list(symbol: str, order_id: str|None=None, order_link_id: str|Non
         return []
 
     return (j.get("result") or {}).get("list") or []
+
+def okx_exec_list(symbol: str,
+                  order_id: str | None = None,
+                  order_link_id: str | None = None,
+                  start_ms: int | None = None) -> list[dict]:
+    """
+    OKX executions helper.
+    Берём трейды из /api/v5/trade/fills-history по instId (SWAP),
+    фильтруем по времени и ordId/clOrdId.
+    """
+    key = os.getenv("OKX_API_KEY") or ""
+    sec = os.getenv("OKX_API_SECRET") or ""
+    pph = os.getenv("OKX_PASSPHRASE") or ""
+    if not key or not sec or not pph:
+        logging.warning("okx_exec_list: missing OKX API keys")
+        return []
+
+    base = okx_base()
+    inst_id = okx_inst_from_symbol(symbol)
+
+    path = "/api/v5/trade/fills-history"
+    params = {
+        "instType": "SWAP",
+        "instId": inst_id,
+        "limit": "100",
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    req_path = f"{path}?{query}"
+
+    method = "GET"
+    # OKX требует ISO-8601 в UTC
+    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    prehash = ts + method + req_path
+
+    sign = base64.b64encode(
+        hmac.new(sec.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+
+    sim_flag = "1" if (_is_true("OKX_TESTNET", False) or _is_true("OKX_PAPER", False)) else "0"
+
+    headers = {
+        "OK-ACCESS-KEY": key,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": pph,
+        "OK-ACCESS-PROJECT": os.getenv("OKX_PROJECT", ""),
+        "x-simulated-trading": sim_flag,
+    }
+
+    url = f"{base}{req_path}"
+    try:
+        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except Exception:
+        logging.exception("okx_exec_list: request failed")
+        return []
+
+    try:
+        j = r.json()
+    except Exception:
+        logging.exception("okx_exec_list: bad JSON, status=%s body=%s", r.status_code, r.text[:500])
+        return []
+
+    if r.status_code != 200 or str(j.get("code")) not in ("0", "None", "null"):
+        logging.warning("okx_exec_list: error code=%s msg=%s", j.get("code"), j.get("msg"))
+        data = j.get("data") or []
+    else:
+        data = j.get("data") or []
+
+    res: list[dict] = []
+    for t in data:
+        try:
+            ts_ms = int(t.get("ts", 0))
+        except Exception:
+            ts_ms = 0
+
+        if start_ms and ts_ms < start_ms:
+            continue
+        if order_id and str(t.get("ordId")) != str(order_id):
+            continue
+        if order_link_id and t.get("clOrdId") != str(order_link_id):
+            continue
+        res.append(t)
+
+    return res
+
+def gate_exec_list(symbol: str,
+                   order_id: str | None = None,
+                   client_order_id: str | None = None,
+                   start_ms: int | None = None) -> list[dict]:
+    """
+    Gate futures user trades: /api/v4/futures/usdt/user_trades
+    Фильтруем по contract, времени, order_id и text (clientOrderId).
+    """
+    key = os.getenv("GATE_API_KEY") or ""
+    sec = os.getenv("GATE_API_SECRET") or ""
+    if not key or not sec:
+        logging.warning("gate_exec_list: missing Gate API keys")
+        return []
+
+    # Фьючи контракт: BTCUSDT -> BTC_USDT
+    contract = symbol.upper()
+    if contract.endswith("USDT") and "_" not in contract:
+        contract = contract.replace("USDT", "_USDT")
+
+    base = gate_base()
+    path = "/api/v4/futures/usdt/user_trades"
+
+    params = {
+        "contract": contract,
+        "limit": "100",
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+
+    method = "GET"
+    body = ""
+    body_hash = hashlib.sha512(body.encode("utf-8")).hexdigest()
+    ts = str(int(time.time()))
+
+    msg = "\n".join([method, path, query, body_hash, ts])
+    sign = _hmac_sha512_hex(sec, msg)
+
+    headers = {
+        "KEY": key,
+        "Timestamp": ts,
+        "SIGN": sign,
+    }
+
+    url = f"{base}{path}?{query}"
+    try:
+        r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except Exception:
+        logging.exception("gate_exec_list: request failed")
+        return []
+
+    try:
+        data = r.json()
+    except Exception:
+        logging.exception("gate_exec_list: bad JSON, status=%s body=%s", r.status_code, r.text[:500])
+        return []
+
+    # user_trades возвращает список, но на всякий случай нормализуем
+    if isinstance(data, dict):
+        # Ошибка от API
+        if "label" in data or "message" in data:
+            logging.warning("gate_exec_list: error %s", data)
+            return []
+        trades = data.get("trades") or []
+    else:
+        trades = data
+
+    res: list[dict] = []
+    for t in trades:
+        try:
+            ts_ms = int(float(t.get("create_time_ms", 0)))
+        except Exception:
+            ts_ms = 0
+
+        if start_ms and ts_ms < start_ms:
+            continue
+        if order_id and str(t.get("order_id")) != str(order_id):
+            continue
+        if client_order_id and t.get("text") != str(client_order_id):
+            continue
+        res.append(t)
+
+    return res
 
 # =======================
 # Balances (post-trade)
@@ -4281,42 +4456,112 @@ def get_post_close_balances(exchanges: list[str]) -> dict[str, dict]:  # NEW
             out["GATE"] = gate_usdt_futures_balance()
     return out
 
-def summarize_fills(exchange: str, symbol: str, open_side: str, open_oid: str|None, open_cloid: str|None, close_side: str, close_oid: str|None, close_cloid: str|None, start_ms: int) -> dict:
+def summarize_fills(exchange: str, symbol: str,
+                    open_side: str, open_oid: str | None, open_cloid: str | None,
+                    close_side: str, close_oid: str | None, close_cloid: str | None,
+                    start_ms: int) -> dict:
     """
     Возвращает:
       avg_open_px, avg_close_px, fees_open_usd, fees_close_usd
-    Берём трейды от момента открытия позиции (start_ms) и фильтруем по orderId/ClientId, где возможно.
+    Работает для: BINANCE, BYBIT, OKX, GATE.
     """
+
     ex = exchange.lower()
     avg_open = avg_close = 0.0
     fees_open = fees_close = 0.0
+
+    # ------------------------------
+    # BINANCE
+    # ------------------------------
     if ex == "binance":
         trades = binance_user_trades(symbol, start_ms)
-        # Binance futures отдает поля: orderId, buyer, maker, realizedPnl, commission, qty, price, side=BUY/SELL, clientOrderId (может быть пустой)
-        open_tr = [t for t in trades if (str(t.get("orderId"))==str(open_oid) or (open_cloid and t.get("clientOrderId")==open_cloid))]
-        close_tr= [t for t in trades if (str(t.get("orderId"))==str(close_oid) or (close_cloid and t.get("clientOrderId")==close_cloid))]
-        def _avg(trs): 
-            pxs=[float(t["price"]) for t in trs if "price" in t]; qs=[float(t["qty"]) for t in trs if "qty" in t]
-            return _wavg(pxs, qs)
+
+        open_tr  = [t for t in trades if (
+            str(t.get("orderId")) == str(open_oid)
+            or (open_cloid and t.get("clientOrderId") == open_cloid)
+        )]
+
+        close_tr = [t for t in trades if (
+            str(t.get("orderId")) == str(close_oid)
+            or (close_cloid and t.get("clientOrderId") == close_cloid)
+        )]
+
+        def _avg(trs):
+            px = [float(t["price"]) for t in trs]
+            q  = [float(t["qty"])   for t in trs]
+            return _wavg(px, q)
+
         avg_open  = _avg(open_tr)  or 0.0
         avg_close = _avg(close_tr) or 0.0
-        fees_open = _sum([float(t.get("commission",0)) for t in open_tr])
-        fees_close= _sum([float(t.get("commission",0)) for t in close_tr])
+
+        fees_open  = _sum([float(t.get("commission", 0)) for t in open_tr])
+        fees_close = _sum([float(t.get("commission", 0)) for t in close_tr])
+
+    # ------------------------------
+    # BYBIT
+    # ------------------------------
     elif ex == "bybit":
-        # Bybit executions: execPrice, execQty, execFee, side, orderId, orderLinkId
-        open_tr = bybit_exec_list(symbol, order_id=open_oid, order_link_id=open_cloid, start_ms=start_ms)
-        close_tr= bybit_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+        open_tr  = bybit_exec_list(symbol, order_id=open_oid,  order_link_id=open_cloid,  start_ms=start_ms)
+        close_tr = bybit_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+
         def _avg_bybit(trs):
-            pxs=[float(t.get("execPrice",0)) for t in trs]; qs=[float(t.get("execQty",0)) for t in trs]
-            return _wavg(pxs, qs)
+            px = [float(t.get("execPrice", 0)) for t in trs]
+            q  = [float(t.get("execQty", 0))   for t in trs]
+            return _wavg(px, q)
+
         avg_open  = _avg_bybit(open_tr)  or 0.0
         avg_close = _avg_bybit(close_tr) or 0.0
-        fees_open = _sum([float(t.get("execFee",0)) for t in open_tr])
-        fees_close= _sum([float(t.get("execFee",0)) for t in close_tr])
-    else:
-        # Для OKX/Gate/MEXC можно расширить аналогично при необходимости
-        pass
-    return {"avg_open_px":avg_open, "avg_close_px":avg_close, "fees_open_usd":fees_open, "fees_close_usd":fees_close}
+
+        fees_open  = _sum([float(t.get("execFee", 0)) for t in open_tr])
+        fees_close = _sum([float(t.get("execFee", 0)) for t in close_tr])
+
+    # ------------------------------
+    # OKX
+    # ------------------------------
+    elif ex == "okx":
+        # OKX returns: fillPx, fillSz, fillFee, side, ordId, clOrdId
+        open_tr  = okx_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+        close_tr = okx_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+
+        def _avg_okx(trs):
+            px = [float(t.get("fillPx", 0)) for t in trs]
+            q  = [abs(float(t.get("fillSz", 0))) for t in trs]
+            return _wavg(px, q)
+
+        avg_open  = _avg_okx(open_tr)  or 0.0
+        avg_close = _avg_okx(close_tr) or 0.0
+
+        fees_open  = _sum([abs(float(t.get("fillFee", 0))) for t in open_tr])
+        fees_close = _sum([abs(float(t.get("fillFee", 0))) for t in close_tr])
+
+    # ------------------------------
+    # GATE
+    # ------------------------------
+    elif ex == "gate":
+        # Gate futures trades: size, price, fee, order_id, text=clientOrderId
+        open_tr  = gate_exec_list(symbol, order_id=open_oid,  order_link_id=open_cloid,  start_ms=start_ms)
+        close_tr = gate_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+
+        def _avg_gate(trs):
+            px = [float(t.get("price", 0)) for t in trs]
+            q  = [abs(float(t.get("size", 0))) for t in trs]
+            return _wavg(px, q)
+
+        avg_open  = _avg_gate(open_tr)  or 0.0
+        avg_close = _avg_gate(close_tr) or 0.0
+
+        fees_open  = _sum([abs(float(t.get("fee", 0))) for t in open_tr])
+        fees_close = _sum([abs(float(t.get("fee", 0))) for t in close_tr])
+
+    # ------------------------------
+    # RESULT
+    # ------------------------------
+    return {
+        "avg_open_px": avg_open,
+        "avg_close_px": avg_close,
+        "fees_open_usd": fees_open,
+        "fees_close_usd": fees_close
+    }
 
 # ----------------- Positions -----------------
 POS_COLS = ["id","attempt_id","symbol","long_ex","short_ex","opened_ms","last_ms","held_h",
