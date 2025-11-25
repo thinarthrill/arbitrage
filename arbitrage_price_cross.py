@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.5</b>")
+    lines.append(f"\n<b> ver: 2.6</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2022,9 +2022,22 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             best["_open_skip_reasons"] = skip_reasons
         except Exception:
             pass
+
         if getenv_bool("DEBUG_INSTANT_OPEN", False) and not best.get("_open_skip_logged"):
             logging.info("[OPEN_SKIP] %s %s", sym, msg)
             best["_open_skip_logged"] = True
+            # отдельная карточка в TG с причинами, почему open не состоялся
+            try:
+                price_source = getenv_str("PRICE_SOURCE", "mid")
+                card = format_signal_card(best, per_leg_notional_usd, price_source)
+                reasons_text = "\n".join(f"• {r}" for r in skip_reasons)
+                maybe_send_telegram(
+                    "⚪ <b>OPEN SKIPPED</b>\n" + card + f"\nПричины:\n{reasons_text}"
+                )
+            except Exception:
+                # не ломаем основной поток из-за ошибок в отправке дебажной карточки
+                logging.exception("Failed to send OPEN SKIPPED card for %s", sym)
+
         return False
 
     if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
