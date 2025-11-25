@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.6</b>")
+    lines.append(f"\n<b> ver: 2.7</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2231,14 +2231,28 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         symbol=sym, cheap_ex=cheap_ex, rich_ex=rich_ex,
         qty=qty, price_low=px_low, price_high=px_high, paper=paper
     )
+
     if not ok:
-        # добавляем причину отказа атомарного открытия
-        try:
-            reason = meta.get("reason") if isinstance(meta, dict) else meta
-            skip_reasons.append(f"atomic_open failed: {reason}")
-            best["_open_skip_reasons"] = skip_reasons
-        except Exception:
-            pass
+            # аккуратно достаём текст причины
+            reason = None
+            try:
+                if isinstance(meta, dict):
+                    reason = meta.get("error") or meta.get("reason") or str(meta)
+                else:
+                    reason = str(meta)
+            except Exception:
+                reason = str(meta)
+
+            if reason:
+                skip_reasons.append(f"atomic_open failed: {reason}")
+            try:
+                best["_open_skip_reasons"] = skip_reasons
+            except Exception:
+                pass
+
+            # отдадим через _reject, чтобы ушла OPEN SKIPPED-карточка
+            return _reject(f"atomic_open failed: {reason}")
+
     now_ms = utc_ms_now()
 
     if ok:
@@ -2886,7 +2900,7 @@ def scan_spreads_once(
             _ = try_instant_open(best, per_leg_notional_usd, taker_fee, _paper, _pos_path)
         except Exception as e:
             # ошибку открытия try_instant_open сам покажет в TG при DEBUG_INSTANT_OPEN
-            pass
+            logging.exception("[OPEN] instant open failed: %s", e)
 
     return best, quotes_df
 
