@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.7</b>")
+    lines.append(f"\n<b> ver: 2.8</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3884,7 +3884,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         # --- NEW: фиксируем реальную цену открытия SHORT ---
         open_short_px = float(ob.get("avg_price") or 0.0)
         if open_short_px <= 0:
-            q = get_bbo(rich_ex, symbol, "book") or {}
+            q = get_bbo(symbol, rich_ex) or {}
             b = q.get("bid")
             a = q.get("ask")
             open_short_px = float(b or a or 0.0)
