@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.1</b>")
+    lines.append(f"\n<b> ver: 2.2</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2727,19 +2727,70 @@ def scan_spreads_once(
     else:
         return None, quotes_df
 
-    # ---- NEW: определяем has_open точно так же, как в positions_once ----
+    # ---- has_open: проверяем открыто ли по ЭТОМУ символу ----
+    has_open = False
     try:
-        df_pos = load_positions(pos_path)
-        if df_pos is None or df_pos.empty:
-            has_open = False
-        else:
-            has_open = any(df_pos.get("status", "") == "open")
+        df_pos = load_positions(pos_path_for_instant or pos_path)
+        if df_pos is not None and not df_pos.empty:
+            sym_u = str(best.get("symbol", "")).upper()
+            if sym_u:
+                df_pos["symbol"] = df_pos["symbol"].astype(str).str.upper()
+                has_open = any((df_pos["symbol"] == sym_u) & (df_pos["status"] == "open"))
     except Exception:
         has_open = False
 
-    # 2) и только ПОСЛЕ этого шлём карточку уже с confirm/skip
+    # ---- entry filters / cond_open ----
+    entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+    open_in_scanner = getenv_bool("OPEN_IN_SCANNER", False)
+    Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+    std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+
+    spread_bps = float(best.get("spread_bps") or 0.0)
+    net_usd_adj = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
+    z = to_float(best.get("z"))
+    std = to_float(best.get("std"))
+
+    spread_ok = spread_bps >= float(spread_bps_min)
+    eco_ok = net_usd_adj > 0
+    z_ok = (z is not None) and (z >= Z_IN_LOC)
+    std_ok = (std is not None) and (std >= std_min_for_open)
+
+    cond_open = (
+        open_in_scanner
+        and instant_open
+        and (not has_open)
+        and spread_ok
+        and eco_ok
+        and (entry_mode_loc != "zscore" or (z_ok and std_ok))
+        and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
+    )
+
+    # ---- Telegram card with debug ----
     if best is not None:
-        maybe_send_telegram(format_signal_card(best, per_leg_notional_usd, price_source))
+        card = format_signal_card(best, per_leg_notional_usd, price_source)
+        card += (
+            f"\n🧪 *INSTANT-OPEN DEBUG*\n"
+            f"• cond_open = `{cond_open}`\n"
+            f"• has_open = `{has_open}`\n"
+            f"• ENTRY_MODE = `{entry_mode_loc}`\n"
+           f"• Z_IN = `{Z_IN_LOC}`\n"
+            f"• std_min = `{std_min_for_open}`\n"
+            f"• spread_ok = `{spread_ok}` ({spread_bps:.1f} ≥ {float(spread_bps_min):.1f})\n"
+            f"• eco_ok = `{eco_ok}` (net_adj={net_usd_adj:.4f})\n"
+            f"• z_ok = `{z_ok}` (z={z})\n"
+            f"• std_ok = `{std_ok}` (std={std})\n"
+        )
+        maybe_send_telegram(card)
+
+    # ---- instant open ----
+    if cond_open:
+        _pos_path = pos_path_for_instant or bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
+        _paper    = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
+        try:
+            _ = try_instant_open(best, per_leg_notional_usd, taker_fee, _paper, _pos_path)
+        except Exception as e:
+            # ошибку открытия try_instant_open сам покажет в TG при DEBUG_INSTANT_OPEN
+            pass
 
     return best, quotes_df
 
