@@ -357,10 +357,8 @@ def _private_base(exchange: str) -> str:
         #   API domain for demo trading: https://api-testnet.gateapi.io/api/v4
         use_testnet = _is_true("GATE_TESTNET", False) or _is_true("GATE_PAPER", False)
         if use_testnet:
-            #return "https://api-testnet.gateapi.io"
-            return "https://fx-api-testnet.gateio.ws"
-        #return "https://api.gateio.ws"
-        return "https://fx-api.gateio.ws"
+            return "https://api-testnet.gateapi.io"
+        return "https://api.gateio.ws"
     if ex == "okx":
         # у OKX отдельного фьюч-тестнета для USDT-SWAP нет, «демо» режим делается заголовком x-simulated-trading
         # поэтому всегда используем основной хост
@@ -964,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.12</b>")
+    lines.append(f"\n<b> ver: 2.13</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4899,17 +4897,64 @@ def positions_once(
                     except Exception:
                         pass
 
+                    # --- NEW: PnL из meta в CSV + для карточки ---
+                    pnl = 0.0
                     try:
                         pnl = float(meta.get("pnl_usd", 0.0) or 0.0)
                         df_pos.at[i, "pnl_usd"] = pnl
                     except Exception:
                         pass
 
-                    maybe_send_telegram(
-                        "✅ <b>CLOSED</b>\n"
-                        f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
-                        f"exit_bps_now={exit_bps_now:.2f} bps"
-                    )
+                    # --- NEW: попытка подтянуть балансы и total equity ---
+                    balances_text = ""
+                    total_eq = None
+
+                    try:
+                        # ожидаем, что где-то в проекте есть модуль exch_balances
+                        # с функцией get_all_balances_usd() → {"binance": 1234.56, "bybit": 789.01, ...}
+                        from exch_balances import get_all_balances_usd  # type: ignore
+
+                        try:
+                            balances = get_all_balances_usd()
+                        except Exception as e_bal:
+                            logging.debug("positions_once: get_all_balances_usd failed: %s", e_bal)
+                            balances = {}
+
+                        if isinstance(balances, dict) and balances:
+                            lines = []
+                            total_val = 0.0
+                            for ex_name, val in balances.items():
+                                try:
+                                    v = float(val)
+                                except Exception:
+                                    continue
+                                total_val += v
+                                lines.append(f"   • {str(ex_name).upper()}: ${v:,.2f}")
+                            if lines:
+                                balances_text = "\n".join(lines)
+                                total_eq = total_val
+                    except Exception as e_imp:
+                        # если модуля нет — просто логируем и продолжаем без балансов
+                        logging.debug("positions_once: balances module not available: %s", e_imp)
+
+                    # --- NEW: формирование расширенной TG-карточки ---
+                    msg_lines = [
+                        "✅ <b>CLOSED</b>",
+                        f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}",
+                        f"exit_bps_now={exit_bps_now:.2f} bps",
+                        f"💰 PnL: {pnl:+.2f} USD",
+                    ]
+
+                    if balances_text:
+                        msg_lines.append("")  # пустая строка
+                        msg_lines.append("📊 Balances after close:")
+                        msg_lines.append(balances_text)
+
+                    if total_eq is not None:
+                        msg_lines.append(f"🏦 Total equity: ${total_eq:,.2f}")
+
+                    maybe_send_telegram("\n".join(msg_lines))
+
                 else:
                     err = str(meta.get("error") or "unknown")
                     logging.warning("Close failed: %s", err)
