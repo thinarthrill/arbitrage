@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.15</b>")
+    lines.append(f"\n<b> ver: 2.16</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3416,6 +3416,14 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
 
         ask_px = float(to_float(row_low.get("ask")))
         bid_px = float(to_float(row_high.get("bid")))
+
+        # --- Фильтр по минимальной цене монеты (из .env MIN_PRICE) ---
+        # Отсекаем ультрадешёвые тикеры, чтобы не получать десятки миллионов контрактов.
+        min_price = float(getenv_float("MIN_PRICE", 0.0))
+        if min_price > 0.0 and (ask_px < min_price or bid_px < min_price):
+           # цена монеты ниже допустимого порога — пару вообще не строим
+            return None
+
         ask_sz = float(to_float(row_low.get("ask_qty") or row_low.get("askSize") or 0.0))
         bid_sz = float(to_float(row_high.get("bid_qty") or row_high.get("bidSize") or 0.0))
 
