@@ -887,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.20</b>")
+    lines.append(f"\n<b> ver: 2.21</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4950,7 +4950,6 @@ def positions_once(
                             e_imp,
                         )
 
-                    # --- NEW: формирование расширенной TG-карточки ---
                     msg_lines = [
                         "✅ <b>CLOSED</b>",
                         f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}",
@@ -4966,16 +4965,41 @@ def positions_once(
                     if total_eq is not None:
                         msg_lines.append(f"🏦 Total equity: ${total_eq:,.2f}")
 
+                    # важно: отправляем ОДНУ строку, а не список
                     maybe_send_telegram("\n".join(msg_lines))
 
                 else:
-                    err = str(meta.get("error") or "unknown")
-                    logging.warning("Close failed: %s", err)
-                    maybe_send_telegram(
-                        "⚠️ <b>CLOSE FAILED</b>\n"
-                        f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
-                        f"Причина: <code>{err}</code>"
+                    # Отладка: закрытие не удалось — лог + карточка в TG
+                    err_msg = ""
+                    try:
+                        if isinstance(meta, dict) and "error" in meta:
+                            err_msg = str(meta.get("error"))
+                        else:
+                            err_msg = str(meta)
+                    except Exception:
+                        err_msg = "unknown"
+
+                    logging.error(
+                        "[CLOSE] exit close failed for %s %s↔%s qty=%s: %s",
+                        sym,
+                        ex_l,
+                        ex_h,
+                        qty,
+                        err_msg,
                     )
+
+                    try:
+                        maybe_send_telegram(
+                            "❌ <b>CLOSE ERROR</b>\n"
+                            f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                            f"qty={qty:.4f}\n"
+                            f"error={err_msg}"
+                        )
+                    except Exception as e_tg:
+                        logging.debug(
+                            "positions_once: telegram close-error notify failed: %s",
+                            e_tg,
+                        )
 
     # ------------------------------
     # 5) ротация (optional)
@@ -4997,7 +5021,11 @@ def positions_once(
                     qty = float(open_row.get("qty", 0.0) or 0.0)
                     if qty > 0:
                         ok, meta = atomic_cross_close(
-                            symbol=sym, cheap_ex=ex_l, rich_ex=ex_h, qty=qty, paper=paper
+                            symbol=sym,
+                            cheap_ex=ex_l,
+                            rich_ex=ex_h,
+                            qty=qty,
+                            paper=paper,
                         )
                         if ok:
                             idx = open_rows.index[0]
@@ -5008,6 +5036,41 @@ def positions_once(
                                 f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
                                 f"open_net={open_net:.2f} → best_net={best_net:.2f}"
                             )
+                        else:
+                            # Отладка: не смогли закрыть перед ротацией
+                            err_msg = ""
+                            try:
+                                if isinstance(meta, dict) and "error" in meta:
+                                    err_msg = str(meta.get("error"))
+                                else:
+                                    err_msg = str(meta)
+                            except Exception:
+                                err_msg = "unknown"
+
+                            logging.error(
+                                "[ROTATE] close before rotate failed for %s %s↔%s qty=%s: %s",
+                                sym,
+                                ex_l,
+                                ex_h,
+                                qty,
+                                err_msg,
+                            )
+
+                            try:
+                                maybe_send_telegram(
+                                    "❌ <b>ROTATE CLOSE ERROR</b>\n"
+                                    f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                                    f"qty={qty:.4f}\n"
+                                    f"error={err_msg}"
+                                )
+                            except Exception as e_tg:
+                                logging.debug(
+                                    "positions_once: telegram rotate-close notify failed: %s",
+                                    e_tg,
+                                )
+
+                            # Позицию намеренно оставляем статусом open,
+                            # чтобы в positions_cross.csv было видно, что она "зависла".
                             # открыть новый best тем же механизмом, что в блоке 6 (atomic_cross_open)
                             entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
