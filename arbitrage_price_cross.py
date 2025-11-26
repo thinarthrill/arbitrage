@@ -551,81 +551,6 @@ def _fmt_price_str(p: float) -> str:
     s = ("%.10f" % float(p)).rstrip("0").rstrip(".")
     return s if s else "0"
 
-def _read_lock() -> dict:
-    try:
-        p = _OPEN_LOCK_PATH
-        if not p:
-            return {}
-        if is_gs(p):
-            client = gcs_client()
-            bname = p[5:].split("/",1)[0]; oname = p[5+len(bname)+1:]
-            blob = client.lookup_bucket(bname).blob(oname)
-            if not blob.exists():
-                return {}
-            data = blob.download_as_bytes()
-            return json.loads(data.decode("utf-8"))
-        else:
-            if not os.path.exists(p):
-                return {}
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        return {}
-
-def _write_lock(obj: dict):
-    try:
-        p = _OPEN_LOCK_PATH
-        if not p:
-            return
-        data = json.dumps(obj, ensure_ascii=False)
-        if is_gs(p):
-            client = gcs_client()
-            bname = p[5:].split("/",1)[0]; oname = p[5+len(bname)+1:]
-            client.lookup_bucket(bname).blob(oname).upload_from_string(data, content_type="application/json")
-        else:
-            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(data)
-    except Exception as e:
-        logging.warning("open-lock write error: %s", e)
-
-def _clear_lock():
-    try:
-        p = _OPEN_LOCK_PATH
-        if not p:
-           return
-        if is_gs(p):
-            client = gcs_client()
-            bname = p[5:].split("/",1)[0]; oname = p[5+len(bname)+1:]
-            client.lookup_bucket(bname).blob(oname).delete(if_generation_match=None)
-        else:
-            if os.path.exists(p):
-                os.remove(p)
-    except Exception:
-        pass
-
-def open_lock_check_or_set(symbol: str) -> bool:
-    """
-    True  -> можно открывать (и лок установлен)
-    False -> нельзя (уже кто-то открывает/лок свежий)
-   """
-    now = time.time()
-    lk = _read_lock()
-    if lk:
-        sym = lk.get("symbol")
-        ts  = float(lk.get("ts", 0.0))
-        if (now - ts) < _OPEN_LOCK_TTL_SEC:
-            # свежий лок — запрещаем другой тикер
-            if sym and sym != symbol:
-                logging.debug("Pair-lock: opening %s is in progress, skip %s", sym, symbol)
-                return False
-            # тот же тикер — обновим таймштамп
-    _write_lock({"symbol": symbol, "ts": now})
-    return True
-
-def open_lock_clear():
-    _clear_lock()
-
 def cap_qty_by_capital(price: float, qty_step: float, capital_usd: float, leverage: float) -> float:
     """
     Жёсткий лимит: нотионал одной ноги ≤ CAPITAL*LEVERAGE/2
@@ -962,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.18</b>")
+    lines.append(f"\n<b> ver: 2.19</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2222,9 +2147,21 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                 f"cooldown after close: {COOLDOWN_AFTER_CLOSE_SEC}s not passed"
             )
 
-    # --- 5) Pair-lock ---
-    if not open_lock_check_or_set(sym):
-        return _reject("open lock active (another open recently)")
+    # --- 5) Проверка, что по этой паре нет уже открытой позиции в positions_cross.csv ---
+    try:
+        df_pos = load_positions(pos_path)
+        if not df_pos.empty and all(c in df_pos.columns for c in ("symbol", "long_ex", "short_ex", "status")):
+            mask = (
+                df_pos["symbol"].astype(str).str.upper().eq(sym)
+                & df_pos["long_ex"].astype(str).str.lower().eq(cheap_ex)
+                & df_pos["short_ex"].astype(str).str.lower().eq(rich_ex)
+                & df_pos["status"].astype(str).isin(["open", "closing"])
+            )
+            if mask.any():
+                return _reject("position already open in positions_cross.csv")
+    except Exception as e:
+        # не блокируем open из-за проблем с CSV, просто логируем
+        logging.debug("instant_open: positions check failed for %s: %s", sym, e)
 
     # --- 6) Открываем атомарно ---
     ok, attempt_id, meta = atomic_cross_open(
@@ -2319,7 +2256,6 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             except Exception:
                 pass
 
-        open_lock_clear()
         return False
 
 # ----------------- Scanners -----------------
