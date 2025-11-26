@@ -4954,6 +4954,7 @@ def positions_once(
                                 except Exception:
                                     continue
                                 total_val += v
+                                # корректный формат: разделитель тысяч + 2 знака после запятой
                                 lines.append(f"   • {str(ex_name).upper()}: ${v:,.2f}")
                             if lines:
                                 balances_text = "\n".join(lines)
