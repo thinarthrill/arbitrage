@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.16</b>")
+    lines.append(f"\n<b> ver: 2.17</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3466,6 +3466,13 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
     priciest = max(usable, key=lambda x:x["px"])
 
     px_low, px_high = float(cheapest["px"]), float(priciest["px"])
+
+    # --- Тот же фильтр MIN_PRICE для не-book режимов (mid/last/mark/bid/ask) ---
+    min_price = float(getenv_float("MIN_PRICE", 0.0))
+    if min_price > 0.0 and (px_low < min_price or px_high < min_price):
+        # слишком дешёвая монета — сразу выходим, она нам не нужна
+        return None
+
     spread = px_high - px_low
     spread_pct = (spread/px_low)*100.0 if px_low>0 else 0.0
     spread_bps = spread_pct*100.0
