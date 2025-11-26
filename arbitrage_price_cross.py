@@ -962,7 +962,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.17</b>")
+    lines.append(f"\n<b> ver: 2.18</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4925,7 +4925,12 @@ def positions_once(
                     # --- NEW: PnL из meta в CSV + для карточки ---
                     pnl = 0.0
                     try:
-                        pnl = float(meta.get("pnl_usd", 0.0) or 0.0)
+                        # базовый вариант – ожидаем pnl_usd
+                        if "pnl_usd" in meta:
+                            pnl = float(meta.get("pnl_usd") or 0.0)
+                        # fallback – вдруг atomic_cross_close вернёт просто "pnl"
+                        elif "pnl" in meta:
+                            pnl = float(meta.get("pnl") or 0.0)
                         df_pos.at[i, "pnl_usd"] = pnl
                     except Exception:
                         pass
@@ -4935,33 +4940,79 @@ def positions_once(
                     total_eq = None
 
                     try:
-                        # ожидаем, что где-то в проекте есть модуль exch_balances
-                        # с функцией get_all_balances_usd() → {"binance": 1234.56, "bybit": 789.01, ...}
-                        from exch_balances import get_all_balances_usd  # type: ignore
+                        per_ex: dict[str, float] = {}
 
+                        # Binance Futures USDT
                         try:
-                            balances = get_all_balances_usd()
-                        except Exception as e_bal:
-                            logging.debug("positions_once: get_all_balances_usd failed: %s", e_bal)
-                            balances = {}
+                            b = binance_usdt_futures_balance()
+                            if b:
+                                per_ex["BINANCE"] = float(
+                                    b.get("equity") or b.get("wallet") or 0.0
+                                )
+                        except Exception as e_b:
+                            logging.debug(
+                                "positions_once: binance_usdt_futures_balance failed: %s",
+                                e_b,
+                            )
 
-                        if isinstance(balances, dict) and balances:
-                            lines = []
+                        # Bybit Unified USDT
+                        try:
+                            bb = bybit_unified_usdt_balance()
+                            if bb:
+                                per_ex["BYBIT"] = float(
+                                    bb.get("equity") or bb.get("wallet") or 0.0
+                                )
+                        except Exception as e_bb:
+                            logging.debug(
+                                "positions_once: bybit_unified_usdt_balance failed: %s",
+                                e_bb,
+                            )
+
+                        # OKX unified USDT
+                        try:
+                            ok = okx_usdt_balance()
+                            if ok:
+                                per_ex["OKX"] = float(
+                                    ok.get("equity") or ok.get("wallet") or 0.0
+                                )
+                        except Exception as e_ok:
+                            logging.debug(
+                                "positions_once: okx_usdt_balance failed: %s",
+                                e_ok,
+                            )
+
+                        # Gate futures USDT
+                        try:
+                            gt = gate_usdt_futures_balance()
+                            if gt:
+                                per_ex["GATE"] = float(
+                                    gt.get("equity") or gt.get("wallet") or 0.0
+                                )
+                        except Exception as e_gt:
+                            logging.debug(
+                                "positions_once: gate_usdt_futures_balance failed: %s",
+                                e_gt,
+                            )
+
+                        if per_ex:
+                            lines: list[str] = []
                             total_val = 0.0
-                            for ex_name, val in balances.items():
+                            for ex_name, val in per_ex.items():
                                 try:
                                     v = float(val)
                                 except Exception:
                                     continue
                                 total_val += v
-                                # корректный формат: разделитель тысяч + 2 знака после запятой
-                                lines.append(f"   • {str(ex_name).upper()}: ${v:,.2f}")
+                                # разделитель тысяч + 2 знака после запятой
+                                lines.append(f"   • {ex_name}: ${v:,.2f}")
                             if lines:
                                 balances_text = "\n".join(lines)
                                 total_eq = total_val
                     except Exception as e_imp:
-                        # если модуля нет — просто логируем и продолжаем без балансов
-                        logging.debug("positions_once: balances module not available: %s", e_imp)
+                        logging.debug(
+                            "positions_once: balances fetch failed: %s",
+                            e_imp,
+                        )
 
                     # --- NEW: формирование расширенной TG-карточки ---
                     msg_lines = [
