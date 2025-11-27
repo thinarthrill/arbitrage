@@ -887,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.22</b>")
+    lines.append(f"\n<b> ver: 2.24</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4481,7 +4481,8 @@ def summarize_fills(exchange: str, symbol: str,
     # ------------------------------
     elif ex == "okx":
         # OKX returns: fillPx, fillSz, fillFee, side, ordId, clOrdId
-        open_tr  = okx_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
+        # ВАЖНО: для открытия используем open_oid/open_cloid, для закрытия — close_oid/close_cloid
+        open_tr  = okx_exec_list(symbol, order_id=open_oid,  order_link_id=open_cloid,  start_ms=start_ms)
         close_tr = okx_exec_list(symbol, order_id=close_oid, order_link_id=close_cloid, start_ms=start_ms)
 
         def _avg_okx(trs):
@@ -4923,7 +4924,8 @@ def positions_once(
 
                 if ok:
                     df_pos.at[i, "status"] = "closed"
-                    df_pos.at[i, "reason"] = "exit"
+                    # пишем в корректное поле схемы — close_reason
+                    df_pos.at[i, "close_reason"] = "exit"
                     try:
                         df_pos.at[i, "closed_at"] = now_utc_str()
                     except Exception:
@@ -4938,7 +4940,8 @@ def positions_once(
                         # fallback – вдруг atomic_cross_close вернёт просто "pnl"
                         elif "pnl" in meta:
                             pnl = float(meta.get("pnl") or 0.0)
-                        df_pos.at[i, "pnl_usd"] = pnl
+                        # сохраняем в колонку схемы POS_COLS
+                        df_pos.at[i, "realized_pnl_usd"] = pnl
                     except Exception:
                         pass
 
