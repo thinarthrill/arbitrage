@@ -887,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.24</b>")
+    lines.append(f"\n<b> ver: 2.25</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2245,16 +2245,29 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         return True
 
     else:
-        err = str(meta.get("error") or "unknown")
+        err = str((meta or {}).get("error") or "unknown error")
+
+        # если откат первой ноги не удался — предупреждаем явно
+        rb_warn = ""
+        if isinstance(meta, dict) and meta.get("rollback_failed"):
+            rb_ex = str(meta.get("rollback_ex") or cheap_ex).upper()
+            rb_sym = sym
+            rb_warn = f"\n⚠️ ROLLBACK WARNING: check {rb_sym} on {rb_ex}"
+
         logging.warning("Instant open failed for %s: %s", sym, err)
 
         if getenv_bool("DEBUG_INSTANT_OPEN", False):
-            try:
-                price_source = getenv_str("PRICE_SOURCE", "mid")
-                card = format_signal_card(best, per_leg_notional_usd, price_source)
-                maybe_send_telegram("⚠️ <b>OPEN FAILED</b>\n" + card + f"\nПричина: <code>{err}</code>")
-            except Exception:
-                pass
+            card = format_signal_card(best, per_leg_notional_usd, getenv_str("PRICE_SOURCE", "mid"))
+            card = (
+                "⚠️ <b>OPEN FAILED</b>\n"
+                + card
+                + f"\nПричина: <code>{err}</code>"
+                + rb_warn
+            )
+            maybe_send_telegram(card)
+        # даже если DEBUG_INSTANT_OPEN выключен — хотя бы короткое предупреждение
+        elif rb_warn:
+            maybe_send_telegram(rb_warn.strip())
 
         return False
 
@@ -3839,12 +3852,29 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         )
         if ob.get("status") != "FILLED":
             # откат первой ноги
+            rollback_failed = False
+            rollback_err: Optional[Exception] = None
             try:
-                _ = _place_perp_market_order(cheap_ex, symbol, "SELL", qty_final,
-                                            paper=paper, reduce_only=True)
+                _ = _place_perp_market_order(
+                    cheap_ex, symbol, "SELL", qty_final,
+                    paper=paper, reduce_only=True
+                )
             except Exception as e2:
+                rollback_failed = True
+                rollback_err = e2
                 logging.error("Rollback failed: %s", e2)
-            return False, attempt_id, {"error": f"legB not filled: {ob}"}
+
+            meta_err: dict = {"error": f"legB not filled: {ob}"}
+            if rollback_failed:
+                meta_err.update({
+                    "rollback_failed": True,
+                    "rollback_ex": cheap_ex,
+                    "rollback_symbol": symbol,
+                    "rollback_qty": float(qty_final),
+                    "rollback_error": str(rollback_err),
+                })
+            return False, attempt_id, meta_err
+        
         if ob.get("status") != "FILLED":
             raise RuntimeError(f"legB not filled: {ob}")
         # --- NEW: фиксируем реальную цену открытия SHORT ---
@@ -3862,11 +3892,28 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
 
     except Exception as e:
         # откат первой ноги (продаём то, что купили)
+        rollback_failed = False
+        rollback_err: Optional[Exception] = None
         try:
-            _ = _place_perp_market_order(cheap_ex, symbol, "SELL", qty_final, paper=paper, reduce_only=True)
+            _ = _place_perp_market_order(
+                cheap_ex, symbol, "SELL", qty_final,
+                paper=paper, reduce_only=True
+            )
         except Exception as e2:
+            rollback_failed = True
+            rollback_err = e2
             logging.error("Rollback failed: %s", e2)
-        return False, attempt_id, {"error": f"legB error: {e}"}
+
+        meta_err: dict = {"error": f"legB error: {e}"}
+        if rollback_failed:
+            meta_err.update({
+                "rollback_failed": True,
+                "rollback_ex": cheap_ex,
+                "rollback_symbol": symbol,
+                "rollback_qty": float(qty_final),
+                "rollback_error": str(rollback_err),
+            })
+        return False, attempt_id, meta_err
 
         # --- Контроль качества fill'а: проверяем, что реальный спред на входе достаточный ---
     long_px  = float(oa.get("avg_price") or 0.0)
