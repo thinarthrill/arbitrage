@@ -4783,6 +4783,23 @@ def positions_once(
             if not sym or not ex_l or not ex_h or qty <= 0:
                 continue
 
+            # --- возраст сделки через MAX_HOLD_SEC ---
+            max_hold_sec = float(getenv_float("MAX_HOLD_SEC", 0.0))
+            max_hold_reached = False
+            age_sec = None
+
+            try:
+                opened_ms = float(row.get("opened_ms") or 0.0)
+                now_ms    = utc_ms_now()
+                if opened_ms > 0:
+                    age_sec = max(0.0, (now_ms - opened_ms) / 1000.0)
+                    # обновляем last_ms в CSV
+                    df_pos.at[i, "last_ms"] = now_ms
+                    if max_hold_sec > 0 and age_sec >= max_hold_sec:
+                        max_hold_reached = True
+            except Exception:
+                pass
+
             # ------- локальная функция котировок -------
             def _single_quote(ex: str, symbol: str):
                 ps = getenv_str("PRICE_SOURCE", "mid") or "mid"
@@ -4826,6 +4843,35 @@ def positions_once(
 
             exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
 
+            # --- ожидаемый PnL при закрытии ---
+            pnl_est_ok = True
+            try:
+                size_usd = float(row.get("size_usd") or per_leg_notional_usd)
+                entry_spread_bps = float(row.get("entry_spread_bps") or 0.0)
+
+                # насколько спред схлопнулся
+                delta_bps = entry_spread_bps - exit_bps_now
+                gross_est = (delta_bps / 1e4) * size_usd
+
+                # комиссии
+                taker_fee_env = float(getenv_float("TAKER_FEE", taker_fee))
+                close_fee_est = 2.0 * taker_fee_env * size_usd
+                open_fees_usd = float(row.get("open_fees_usd") or 0.0)
+
+                pnl_est = gross_est - open_fees_usd - close_fee_est
+
+                # если время истекло, но PnL отрицательный — запрещаем закрытие
+                if max_hold_reached and pnl_est < 0.0:
+                    pnl_est_ok = False
+                    logging.info(
+                        "positions_once: MAX_HOLD_SEC reached for %s %s↔%s, "
+                        "but pnl_est=%.4f < 0 → skip close",
+                        sym, ex_l, ex_h, pnl_est
+                    )
+
+            except Exception:
+                pnl_est_ok = True
+
             # z-условия выхода (если включены)
             z_ok = True
             if getenv_str("EXIT_MODE", "zscore").lower() == "zscore":
@@ -4837,7 +4883,7 @@ def positions_once(
                 except Exception:
                     z_ok = True
 
-            if exit_ok and z_ok:
+            if exit_ok and z_ok and pnl_est_ok:
                 # закрываем позицию
                 try:
                     ok, meta = atomic_cross_close(
