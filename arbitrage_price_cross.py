@@ -887,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.21</b>")
+    lines.append(f"\n<b> ver: 2.22</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4835,13 +4835,22 @@ def positions_once(
             if ask_low <= 0 or bid_high <= 0:
                 continue
 
-            # текущий спред выхода: мы закрываем, т.е. long продаём по bid_low, short откупаем по ask_high
-            exit_bps_now = (bid_low - ask_high) / ask_high * 1e4
+            # текущий спред выхода в тех же bps, что и entry_spread_bps:
+            # long продаём по bid_low, short откупаем по ask_high
+            # → спред = (ask_high - bid_low) / bid_low * 1e4  (всегда >= 0 при нормальном арбитраже)
+            exit_bps_now = (ask_high - bid_low) / bid_low * 1e4
 
             EXIT_HYST_BPS = float(getenv_float("EXIT_HYST_BPS", 3.0))
             exit_req = float(exit_bps)
 
-            exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
+            exit_mode_loc = getenv_str("EXIT_MODE", "zscore").lower()
+            if exit_mode_loc == "price":
+                # price-режим: выходим по уровню спреда (спред вернулся к "норме")
+                exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
+            else:
+                # zscore-режим: по самому уровню спреда не выходим,
+                # он используется только для оценки PnL/стоп-лосса
+                exit_ok = True
 
             # --- ожидаемый PnL при закрытии ---
             pnl_est_ok = True
@@ -4849,7 +4858,8 @@ def positions_once(
                 size_usd = float(row.get("size_usd") or per_leg_notional_usd)
                 entry_spread_bps = float(row.get("entry_spread_bps") or 0.0)
 
-                # насколько спред схлопнулся
+                # насколько спред схлопнулся относительно входа
+                # (entry_spread_bps и exit_bps_now теперь в одной системе координат)
                 delta_bps = entry_spread_bps - exit_bps_now
                 gross_est = (delta_bps / 1e4) * size_usd
 
@@ -4860,21 +4870,36 @@ def positions_once(
 
                 pnl_est = gross_est - open_fees_usd - close_fee_est
 
-                # если время истекло, но PnL отрицательный — запрещаем закрытие
-                if max_hold_reached and pnl_est < 0.0:
+                # политика по PnL:
+                #   EXIT_REQUIRE_POSITIVE=1 → до истечения MAX_HOLD_SEC
+                #   не закрываем позицию с нулевым/отрицательным ожидаемым PnL
+                #   STOP_LOSS_BPS < 0 → жёсткий стоп-лосс по спреду против нас
+                require_pos = bool(getenv_bool("EXIT_REQUIRE_POSITIVE", True))
+                stop_loss_bps = float(getenv_float("STOP_LOSS_BPS", 0.0))
+
+                # базово: пока не вышло MAX_HOLD_SEC, требуем pnl_est > 0
+                if require_pos and (not max_hold_reached) and pnl_est <= 0.0:
                     pnl_est_ok = False
+
+                # стоп-лосс в bps от entry_spread_bps (delta_bps сильно отрицательный → спред ушёл против нас)
+                if stop_loss_bps < 0.0 and delta_bps <= stop_loss_bps:
+                    pnl_est_ok = True
+
+                # после MAX_HOLD_SEC даём позиции закрыться даже с минусом — просто логируем
+                if max_hold_reached and pnl_est < 0.0:
                     logging.info(
                         "positions_once: MAX_HOLD_SEC reached for %s %s↔%s, "
-                        "but pnl_est=%.4f < 0 → skip close",
+                        "pnl_est=%.4f < 0 → allow close by time",
                         sym, ex_l, ex_h, pnl_est
                     )
 
             except Exception:
+                # если оценка PnL сломалась — не блокируем выход
                 pnl_est_ok = True
 
             # z-условия выхода (если включены)
             z_ok = True
-            if getenv_str("EXIT_MODE", "zscore").lower() == "zscore":
+            if exit_mode_loc == "zscore":
                 try:
                     z_out = float(getenv_float("Z_OUT", 0.0))
                     # если в stats были z/std/ema — используем их
