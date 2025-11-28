@@ -887,7 +887,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.25</b>")
+    lines.append(f"\n<b> ver: 2.26</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2210,6 +2210,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             "opened_ms": now_ms, "last_ms": now_ms, "held_h": 0.0,
             "size_usd": per_leg_notional_usd,
             "entry_spread_bps": float(best["spread_bps"]),
+            "entry_z": float(best.get("z") or 0.0),
             "entry_px_low": px_low, "entry_px_high": px_high,
             "status": "open",
             "opened_at": iso_utc(now_ms), "closed_at": "", "close_reason": "",
@@ -4574,7 +4575,7 @@ def summarize_fills(exchange: str, symbol: str,
 
 # ----------------- Positions -----------------
 POS_COLS = ["id","attempt_id","symbol","long_ex","short_ex","opened_ms","last_ms","held_h",
-            "size_usd","entry_spread_bps","entry_px_low","entry_px_high",
+            "size_usd","entry_spread_bps","entry_z","entry_px_low","entry_px_high",
             "status","opened_at","closed_at","close_reason","validated_qty","note_net_usd",
             "open_long_order_id","open_short_order_id","open_long_px","open_short_px","open_fees_usd",
             "open_long_cloid","open_short_cloid",
@@ -4598,7 +4599,8 @@ def load_positions(path: str) -> pd.DataFrame:
             df[c] = df[c].astype("string").fillna("")
     # Числовые поля — в float
     num_cols = [
-        "id","opened_ms","last_ms","held_h","size_usd","entry_spread_bps",
+        "id","opened_ms","last_ms","held_h","size_usd",
+        "entry_spread_bps","entry_z",
         "entry_px_low","entry_px_high","validated_qty",
         "open_long_px","open_short_px","open_fees_usd",
         "close_long_px","close_short_px","close_fees_usd","realized_pnl_usd"
@@ -4891,13 +4893,17 @@ def positions_once(
             EXIT_HYST_BPS = float(getenv_float("EXIT_HYST_BPS", 3.0))
             exit_req = float(exit_bps)
 
-            exit_mode_loc = getenv_str("EXIT_MODE", "zscore").lower()
-            if exit_mode_loc == "price":
+            # ENTRY_MODE=zscore → выходим по z / Δz / времени, а не по exit_bps_now
+            entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+            exit_mode_loc  = getenv_str("EXIT_MODE", "zscore").lower()
+            use_z_exit = (entry_mode_loc == "zscore") or (exit_mode_loc == "zscore")
+
+            if (not use_z_exit) and exit_mode_loc == "price":
                 # price-режим: выходим по уровню спреда (спред вернулся к "норме")
                 exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
             else:
-                # zscore-режим: по самому уровню спреда не выходим,
-                # он используется только для оценки PnL/стоп-лосса
+                # в zscore-режиме exit_bps_now не является триггером выхода
+                # (используется только как вспомогательная метрика/для логов)
                 exit_ok = True
 
             # --- ожидаемый PnL при закрытии ---
@@ -4922,16 +4928,26 @@ def positions_once(
                 #   EXIT_REQUIRE_POSITIVE=1 → до истечения MAX_HOLD_SEC
                 #   не закрываем позицию с нулевым/отрицательным ожидаемым PnL
                 #   STOP_LOSS_BPS < 0 → жёсткий стоп-лосс по спреду против нас
-                require_pos = bool(getenv_bool("EXIT_REQUIRE_POSITIVE", True))
-                stop_loss_bps = float(getenv_float("STOP_LOSS_BPS", 0.0))
+                require_pos = getenv_bool("EXIT_REQUIRE_POSITIVE", False)
+                STOP_LOSS_BPS = float(getenv_float("STOP_LOSS_BPS", 0.0))
 
-                # базово: пока не вышло MAX_HOLD_SEC, требуем pnl_est > 0
-                if require_pos and (not max_hold_reached) and pnl_est <= 0.0:
-                    pnl_est_ok = False
-
-                # стоп-лосс в bps от entry_spread_bps (delta_bps сильно отрицательный → спред ушёл против нас)
-                if stop_loss_bps < 0.0 and delta_bps <= stop_loss_bps:
+                if use_z_exit:
+                    # В zscore-режиме PnL-логика НЕ блокирует выход:
+                    # закрываемся по z / Δz / времени, а не по exit_bps_now / pnl_est
                     pnl_est_ok = True
+                else:
+                    if require_pos and (not max_hold_reached):
+                        pnl_est_ok = pnl_est > 0.0
+                    else:
+                        pnl_est_ok = True
+                    # дополнительно: грубый стоп-лосс по bps, если задали
+                    if STOP_LOSS_BPS < 0:
+                        # считаем delta_bps как разницу между entry и текущим спредом
+                        entry_spread_bps = float(row.get("entry_spread_bps") or 0.0)
+                        cur_spread_bps   = 1e4 * max(0.0, bid_high - ask_low) / max(ask_low, 1e-12)
+                        delta_bps = cur_spread_bps - entry_spread_bps
+                        if delta_bps <= STOP_LOSS_BPS:
+                            pnl_est_ok = True
 
                 # после MAX_HOLD_SEC даём позиции закрыться даже с минусом — просто логируем
                 if max_hold_reached and pnl_est < 0.0:
@@ -4945,16 +4961,59 @@ def positions_once(
                 # если оценка PnL сломалась — не блокируем выход
                 pnl_est_ok = True
 
-            # z-условия выхода (если включены)
+            # z / Δz / время — условия выхода в zscore-режиме
             z_ok = True
-            if exit_mode_loc == "zscore":
+            if use_z_exit:
+                # по умолчанию: выходим, когда |z| достаточно схлопнулся
+                # ИЛИ когда Δz (сдвиг к нулю) достаточно велик
+                # ИЛИ когда позиция пересидела MAX_HOLD_SEC
+                z_cur = float("nan")
                 try:
-                    z_out = float(getenv_float("Z_OUT", 0.0))
-                    # если в stats были z/std/ema — используем их
-                    z_cur = float(best.get("z", 0.0) if best else 0.0)
-                    z_ok = abs(z_cur) <= abs(z_out)
+                    stats_df2 = stats_df if stats_df is not None else read_spread_stats()
                 except Exception:
-                    z_ok = True
+                    stats_df2 = None
+
+                if stats_df2 is not None and not stats_df2.empty:
+                    try:
+                        ex_low  = str(ex_l or "").lower()
+                        ex_high = str(ex_h or "").lower()
+                        if sym and ex_low and ex_high:
+                            _, z_val, _ = get_z_for_pair(
+                                stats_df2,
+                                symbol=sym,
+                                ex_low=ex_low,
+                                ex_high=ex_high,
+                                px_low=ask_low,
+                                px_high=bid_high,
+                            )
+                            if z_val == z_val:  # not NaN
+                                z_cur = float(z_val)
+                    except Exception:
+                        z_cur = float("nan")
+
+                # entry_z мы сохранили при открытии позиции
+                entry_z_raw = row.get("entry_z")
+                try:
+                    entry_z = float(entry_z_raw) if entry_z_raw is not None else float("nan")
+                except Exception:
+                    entry_z = float("nan")
+
+                dz = float("nan")
+                if entry_z == entry_z and z_cur == z_cur:
+                    # Δz = насколько z схлопнулся к нулю (в абсолюте)
+                    dz = abs(entry_z) - abs(z_cur)
+
+                # пороги выхода
+                z_out_abs    = float(getenv_float("Z_OUT", 0.5))          # |z| ниже этого — фиксация
+                z_delta_exit = float(getenv_float("Z_DELTA_OUT", 1.0))    # минимум схлопывания по Δz
+
+                cond_abs   = (z_cur == z_cur) and (z_out_abs > 0.0) and (abs(z_cur) <= abs(z_out_abs))
+                cond_delta = (dz == dz) and (dz >= z_delta_exit)
+                cond_time  = bool(max_hold_reached)
+
+                z_ok = cond_abs or cond_delta or cond_time
+            else:
+                z_ok = True
 
             if exit_ok and z_ok and pnl_est_ok:
                 # закрываем позицию
