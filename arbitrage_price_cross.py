@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Cross-Exchange PRICE Arbitrage (Perp Futures) — with external Spread Stats (z-score)
-
-Дополнения:
-- MEXC использует фьючерсный контрактный API (contract.mexc.com) — apples-to-apples с остальными.
-- Вход по аномалии спреда: z >= Z_IN и positive economics (net_usd_adj > 0).
-- Выход по z <= Z_OUT (или по EXIT_SPREAD_BPS).
-- Статистика лог-спредов читается из SPREAD_STATS_PATH (обновляется сервисом spread_stats_collector.py).
-"""
 
 import os, time, json, math, hmac, hashlib, logging, uuid, base64
 from datetime import datetime, timezone
@@ -887,7 +878,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.26</b>")
+    lines.append(f"\n<b> ver: 2.27</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4898,12 +4889,17 @@ def positions_once(
             exit_mode_loc  = getenv_str("EXIT_MODE", "zscore").lower()
             use_z_exit = (entry_mode_loc == "zscore") or (exit_mode_loc == "zscore")
 
-            if (not use_z_exit) and exit_mode_loc == "price":
+            exit_mode_loc   = getenv_str("EXIT_MODE", "zscore").lower()
+            entry_mode_glob = getenv_str("ENTRY_MODE", "price").lower()
+
+            # В режиме ENTRY_MODE=zscore полностью игнорируем триггер по exit_bps_now:
+            # выходим только по z / времени / PnL-логике.
+            if exit_mode_loc == "price" and entry_mode_glob != "zscore":
                 # price-режим: выходим по уровню спреда (спред вернулся к "норме")
                 exit_ok = exit_bps_now <= (exit_req + EXIT_HYST_BPS)
             else:
-                # в zscore-режиме exit_bps_now не является триггером выхода
-                # (используется только как вспомогательная метрика/для логов)
+                # zscore-режим: по самому уровню спреда не выходим,
+                # он используется только для оценки PnL/стоп-лосса
                 exit_ok = True
 
             # --- ожидаемый PnL при закрытии ---
@@ -4964,56 +4960,51 @@ def positions_once(
             # z / Δz / время — условия выхода в zscore-режиме
             z_ok = True
             if use_z_exit:
-                # по умолчанию: выходим, когда |z| достаточно схлопнулся
-                # ИЛИ когда Δz (сдвиг к нулю) достаточно велик
-                # ИЛИ когда позиция пересидела MAX_HOLD_SEC
-                z_cur = float("nan")
                 try:
-                    stats_df2 = stats_df if stats_df is not None else read_spread_stats()
-                except Exception:
-                    stats_df2 = None
+                    z_out = float(getenv_float("Z_OUT", 0.0))
 
-                if stats_df2 is not None and not stats_df2.empty:
-                    try:
-                        ex_low  = str(ex_l or "").lower()
-                        ex_high = str(ex_h or "").lower()
-                        if sym and ex_low and ex_high:
-                            _, z_val, _ = get_z_for_pair(
-                                stats_df2,
-                                symbol=sym,
-                                ex_low=ex_low,
-                                ex_high=ex_high,
-                                px_low=ask_low,
-                                px_high=bid_high,
-                            )
-                            if z_val == z_val:  # not NaN
-                                z_cur = float(z_val)
-                    except Exception:
+                    # если Z_OUT не задан (0.0) — не используем z как триггер
+                    if z_out <= 0.0:
+                        z_ok = bool(max_hold_reached)
+                    else:
                         z_cur = float("nan")
 
-                # entry_z мы сохранили при открытии позиции
-                entry_z_raw = row.get("entry_z")
-                try:
-                    entry_z = float(entry_z_raw) if entry_z_raw is not None else float("nan")
+                        # Берём stats: либо переданный в positions_once, либо читаем с диска
+                        stats_df2 = None
+                        try:
+                            if stats_df is not None and not stats_df.empty:
+                                stats_df2 = stats_df
+                            else:
+                                stats_df2 = read_spread_stats()
+                        except Exception:
+                            stats_df2 = None
+
+                        if stats_df2 is not None and not stats_df2.empty:
+                            try:
+                                # z для текущего спреда по текущим ценам
+                                _, z_val, _ = get_z_for_pair(
+                                    stats_df2,
+                                    symbol=sym,
+                                    ex_low=str(ex_l).lower(),
+                                    ex_high=str(ex_h).lower(),
+                                    px_low=ask_low,      # где мы long (дешёвый)
+                                    px_high=bid_high,    # где мы short (дорогой)
+                                )
+                                if z_val == z_val:  # not NaN
+                                    z_cur = float(z_val)
+                            except Exception:
+                                z_cur = float("nan")
+
+                        # Основной триггер: |z_cur| <= Z_OUT
+                        cond_z = (z_cur == z_cur) and (abs(z_cur) <= abs(z_out))
+                        # Резервный триггер: истёк MAX_HOLD_SEC
+                        cond_time = bool(max_hold_reached)
+
+                        z_ok = cond_z or cond_time
+
                 except Exception:
-                    entry_z = float("nan")
-
-                dz = float("nan")
-                if entry_z == entry_z and z_cur == z_cur:
-                    # Δz = насколько z схлопнулся к нулю (в абсолюте)
-                    dz = abs(entry_z) - abs(z_cur)
-
-                # пороги выхода
-                z_out_abs    = float(getenv_float("Z_OUT", 0.5))          # |z| ниже этого — фиксация
-                z_delta_exit = float(getenv_float("Z_DELTA_OUT", 1.0))    # минимум схлопывания по Δz
-
-                cond_abs   = (z_cur == z_cur) and (z_out_abs > 0.0) and (abs(z_cur) <= abs(z_out_abs))
-                cond_delta = (dz == dz) and (dz >= z_delta_exit)
-                cond_time  = bool(max_hold_reached)
-
-                z_ok = cond_abs or cond_delta or cond_time
-            else:
-                z_ok = True
+                    # если z посчитать не смогли — разрешаем выход только по времени
+                    z_ok = bool(max_hold_reached)
 
             if exit_ok and z_ok and pnl_est_ok:
                 # закрываем позицию
