@@ -2716,15 +2716,13 @@ def scan_spreads_once(
         best["z"] = z2
         best["std"] = std2
 
-    # ---- has_open: проверяем открыто ли по ЭТОМУ символу ----
+    # ---- has_open: ГЛОБАЛЬНЫЙ флаг — есть ли хотя бы ОДНА открытая позиция ----
     has_open = False
     try:
         df_pos = load_positions(pos_path_for_instant or pos_path)
-        if df_pos is not None and not df_pos.empty:
-            sym_u = str(best.get("symbol", "")).upper()
-            if sym_u:
-                df_pos["symbol"] = df_pos["symbol"].astype(str).str.upper()
-                has_open = any((df_pos["symbol"] == sym_u) & (df_pos["status"] == "open"))
+        if df_pos is not None and not df_pos.empty and "status" in df_pos.columns:
+            # считаем, что status in ["open", "closing"] = позиция занята
+            has_open = any(df_pos["status"].isin(["open", "closing"]))
     except Exception:
         has_open = False
 
@@ -4804,7 +4802,9 @@ def positions_once(
 
     has_open = False
     try:
-        has_open = any(df_pos.get("status","") == "open")
+        if not df_pos.empty and "status" in df_pos.columns:
+            # глобальный признак: есть ли хотя бы одна активная позиция
+            has_open = any(df_pos["status"].isin(["open", "closing"]))
     except Exception:
         has_open = False
 
