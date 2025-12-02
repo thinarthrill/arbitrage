@@ -878,7 +878,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.28</b>")
+    lines.append(f"\n<b> ver: 2.29</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4946,10 +4946,9 @@ def positions_once(
                             pnl_est_ok = True
 
                 # после MAX_HOLD_SEC даём позиции закрыться даже с минусом — просто логируем
-                if max_hold_reached and pnl_est < 0.0:
+                if max_hold_reached:
                     logging.info(
-                        "positions_once: MAX_HOLD_SEC reached for %s %s↔%s, "
-                        "pnl_est=%.4f < 0 → allow close by time",
+                        "positions_once: MAX_HOLD_SEC reached for %s %s↔%s (pnl_est=%.4f)",
                         sym, ex_l, ex_h, pnl_est
                     )
 
@@ -5005,6 +5004,12 @@ def positions_once(
                 except Exception:
                     # если z посчитать не смогли — разрешаем выход только по времени
                     z_ok = bool(max_hold_reached)
+
+            # Если достигли MAX_HOLD_SEC — разрешаем выход строго по таймингу,
+            if max_hold_reached:
+                exit_ok = True
+                z_ok = True
+                pnl_est_ok = True
 
             if exit_ok and z_ok and pnl_est_ok:
                 # закрываем позицию
