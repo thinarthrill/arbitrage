@@ -878,7 +878,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.31</b>")
+    lines.append(f"\n<b> ver: 2.32</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -5209,13 +5209,18 @@ def positions_once(
                                 except Exception:
                                     continue
                                 total_val += v
-                                # разделитель тысяч + 2 знака после запятой
                                 lines.append(f"   • {ex_name}: ${v:,.2f}")
                             if lines:
                                 balances_text = "\n".join(lines)
                                 total_eq = total_val
+                        else:
+                            # Явно логируем, что баланс не удалось получить
+                            logging.warning(
+                                "positions_once: balances are empty after close for %s %s↔%s",
+                                sym, ex_l, ex_h,
+                            )
                     except Exception as e_imp:
-                        logging.debug(
+                        logging.warning(
                             "positions_once: balances fetch failed: %s",
                             e_imp,
                         )
