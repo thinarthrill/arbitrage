@@ -878,7 +878,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.30</b>")
+    lines.append(f"\n<b> ver: 2.31</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4840,6 +4840,99 @@ def positions_once(
                         max_hold_reached = True
             except Exception:
                 pass
+
+            # --- ЖЁСТКИЙ ВЫХОД ПО ТАЙМЕРУ (MAX_HOLD_SEC) ---
+            if max_hold_sec > 0 and max_hold_reached:
+                try:
+                    logging.info(
+                        "positions_once: FORCE TIME EXIT %s %s↔%s age=%.0fs >= MAX_HOLD_SEC=%s",
+                        sym,
+                        ex_l,
+                        ex_h,
+                        age_sec if age_sec is not None else -1.0,
+                        max_hold_sec,
+                    )
+                except Exception:
+                    logging.info(
+                        "positions_once: FORCE TIME EXIT %s %s↔%s (age or MAX_HOLD_SEC unknown)",
+                        sym,
+                        ex_l,
+                        ex_h,
+                    )
+
+                try:
+                    ok, meta = atomic_cross_close(
+                        symbol=sym,
+                        cheap_ex=ex_l,
+                        rich_ex=ex_h,
+                        qty=qty,
+                        paper=paper,
+                    )
+                except Exception as e:
+                    ok, meta = False, {"error": str(e)}
+
+                if ok:
+                    df_pos.at[i, "status"] = "closed"
+                    df_pos.at[i, "close_reason"] = "time"
+                    try:
+                        df_pos.at[i, "closed_at"] = now_utc_str()
+                    except Exception:
+                        pass
+
+                    # PnL из meta в CSV (аналогично обычному exit-блоку)
+                    try:
+                        pnl = 0.0
+                        if isinstance(meta, dict):
+                            if "pnl_usd" in meta:
+                                pnl = float(meta.get("pnl_usd") or 0.0)
+                            elif "pnl" in meta:
+                                pnl = float(meta.get("pnl") or 0.0)
+                        df_pos.at[i, "realized_pnl_usd"] = pnl
+                    except Exception:
+                        pass
+
+                    try:
+                        msg = (
+                            "⏰ <b>CLOSED BY TIME</b>\n"
+                            f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                        )
+                        if age_sec is not None:
+                            msg += f"age ≈ {age_sec:.0f} s (MAX_HOLD_SEC={int(max_hold_sec)})"
+                        maybe_send_telegram(msg)
+                    except Exception:
+                        pass
+
+                else:
+                    # Ошибка при тайм-аут закрытии — лог + TG
+                    err_msg = ""
+                    try:
+                        if isinstance(meta, dict) and "error" in meta:
+                            err_msg = str(meta.get("error"))
+                        else:
+                            err_msg = str(meta)
+                    except Exception:
+                        err_msg = "unknown"
+
+                    logging.error(
+                        "[CLOSE] time-based close failed for %s %s↔%s qty=%s: %s",
+                        sym,
+                        ex_l,
+                        ex_h,
+                        qty,
+                        err_msg,
+                    )
+                    try:
+                        maybe_send_telegram(
+                            "❌ <b>CLOSE ERROR (TIME)</b>\n"
+                            f"{sym} {ex_l.upper()} ↔ {ex_h.upper()}\n"
+                            f"MAX_HOLD_SEC={max_hold_sec}, age≈{age_sec} s\n"
+                           f"{err_msg}"
+                        )
+                    except Exception:
+                        pass
+
+                # По этой строке дальше ничего не делаем
+                continue
 
             # ------- локальная функция котировок -------
             def _single_quote(ex: str, symbol: str):
