@@ -435,9 +435,16 @@ def get_bbo(symbol: str, ex_name: str):
 def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                        qty: float, paper: bool) -> Tuple[bool, dict]:
     """
-    Закрытие кросса:
+    Закрытие кросса.
+
+    По умолчанию (REVERSE_SIDE=0), закрываем:
       cheap_ex -> SELL reduce_only (закрываем LONG)
       rich_ex  -> BUY  reduce_only (закрываем SHORT)
+
+    Если REVERSE_SIDE=1 (на входе делали SHORT на cheap_ex и LONG на rich_ex),
+    то для закрытия делаем наоборот:
+      cheap_ex -> BUY  reduce_only (закрываем SHORT)
+      rich_ex  -> SELL reduce_only (закрываем LONG)
     """
 
     attempt_id = new_attempt_id()
@@ -445,18 +452,26 @@ def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
     cl_close_short = _gen_cloid("CLOSEB", attempt_id, "B")
 
     meta = {"attempt_id": attempt_id}
+
+    # тот же флаг, что и при открытии
+    reverse_side = getenv_bool("REVERSE_SIDE", False)
+
+    side_a_close = "SELL"
+    side_b_close = "BUY"
+    if reverse_side:
+        side_a_close, side_b_close = "BUY", "SELL"
     try:
-        # закрываем LONG на дешёвой
+        # закрываем позицию на дешёвой
         oa = _place_perp_market_order(
-            cheap_ex, symbol, "SELL", qty,
+            cheap_ex, symbol, side_a_close, qty,
             paper=paper, cl_oid=cl_close_long, reduce_only=True
         )
         if oa.get("status") != "FILLED":
             raise RuntimeError(f"legA close not filled: {oa}")
 
-        # закрываем SHORT на дорогой
+        # закрываем позицию на дорогой
         ob = _place_perp_market_order(
-            rich_ex, symbol, "BUY", qty,
+            rich_ex, symbol, side_b_close, qty,
             paper=paper, cl_oid=cl_close_short, reduce_only=True
         )
         if ob.get("status") != "FILLED":
@@ -878,7 +893,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.33</b>")
+    lines.append(f"\n<b> ver: 2.36</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3781,8 +3796,14 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
                       paper: bool) -> Tuple[bool,str,dict]:
     """
     Открываем кросс:
-      cheap_ex -> BUY (LONG)
-      rich_ex  -> SELL (SHORT)
+      по умолчанию:
+        cheap_ex -> BUY (LONG)
+        rich_ex  -> SELL (SHORT)
+
+      если REVERSE_SIDE=1:
+        cheap_ex -> SELL (SHORT)
+        rich_ex  -> BUY  (LONG)
+
     Без reduce_only. Возвращаем метаданные и клиентские id.
     """
     attempt_id = new_attempt_id()
@@ -3805,14 +3826,23 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
     if qty_final <= 0:
         return False, attempt_id, {"error": "qty_final<=0 after rounding"}
 
+    # Реверс сторон по флагу REVERSE_SIDE (0/1)
+    reverse_side = getenv_bool("REVERSE_SIDE", False)
+
+    side_a_open = "BUY"
+    side_b_open = "SELL"
+    if reverse_side:
+        # тупой реверс: где раньше покупали — теперь продаём, и наоборот
+        side_a_open, side_b_open = "SELL", "BUY"
+
     # client IDs для ног открытия
     cl_open_long  = _gen_cloid("OPENA", attempt_id, "A")
     cl_open_short = _gen_cloid("OPENB", attempt_id, "B")
 
     try:
-        # LONG (BUY) на дешёвой бирже
+        # Нога A на дешёвой бирже
         oa = _place_perp_market_order(
-            cheap_ex, symbol, "BUY", qty_final,
+            cheap_ex, symbol, side_a_open, qty_final,
             paper=paper, cl_oid=cl_open_long, reduce_only=False
         )
         if oa.get("status") != "FILLED":
@@ -3835,9 +3865,9 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         return False, attempt_id, {"error": f"legA error: {e}"}
 
     try:
-        # SHORT (SELL) на дорогой бирже
+        # Нога B на дорогой бирже
         ob = _place_perp_market_order(
-            rich_ex, symbol, "SELL", qty_final,
+            rich_ex, symbol, side_b_open, qty_final,
             paper=paper, cl_oid=cl_open_short, reduce_only=False
         )
         if ob.get("status") != "FILLED":
