@@ -893,7 +893,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.37</b>")
+    lines.append(f"\n<b> ver: 2.38</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -5149,23 +5149,28 @@ def positions_once(
                 require_pos = getenv_bool("EXIT_REQUIRE_POSITIVE", False)
                 STOP_LOSS_BPS = float(getenv_float("STOP_LOSS_BPS", 0.0))
 
-                if use_z_exit:
-                    # В zscore-режиме PnL-логика НЕ блокирует выход:
-                    # закрываемся по z / Δz / времени, а не по exit_bps_now / pnl_est
-                    pnl_est_ok = True
-                else:
+                # базовая логика по PnL:
+                # в zscore-режиме не блокируем выход по PnL (даём решать z / таймеру),
+                # но в price-режиме можем требовать хотя бы неотрицательный pnl_est
+                pnl_est_ok = True
+                if not use_z_exit:
                     if require_pos and (not max_hold_reached):
                         pnl_est_ok = pnl_est > 0.0
                     else:
                         pnl_est_ok = True
-                    # дополнительно: грубый стоп-лосс по bps, если задали
-                    if STOP_LOSS_BPS < 0:
-                        # считаем delta_bps как разницу между entry и текущим спредом
-                        entry_spread_bps = float(row.get("entry_spread_bps") or 0.0)
-                        cur_spread_bps   = 1e4 * max(0.0, bid_high - ask_low) / max(ask_low, 1e-12)
-                        delta_bps = cur_spread_bps - entry_spread_bps
-                        if delta_bps <= STOP_LOSS_BPS:
-                            pnl_est_ok = True
+
+                # Грубый стоп-лосс по bps, если задан (STOP_LOSS_BPS < 0).
+                # Считаем дельту так, что:
+                #   delta_bps > 0  — профит (спред сузился),
+                #   delta_bps < 0  — убыток (спред расширился).
+                if STOP_LOSS_BPS < 0:
+                    entry_spread_bps = float(row.get("entry_spread_bps") or 0.0)
+                    cur_spread_bps   = 1e4 * max(0.0, bid_high - ask_low) / max(ask_low, 1e-12)
+                    # было: cur_spread_bps - entry_spread_bps  (знак перевёрнут)
+                    delta_bps = entry_spread_bps - cur_spread_bps
+                    # при delta_bps <= STOP_LOSS_BPS (например, <= -30) считаем, что убыток превысил порог
+                    if delta_bps <= STOP_LOSS_BPS:
+                        pnl_est_ok = True
 
                 # после MAX_HOLD_SEC даём позиции закрыться даже с минусом — просто логируем
                 if max_hold_reached:
