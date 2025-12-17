@@ -432,6 +432,159 @@ def get_bbo(symbol: str, ex_name: str):
     # default binance
     return binance_best_bid_ask(symbol)
 
+# ----------------- Funding helpers (Binance/Bybit/OKX/Gate) -----------------
+# funding_rate is a fraction per period (e.g., 0.0001 = 0.01% per funding).
+# next_funding_ms is UTC epoch ms when the next funding is applied.
+
+def _sym_to_okx_instid(sym: str) -> str:
+    sym_u = str(sym).upper().replace('-', '').replace('_', '')
+    # BTCUSDT -> BTC-USDT-SWAP
+    if sym_u.endswith('USDT'):
+        base = sym_u[:-4]
+        return f"{base}-USDT-SWAP"
+    return sym_u
+
+def _sym_to_gate_contract(sym: str) -> str:
+    sym_u = str(sym).upper().replace('-', '').replace('_', '')
+    # BTCUSDT -> BTC_USDT
+    if sym_u.endswith('USDT'):
+        base = sym_u[:-4]
+        return f"{base}_USDT"
+    return sym_u
+
+
+def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optional[int], int]:
+    """Return (funding_rate, next_funding_ms, period_sec).
+
+    funding_rate is a fraction per funding period (e.g., 0.0001 = 0.01%).
+    next_funding_ms is UTC epoch ms when the next funding is applied.
+    period_sec is the funding period in seconds (usually 8h).
+
+    On any error, returns (None, None, 28800).
+    """
+    ex = (exchange or '').lower().strip()
+    sym = str(symbol or '').upper().replace('-', '').replace('_', '')
+    period_sec = 8 * 3600
+    try:
+        if ex == 'binance':
+            js = _get(f"{_public_base('binance')}/fapi/v1/premiumIndex", params={'symbol': sym})
+            if not js:
+                return None, None, period_sec
+            r = float(js.get('lastFundingRate')) if js.get('lastFundingRate') is not None else None
+            nft = int(js.get('nextFundingTime')) if js.get('nextFundingTime') is not None else None
+            return r, nft, period_sec
+
+        if ex == 'bybit':
+            js = _get(f"{_public_base('bybit')}/v5/market/tickers", params={'category': 'linear', 'symbol': sym})
+            if not js or js.get('retCode') not in (0, '0', None):
+                return None, None, period_sec
+            lst = ((js.get('result') or {}).get('list') or [])
+            if not lst:
+                return None, None, period_sec
+            it = lst[0] or {}
+            r = float(it.get('fundingRate')) if it.get('fundingRate') is not None else None
+            nft = int(it.get('nextFundingTime')) if it.get('nextFundingTime') is not None else None
+            return r, nft, period_sec
+
+        if ex == 'okx':
+            inst = _sym_to_okx_instid(sym)
+            js = _get(f"{_public_base('okx')}/api/v5/public/funding-rate", params={'instId': inst})
+            if not js or js.get('code') not in ('0', 0, None):
+                return None, None, period_sec
+            data = (js.get('data') or [])
+            if not data:
+                return None, None, period_sec
+            it = data[0] or {}
+            # OKX: fundingRate, nextFundingTime in ms
+            r = float(it.get('fundingRate')) if it.get('fundingRate') is not None else None
+            nft = int(it.get('nextFundingTime')) if it.get('nextFundingTime') is not None else None
+            return r, nft, period_sec
+
+        if ex == 'gate':
+            # Gate futures USDT: /api/v4/futures/usdt/contracts/{contract}
+            contract = _sym_to_gate_contract(sym)
+            js = _get(f"{_public_base('gate')}/api/v4/futures/usdt/contracts/{contract}")
+            if not js:
+                return None, None, period_sec
+            # Gate fields: funding_rate, funding_next_apply (seconds or ms depending)
+            r = float(js.get('funding_rate')) if js.get('funding_rate') is not None else None
+            nft_raw = js.get('funding_next_apply')
+            nft = None
+            if nft_raw is not None:
+                try:
+                    nft_i = int(float(nft_raw))
+                    # heuristics: seconds -> ms
+                    nft = nft_i * 1000 if nft_i < 10_000_000_000 else nft_i
+                except Exception:
+                    nft = None
+            return r, nft, period_sec
+
+    except Exception:
+        return None, None, period_sec
+
+    return None, None, period_sec
+
+
+def _expected_funding_cycles(next_funding_ms: Optional[int], period_sec: int, hold_sec: int) -> int:
+    """How many funding events are likely to happen during hold_sec."""
+    if hold_sec <= 0:
+        return 0
+    if not next_funding_ms:
+        # if we don't know schedule, assume at most 1 event per 8h within holding window
+        return max(0, int(hold_sec // max(1, period_sec)))
+    dt = (next_funding_ms - now_ms()) / 1000.0
+    if dt > hold_sec:
+        return 0
+    rem = max(0.0, hold_sec - max(0.0, dt))
+    return 1 + int(rem // max(1, period_sec))
+
+
+def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec: int, reverse_side: bool=False) -> Tuple[Optional[float], dict]:
+    """Expected funding PnL (percent of notional) over hold_sec for BOTH legs.
+
+    Returns (total_pct, details_dict). total_pct is in percent (e.g., 0.2 means +0.2%).
+    """
+    sym = str(symbol or '').upper()
+
+    # Default (reverse_side=0): long cheap, short rich.
+    # reverse_side=1: short cheap, long rich.
+    pos_cheap = 'short' if reverse_side else 'long'
+    pos_rich  = 'long' if reverse_side else 'short'
+
+    rA, nftA, perA = get_funding_info(cheap_ex, sym)
+    rB, nftB, perB = get_funding_info(rich_ex,  sym)
+
+    cA = _expected_funding_cycles(nftA, perA, hold_sec)
+    cB = _expected_funding_cycles(nftB, perB, hold_sec)
+
+    # funding pnl per event: long pays when rate>0 => pnl = -rate; short receives when rate>0 => pnl = +rate
+    def pnl_per_event(rate: Optional[float], pos: str) -> Optional[float]:
+        if rate is None:
+            return None
+        if pos == 'long':
+            return -float(rate)
+        return float(rate)
+
+    pnlA = pnl_per_event(rA, pos_cheap)
+    pnlB = pnl_per_event(rB, pos_rich)
+
+    total = None
+    if pnlA is not None and pnlB is not None:
+        # NOTE: cycles could differ; use min cycles to avoid overstating
+        c = min(cA, cB)
+        total = (pnlA + pnlB) * c * 100.0
+
+    details = {
+        'cheap_ex': cheap_ex, 'rich_ex': rich_ex, 'reverse_side': bool(reverse_side),
+        'pos_cheap': pos_cheap, 'pos_rich': pos_rich,
+        'rate_cheap': rA, 'rate_rich': rB,
+        'next_ms_cheap': nftA, 'next_ms_rich': nftB,
+        'cycles_cheap': cA, 'cycles_rich': cB,
+        'hold_sec': int(hold_sec),
+        'total_pct': total,
+    }
+    return total, details
+
 def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                        qty: float, paper: bool) -> Tuple[bool, dict]:
     """
@@ -890,10 +1043,36 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 )
             else:
                 lines.append(f"{_flag(False)} std_ok    · σ={std} , need ≥ {std_min_for_open:g}")
+        # funding (optional)
+        f_min = r.get("funding_min_pct_used", None)
+        f_exp = r.get("funding_expected_pct", None)
+        if f_min is not None:
+            try:
+                f_min_v = float(f_min)
+            except Exception:
+                f_min_v = None
+            if f_min_v is not None and f_min_v > 0:
+                rate_a = r.get("funding_rate_cheap", None)
+                rate_b = r.get("funding_rate_rich", None)
+                cyc = r.get("funding_cycles", None)
+                hold_s = r.get("funding_hold_sec_used", None)
+                ok = bool(r.get("funding_ok", False))
+                lines.append("\n💸 <b>FUNDING</b>")
+                lines.append(
+                    f"{_flag(ok)} funding_ok · expected={('None' if f_exp is None else f'{float(f_exp):.4f}%')} ≥ {f_min_v:.4f}% "
+                    f"(cycles={cyc}, hold={int(hold_s) if hold_s is not None else 'n/a'}s)"
+                )
+                if rate_a is not None or rate_b is not None:
+                    try:
+                        ra = "None" if rate_a is None else f"{float(rate_a)*100:.4f}%"
+                        rb = "None" if rate_b is None else f"{float(rate_b)*100:.4f}%"
+                        lines.append(f"   rates: cheap={ra} per fund, rich={rb} per fund")
+                    except Exception:
+                        pass
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.38</b>")
+    lines.append(f"\n<b> ver: 2.39</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2113,6 +2292,43 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         except Exception as e:
             logging.debug("REFRESH_CONFIRM exception: %s", e)
             return _reject(f"refresh_confirm exception: {e}")
+        
+    # --- 2.5) Funding precheck (optional) ---
+    # Parameter is percent over the expected holding window.
+    # Example: FUNDING_MIN_PCT=0.2 means require >= +0.2% expected funding PnL.
+    FUNDING_MIN_PCT = float(getenv_float("FUNDING_MIN_PCT", 0.0))
+    if FUNDING_MIN_PCT > 0:
+        try:
+            max_hold_sec = int(getenv_float("MAX_HOLD_SEC", 0))
+            exp_h = float(getenv_float("EXPECTED_HOLDING_H", 0.0))
+            hold_sec = int(max(0, exp_h * 3600)) if exp_h > 0 else 0
+            # if both are set, be conservative: take min positive
+            if max_hold_sec > 0 and hold_sec > 0:
+                hold_sec = min(max_hold_sec, hold_sec)
+            elif max_hold_sec > 0:
+                hold_sec = max_hold_sec
+            elif hold_sec <= 0:
+                hold_sec = 8 * 3600  # fallback: 1 funding window
+
+            reverse_side = getenv_bool("REVERSE_SIDE", False)
+            f_pct, f_det = expected_funding_pnl_pct(sym, cheap_ex, rich_ex, hold_sec, reverse_side=reverse_side)
+
+            best["funding_expected_pct"] = f_pct
+            # store a compact view for TG/debug
+            best["funding_rate_cheap"] = f_det.get("rate_cheap")
+            best["funding_rate_rich"] = f_det.get("rate_rich")
+            best["funding_cycles"] = min(int(f_det.get("cycles_cheap") or 0), int(f_det.get("cycles_rich") or 0))
+            best["funding_hold_sec_used"] = int(f_det.get("hold_sec") or hold_sec)
+            best["funding_min_pct_used"] = FUNDING_MIN_PCT
+
+            funding_ok = (f_pct is not None) and (float(f_pct) >= FUNDING_MIN_PCT)
+            best["funding_ok"] = funding_ok
+            if not funding_ok:
+                return _reject(f"precheck failed (funding): expected={f_pct}%, min={FUNDING_MIN_PCT}%")
+        except Exception as e:
+            # if funding check is enabled but fetch fails, do NOT block trading
+            best["funding_ok"] = True
+            best["funding_error"] = str(e)
 
     # --- 3) Qty расчёт как в positions_once ---
     try:
