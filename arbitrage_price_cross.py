@@ -404,6 +404,49 @@ INSTANT_ALERT = os.getenv("INSTANT_ALERT", "True").lower() == "true"
 def now_ms() -> int:
     return int(time.time() * 1000)
 
+from typing import Optional
+
+def candidate_rating_z(df: "pd.DataFrame", now_ms_val: Optional[int] = None) -> "pd.Series":
+    """Small bonus to candidate score to prefer more 'reliable' opportunities.
+
+    The intent: break ties between similar z-score candidates in a stable way
+    using (a) sample size (n/count) and (b) freshness of stats (updated_ms),
+    without changing the main logic of ENTRY_MODE=zscore.
+
+    Returns a z-score additive bonus (same units as z). Default is conservative.
+    """
+    if df is None or len(df) == 0:
+        return pd.Series([], dtype=float)
+
+    # configurable knobs (conservative defaults)
+    bonus_max_z = float(getenv_float("CAND_RATING_BONUS_MAX_Z", 0.20))  # up to +0.20z
+    n_cap       = float(getenv_float("CAND_RATING_N_CAP", 200.0))       # reaches max around this n
+    stale_sec   = float(getenv_float("CAND_RATING_STALE_SEC", 3600.0))  # 1h → start discounting
+
+    if now_ms_val is None:
+        now_ms_val = now_ms()
+
+    # pick best available "n" column (some flows use n, others use count)
+    if "n" in df.columns:
+        n = pd.to_numeric(df["n"], errors="coerce")
+    elif "count" in df.columns:
+        n = pd.to_numeric(df["count"], errors="coerce")
+    else:
+        n = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+
+    n = n.fillna(0.0).clip(lower=0.0)
+    frac = (n / max(n_cap, 1.0)).clip(upper=1.0)
+    rating = frac * bonus_max_z
+
+    # freshness discount (if we have updated_ms from spread stats)
+    if "updated_ms" in df.columns:
+        upd = pd.to_numeric(df["updated_ms"], errors="coerce").fillna(0.0)
+        age_sec = (now_ms_val - upd) / 1000.0
+        discount = (1.0 - (age_sec / max(stale_sec, 1.0))).clip(lower=0.0, upper=1.0)
+        rating = rating * discount
+
+    return rating.fillna(0.0)
+
 def _hmac_sha256_hex(secret: str, msg: str) -> str:
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
@@ -1072,7 +1115,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.39</b>")
+    lines.append(f"\n<b> ver: 2.40</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2917,7 +2960,8 @@ def scan_spreads_once(
         ].copy()
 
         if not valid.empty:
-            valid["__score__"] = valid["z"] * 10000 + valid["net_usd_adj"].fillna(0)
+            valid["__rating_z__"] = candidate_rating_z(valid)
+            valid["__score__"] = (valid["z"] + valid["__rating_z__"]) * 10000 + valid["net_usd_adj"].fillna(0)
             cands = valid.sort_values("__score__", ascending=False).reset_index(drop=True)
         else:
             # fallback по прибыли
@@ -4991,8 +5035,9 @@ def positions_once(
         else:
             # 3) сортировка с приоритетом zscore
             # сначала z (убывание), затем net_adj
+            cands["__rating_z__"] = candidate_rating_z(cands)
             cands["__score__"] = (
-                cands["z"] * 10000 +
+                (cands["z"] + cands["__rating_z__"]) * 10000 +
                 cands["net_usd_adj"].fillna(0)
             )
             cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
@@ -6056,7 +6101,10 @@ def main():
         if _is_true("AUTH_CHECK_AT_START", True):
             logging.info("Running private API auth checks...")
             if not check_auth_connectivity(exchanges):
-                msg = "Private API auth check failed — verify API keys/permissions/network."
+                try: ip = requests.get("https://api.ipify.org", timeout=3).text
+                except: ip = "unknown"
+
+                msg = "Private API auth check failed — verify API keys/permissions/network.\n🌐 Outgoing IP: {ip}"
                 logging.error(msg)
                 if must_quit:
                     maybe_send_telegram(f"❌ {msg}")
