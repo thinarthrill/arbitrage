@@ -567,6 +567,102 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
 
     return None, None, period_sec
 
+def _fetch_binance_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int], int]]:
+    """Bulk funding snapshot for Binance USDT-M via /fapi/v1/premiumIndex (no symbol)."""
+    out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
+    try:
+        js = _get("https://fapi.binance.com/fapi/v1/premiumIndex")
+        if isinstance(js, list):
+            for r in js:
+                sym = str(r.get("symbol", "")).upper()
+                if not sym:
+                    continue
+                try:
+                    rate = float(r.get("lastFundingRate")) if r.get("lastFundingRate") is not None else None
+                except Exception:
+                    rate = None
+                try:
+                    nxt = int(r.get("nextFundingTime")) if r.get("nextFundingTime") is not None else None
+                except Exception:
+                    nxt = None
+                out[sym] = (rate, nxt, 8 * 3600)
+    except Exception as e:
+        logging.debug("binance funding bulk failed: %s", e)
+    return out
+
+def _fetch_bybit_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int], int]]:
+    """Bulk funding snapshot for Bybit linear via /v5/market/tickers?category=linear."""
+    out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
+    try:
+        js = _get("https://api.bybit.com/v5/market/tickers?category=linear")
+        lst = (((js or {}).get("result") or {}).get("list") or [])
+        for r in lst:
+            sym = str(r.get("symbol", "")).upper()
+            if not sym:
+                continue
+            try:
+                rate = float(r.get("fundingRate")) if r.get("fundingRate") is not None else None
+            except Exception:
+                rate = None
+            try:
+                nxt = int(r.get("nextFundingTime")) if r.get("nextFundingTime") is not None else None
+            except Exception:
+                nxt = None
+            out[sym] = (rate, nxt, 8 * 3600)
+    except Exception as e:
+        logging.debug("bybit funding bulk failed: %s", e)
+    return out
+
+def _fetch_gate_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int], int]]:
+    """Bulk funding snapshot for Gate USDT futures via /api/v4/futures/usdt/contracts."""
+    out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
+    try:
+        js = _get(f"{_public_base('gate')}/api/v4/futures/usdt/contracts")
+        if isinstance(js, list):
+            for r in js:
+                name = str(r.get("name", "")).upper()
+                if not name:
+                    continue
+                sym = name.replace("_", "")
+                rate = None
+                nxt = None
+                for k in ("funding_rate", "funding_rate_indicative", "fundingRate"):
+                    if r.get(k) is not None:
+                        try:
+                            rate = float(r.get(k))
+                            break
+                        except Exception:
+                            pass
+                for k in ("funding_next_apply", "next_funding_time", "nextFundingTime"):
+                    if r.get(k) is not None:
+                        try:
+                            nxt = int(float(r.get(k))) * 1000 if float(r.get(k)) < 1e12 else int(r.get(k))
+                            break
+                        except Exception:
+                            pass
+                out[sym] = (rate, nxt, 8 * 3600)
+    except Exception as e:
+        logging.debug("gate funding bulk failed: %s", e)
+    return out
+
+def _build_funding_cache(symbols: List[str], exchanges: List[str]) -> Dict[str, Dict[str, Tuple[Optional[float], Optional[int], int]]]:
+    """Build per-cycle funding snapshot cache: exchange -> symbol -> (rate, next_ms, period_sec)."""
+    out: Dict[str, Dict[str, Tuple[Optional[float], Optional[int], int]]] = {ex: {} for ex in exchanges}
+    try:
+        if "binance" in out:
+            out["binance"].update(_fetch_binance_funding_bulk())
+        if "bybit" in out:
+            out["bybit"].update(_fetch_bybit_funding_bulk())
+        if "gate" in out:
+            out["gate"].update(_fetch_gate_funding_bulk())
+    except Exception:
+        pass
+    # OKX bulk public funding-rate нет — останется per-symbol fallback внутри get_funding_info()
+    # Trim to requested symbols (keeping only what we need helps memory)
+    sym_set = set([s.upper() for s in symbols])
+    for ex in list(out.keys()):
+        out[ex] = {k: v for k, v in out[ex].items() if k in sym_set} if sym_set else out[ex]
+    return out
 
 def _expected_funding_cycles(next_funding_ms: Optional[int], period_sec: int, hold_sec: int) -> int:
     """How many funding events are likely to happen during hold_sec."""
@@ -582,7 +678,9 @@ def _expected_funding_cycles(next_funding_ms: Optional[int], period_sec: int, ho
     return 1 + int(rem // max(1, period_sec))
 
 
-def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec: int, reverse_side: bool=False) -> Tuple[Optional[float], dict]:
+def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec: int, reverse_side: bool = False,
+                            funding_cache: Optional[Dict[str, Dict[str, Tuple[Optional[float], Optional[int], int]]]] = None
+                            ) -> Tuple[Optional[float], dict]:
     """Expected funding PnL (percent of notional) over hold_sec for BOTH legs.
 
     Returns (total_pct, details_dict). total_pct is in percent (e.g., 0.2 means +0.2%).
@@ -594,11 +692,24 @@ def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec:
     pos_cheap = 'short' if reverse_side else 'long'
     pos_rich  = 'long' if reverse_side else 'short'
 
-    rA, nftA, perA = get_funding_info(cheap_ex, sym)
-    rB, nftB, perB = get_funding_info(rich_ex,  sym)
+    def _get_cached(ex: str) -> Tuple[Optional[float], Optional[int], int]:
+        exn = str(ex or '').lower()
+        if funding_cache is not None:
+            ex_map = funding_cache.get(exn)
+            if ex_map is not None:
+                hit = ex_map.get(sym)
+                if hit is not None:
+                    return hit
+        r, nxt, per = get_funding_info(exn, sym)
+        if funding_cache is not None:
+            funding_cache.setdefault(exn, {})[sym] = (r, nxt, per)
+        return r, nxt, per
 
-    cA = _expected_funding_cycles(nftA, perA, hold_sec)
-    cB = _expected_funding_cycles(nftB, perB, hold_sec)
+    rA, nextA, periodA = _get_cached(cheap_ex)
+    rB, nextB, periodB = _get_cached(rich_ex)
+
+    cA = _expected_funding_cycles(nextA, periodA, hold_sec)
+    cB = _expected_funding_cycles(nextB, periodB, hold_sec)
 
     # funding pnl per event: long pays when rate>0 => pnl = -rate; short receives when rate>0 => pnl = +rate
     def pnl_per_event(rate: Optional[float], pos: str) -> Optional[float]:
@@ -618,10 +729,11 @@ def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec:
         total = (pnlA + pnlB) * c * 100.0
 
     details = {
-        'cheap_ex': cheap_ex, 'rich_ex': rich_ex, 'reverse_side': bool(reverse_side),
+        'cheap_ex': str(cheap_ex), 'rich_ex': str(rich_ex), 'reverse_side': bool(reverse_side),
         'pos_cheap': pos_cheap, 'pos_rich': pos_rich,
         'rate_cheap': rA, 'rate_rich': rB,
-        'next_ms_cheap': nftA, 'next_ms_rich': nftB,
+        'next_ms_cheap': nextA, 'next_ms_rich': nextB,
+        'period_sec_cheap': periodA, 'period_sec_rich': periodB,
         'cycles_cheap': cA, 'cycles_rich': cB,
         'hold_sec': int(hold_sec),
         'total_pct': total,
@@ -954,7 +1066,15 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         min_net_abs      = (entry_net_pct / 100.0) * capital_env
 
         # условия (1:1 с try_instant_open)
-        eco_ok    = (net_usd_adj is not None) and (net_usd_adj == net_usd_adj) and (float(net_usd_adj) > min_net_abs)
+        # if funding-adjusted net is provided in record, use it for eco_ok (keeps card consistent with scanner)
+        net_total_rec = r.get("net_usd_adj_total", None)
+        net_for_eco = net_usd_adj
+        try:
+            if net_total_rec is not None and float(net_total_rec) == float(net_total_rec):
+                net_for_eco = float(net_total_rec)
+        except Exception:
+            pass
+        eco_ok    = (net_for_eco is not None) and (net_for_eco == net_for_eco) and (float(net_for_eco) > min_net_abs)
         spread_ok = sp_bps >= entry_bps
         z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
         std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
@@ -1023,10 +1143,15 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
         std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
 
+        # funding facts if present in record
+        f_exp = r.get("funding_expected_pct", None)
+        net_total = r.get("net_usd_adj_total", None)
         lines.append(
             "\n📌 <b>FACT (current tick)</b>\n"
             f"   spread_bps=<code>{sp_bps:.2f}</code>\n"
             f"   net_usd_adj=<code>{'None' if net_fact is None else f'{float(net_fact):.4f}'}</code>\n"
+            f"   net_total=<code>{'None' if net_total is None else f'{float(net_total):.4f}'}</code>\n"
+            f"   funding_exp_pct=<code>{'None' if f_exp is None else f'{float(f_exp):.4f}'}</code>\n"            
             f"   z=<code>{'NaN' if z_fact is None else f'{float(z_fact):.4f}'}</code>\n"
             f"   std=<code>{'NaN' if std_fact is None else f'{float(std_fact):.6f}'}</code>"
         )
@@ -1086,36 +1211,36 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 )
             else:
                 lines.append(f"{_flag(False)} std_ok    · σ={std} , need ≥ {std_min_for_open:g}")
-        # funding (optional)
-        f_min = r.get("funding_min_pct_used", None)
-        f_exp = r.get("funding_expected_pct", None)
-        if f_min is not None:
+        # funding (show if any funding data present; do NOT hide when FUNDING_MIN_PCT=0)
+        if getenv_bool("SHOW_FUNDING_ON_CARD", True):
+            f_exp = r.get("funding_expected_pct", None)
+            rate_a = r.get("funding_rate_cheap", None)
+            rate_b = r.get("funding_rate_rich", None)
+            cyc = r.get("funding_cycles", None)
+            hold_s = r.get("funding_hold_sec_used", None)
+            f_min_v = None
             try:
-                f_min_v = float(f_min)
+                f_min_v = float(r.get("funding_min_pct_used"))
             except Exception:
-                f_min_v = None
-            if f_min_v is not None and f_min_v > 0:
-                rate_a = r.get("funding_rate_cheap", None)
-                rate_b = r.get("funding_rate_rich", None)
-                cyc = r.get("funding_cycles", None)
-                hold_s = r.get("funding_hold_sec_used", None)
-                ok = bool(r.get("funding_ok", False))
+                try:
+                    f_min_v = float(getenv_float("FUNDING_MIN_PCT", 0.0))
+                except Exception:
+                    f_min_v = 0.0
+            has_any = (f_exp is not None) or (rate_a is not None) or (rate_b is not None) or (cyc is not None)
+            if has_any:
+                ok = bool(r.get("funding_ok", True))
                 lines.append("\n💸 <b>FUNDING</b>")
                 lines.append(
-                    f"{_flag(ok)} funding_ok · expected={('None' if f_exp is None else f'{float(f_exp):.4f}%')} ≥ {f_min_v:.4f}% "
-                    f"(cycles={cyc}, hold={int(hold_s) if hold_s is not None else 'n/a'}s)"
+                    f"{_flag(ok)} funding_ok · expected={('None' if f_exp is None else f'{float(f_exp):.4f}%')} ≥ {float(f_min_v):.4f}% "
+                    f"(hold={hold_s}s, cycles={cyc})"
                 )
-                if rate_a is not None or rate_b is not None:
-                    try:
-                        ra = "None" if rate_a is None else f"{float(rate_a)*100:.4f}%"
-                        rb = "None" if rate_b is None else f"{float(rate_b)*100:.4f}%"
-                        lines.append(f"   rates: cheap={ra} per fund, rich={rb} per fund")
-                    except Exception:
-                        pass
+                lines.append(
+                    f"   cheap={('None' if rate_a is None else f'{float(rate_a):+.6f}')} · rich={('None' if rate_b is None else f'{float(rate_b):+.6f}')}"
+                )
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.40</b>")
+    lines.append(f"\n<b> ver: 2.41</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2363,6 +2488,14 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             best["funding_cycles"] = min(int(f_det.get("cycles_cheap") or 0), int(f_det.get("cycles_rich") or 0))
             best["funding_hold_sec_used"] = int(f_det.get("hold_sec") or hold_sec)
             best["funding_min_pct_used"] = FUNDING_MIN_PCT
+            # add funding into the economic picture (used by facts/card)
+            try:
+                f_usd = 0.0 if f_pct is None else (float(f_pct) / 100.0) * float(per_leg_notional_usd)
+                best["funding_expected_usd"] = f_usd
+                if best.get("net_usd_adj") is not None:
+                    best["net_usd_adj_total"] = float(best.get("net_usd_adj")) + float(f_usd)
+            except Exception:
+                pass
 
             funding_ok = (f_pct is not None) and (float(f_pct) >= FUNDING_MIN_PCT)
             best["funding_ok"] = funding_ok
@@ -2961,7 +3094,10 @@ def scan_spreads_once(
 
         if not valid.empty:
             valid["__rating_z__"] = candidate_rating_z(valid)
-            valid["__score__"] = (valid["z"] + valid["__rating_z__"]) * 10000 + valid["net_usd_adj"].fillna(0)
+            valid["__score__"] = (
+                (valid["z"] + valid["__rating_z__"]) * 10000
+                + valid.get("net_usd_adj_total", valid["net_usd_adj"]).fillna(0)
+            )
             cands = valid.sort_values("__score__", ascending=False).reset_index(drop=True)
         else:
             # fallback по прибыли
@@ -5010,6 +5146,18 @@ def positions_once(
         capital = float(getenv_float("CAPITAL", 1000.0))
         min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
 
+        # --- NEW: funding settings (shared with try_instant_open) ---
+        FUNDING_MIN_PCT = float(getenv_float("FUNDING_MIN_PCT", 0.0))
+        max_hold_sec = int(getenv_float("MAX_HOLD_SEC", 0))
+        exp_h = float(getenv_float("EXPECTED_HOLDING_H", 0.0))
+        hold_sec = int(max(0, exp_h * 3600)) if exp_h > 0 else 0
+        # if both are set, be conservative: take min positive
+        if max_hold_sec > 0 and hold_sec > 0:
+            hold_sec = min(max_hold_sec, hold_sec)
+        elif max_hold_sec > 0:
+            hold_sec = max_hold_sec
+        elif hold_sec <= 0:
+            hold_sec = 8 * 3600  # fallback: 1 funding window
         cands["spread_bps"]  = pd.to_numeric(cands.get("spread_bps"), errors="coerce")
         cands["z"]           = pd.to_numeric(cands.get("z"), errors="coerce")
         cands["std"]         = pd.to_numeric(cands.get("std"), errors="coerce")
@@ -5018,8 +5166,52 @@ def positions_once(
         cands["spread_ok"] = cands["spread_bps"] >= float(entry_bps)
         cands["std_ok"]    = cands["std"].notna() & (cands["std"] >= std_min_for_open)
         cands["z_ok"]      = cands["z"].notna() & (cands["z"] >= Z_IN_LOC)
-        cands["eco_ok"]    = cands["net_usd_adj"].notna() & (cands["net_usd_adj"] > min_net_abs)
+        # -------- funding-aware economics (compute funding only for a small top-K subset) --------
+        hold_sec = int(float(getenv_float("FUNDING_HOLD_SEC", getenv_float("MAX_HOLD_SEC", 8*3600))))
+        funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
+        funding_topk = int(getenv_float("FUNDING_TOPK", 80))
 
+        pre = cands[cands["spread_ok"] & cands["std_ok"] & cands["z_ok"]].copy()
+        if not pre.empty and funding_topk > 0:
+            try:
+                pre_sorted = pre.sort_values(["z", "net_usd_adj"], ascending=[False, False]).head(funding_topk)
+                sym_set = sorted(set(pre_sorted["symbol"].astype(str).str.upper().tolist()))
+                ex_set = sorted(set(pre_sorted["long_ex"].astype(str).str.lower().tolist() + pre_sorted["short_ex"].astype(str).str.lower().tolist()))
+                f_cache = _build_funding_cache(sym_set, ex_set)
+
+                def _fund_row(rw):
+                    pct, det = expected_funding_pnl_pct(
+                        rw.get("symbol"), rw.get("long_ex"), rw.get("short_ex"), hold_sec,
+                        reverse_side=False, funding_cache=f_cache
+                    )
+                    if det is None:
+                        det = {}
+                    return pd.Series({
+                        "funding_expected_pct": pct,
+                        "funding_rate_cheap": det.get("rate_cheap"),
+                        "funding_rate_rich": det.get("rate_rich"),
+                        "funding_cycles": det.get("cycles"),
+                        "funding_hold_sec_used": hold_sec,
+                        "funding_min_pct_used": funding_min_pct,
+                    })
+
+                fcols = pre_sorted.apply(_fund_row, axis=1)
+                pre_sorted = pd.concat([pre_sorted, fcols], axis=1)
+                for col in [
+                    "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
+                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                ]:
+                    cands.loc[pre_sorted.index, col] = pre_sorted[col]
+            except Exception as e:
+                logging.debug("positions_once: funding topK compute failed: %s", e)
+
+        cands["funding_expected_pct"] = pd.to_numeric(cands.get("funding_expected_pct"), errors="coerce")
+        cands["funding_expected_usd"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * float(per_leg_notional_usd)
+        cands["net_usd_adj_total"] = cands["net_usd_adj"].fillna(0.0) + cands["funding_expected_usd"].fillna(0.0)
+        cands["eco_ok"]    = cands["net_usd_adj_total"].notna() & (cands["net_usd_adj_total"] > min_net_abs)
+        cands["funding_ok"] = cands["funding_expected_pct"].notna() & (cands["funding_expected_pct"] >= funding_min_pct)
+        if funding_min_pct <= 0:
+            cands["funding_ok"] = True
         # 1) фильтруем только валидные сигналы
         cands = cands[
             cands["z_ok"] &
@@ -5027,6 +5219,63 @@ def positions_once(
             cands["spread_ok"] &
             cands["eco_ok"]
         ].copy()
+        # 1) фильтруем только валидные сигналы (без funding)
+        m = cands["z_ok"] & cands["std_ok"] & cands["spread_ok"] & cands["eco_ok"]
+        cands = cands[m].copy()
+
+        # 1.1) опционально: считаем expected funding только для небольшого top-N,
+        # чтобы выводить в карточке и (если включено) фильтровать.
+        # Funding считается как ожидаемый PnL% по обоим плечам за hold_sec.
+        try:
+            need_funding = (FUNDING_MIN_PCT > 0) or getenv_bool("SHOW_FUNDING_ON_CARD", True)
+            if need_funding and not cands.empty:
+                topN_funding = int(getenv_float("FUNDING_TOPN", max(3, int(top3_to_tg or 3))))
+                pre_sorted = cands.head(topN_funding).copy()
+
+                def _fund_row(rw):
+                    pct, det = expected_funding_pnl_pct(
+                        rw.get("symbol"), rw.get("long_ex"), rw.get("short_ex"),
+                        hold_sec, reverse_side=False
+                    )
+                    det = det or {}
+                    return pd.Series({
+                        "funding_expected_pct": pct,
+                        "funding_rate_cheap": det.get("rate_cheap"),
+                        "funding_rate_rich": det.get("rate_rich"),
+                        "funding_cycles": min(int(det.get("cycles_cheap") or 0), int(det.get("cycles_rich") or 0)),
+                        "funding_hold_sec_used": int(det.get("hold_sec") or hold_sec),
+                        "funding_min_pct_used": FUNDING_MIN_PCT,
+                    })
+
+                fcols = pre_sorted.apply(_fund_row, axis=1)
+                pre_sorted = pd.concat([pre_sorted, fcols], axis=1)
+
+                # funding_ok and net_usd_adj_total (net + funding in USD)
+                pre_sorted["funding_ok"] = True
+                if FUNDING_MIN_PCT > 0:
+                    pre_sorted["funding_ok"] = (
+                        pre_sorted["funding_expected_pct"].notna() &
+                        (pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce") >= FUNDING_MIN_PCT)
+                    )
+
+                fund_usd = (
+                    pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce").fillna(0.0) / 100.0
+                    * (2.0 * float(per_leg_notional_usd))
+                )
+                pre_sorted["net_usd_adj_total"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + fund_usd
+
+                for col in [
+                    "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
+                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                    "funding_ok", "net_usd_adj_total",
+                ]:
+                    cands.loc[pre_sorted.index, col] = pre_sorted[col]
+        except Exception as e:
+            logging.debug("positions_once: funding topN compute failed: %s", e)
+
+        # 1.2) если включён funding-фильтр — режем кандидатов
+        if FUNDING_MIN_PCT > 0 and "funding_ok" in cands.columns:
+            cands = cands[cands["funding_ok"]].copy()
 
         # 2) если после фильтра пусто — fallback
         if cands.empty or cands["z"].isna().all():
@@ -5038,13 +5287,56 @@ def positions_once(
             cands["__rating_z__"] = candidate_rating_z(cands)
             cands["__score__"] = (
                 (cands["z"] + cands["__rating_z__"]) * 10000 +
-                cands["net_usd_adj"].fillna(0)
+                cands.get("net_usd_adj_total", cands["net_usd_adj"]).fillna(0)
             )
             cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
     else:
         # price режим — как раньше
         sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
         cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+        # Optional: attach funding info for the small set we might send to Telegram
+        try:
+            if getenv_bool("SHOW_FUNDING_ON_CARD", True) and not cands.empty:
+                hold_sec = int(float(getenv_float("FUNDING_HOLD_SEC", getenv_float("MAX_HOLD_SEC", 8*3600))))
+                funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
+                topk = max(int(top3_to_tg or 0), int(getenv_float("FUNDING_TOPK", 80)))
+                topk = max(0, min(topk, len(cands)))
+                if topk > 0:
+                    sub = cands.head(topk).copy()
+                    sym_set = sorted(set(sub["symbol"].astype(str).str.upper().tolist()))
+                    ex_set = sorted(set(sub["long_ex"].astype(str).str.lower().tolist() + sub["short_ex"].astype(str).str.lower().tolist()))
+                    f_cache = _build_funding_cache(sym_set, ex_set)
+
+                    def _fund_row_price(rw):
+                        pct, det = expected_funding_pnl_pct(
+                            rw.get("symbol"), rw.get("long_ex"), rw.get("short_ex"), hold_sec,
+                            reverse_side=False, funding_cache=f_cache
+                        )
+                        if det is None:
+                            det = {}
+                        return pd.Series({
+                            "funding_expected_pct": pct,
+                            "funding_rate_cheap": det.get("rate_cheap"),
+                            "funding_rate_rich": det.get("rate_rich"),
+                            "funding_cycles": det.get("cycles"),
+                            "funding_hold_sec_used": hold_sec,
+                            "funding_min_pct_used": funding_min_pct,
+                        })
+
+                    fcols = sub.apply(_fund_row_price, axis=1)
+                    sub = pd.concat([sub, fcols], axis=1)
+                    for col in [
+                        "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
+                        "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                    ]:
+                        cands.loc[sub.index, col] = sub[col]
+
+                    cands["funding_expected_pct"] = pd.to_numeric(cands.get("funding_expected_pct"), errors="coerce")
+                    cands["funding_expected_usd"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * float(per_leg_notional_usd)
+                    cands["net_usd_adj_total"] = pd.to_numeric(cands.get("net_usd_adj"), errors="coerce").fillna(0.0) + cands["funding_expected_usd"].fillna(0.0)
+        except Exception as e:
+            logging.debug("positions_once: funding attach (price mode) failed: %s", e)
 
     best = None
     if not cands.empty:
