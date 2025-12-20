@@ -6396,7 +6396,7 @@ def main():
                 try: ip = requests.get("https://api.ipify.org", timeout=3).text
                 except: ip = "unknown"
 
-                msg = "Private API auth check failed — verify API keys/permissions/network.\n🌐 Outgoing IP: {ip}"
+                msg = f"Private API auth check failed — verify API keys/permissions/network.\n🌐 Outgoing IP: {ip}"
                 logging.error(msg)
                 if must_quit:
                     maybe_send_telegram(f"❌ {msg}")
