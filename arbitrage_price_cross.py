@@ -10,7 +10,79 @@ import numpy as np
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
 
- # === Env helpers: куда ходим за котировками и куда отправляем ордера ===
+
+RUN_ID = os.getenv("RUN_ID", True) or uuid.uuid4().hex[:10]
+
+_CARDLOG_LOCAL: Optional[str] = None
+_CARDLOG_LAST_UPLOAD_TS: float = 0.0
+_CARDLOG_PENDING_LINES: int = 0
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def gcs_upload_text(gs_path: str, text: str, content_type: str = "text/plain") -> None:
+    """Overwrite object in GCS with given text."""
+    if not is_gs(gs_path):
+        raise ValueError(f"Not a gs:// path: {gs_path}")
+    client = gcs_client()
+    bucket_name, blob_name = gs_path.replace("gs://", "", 1).split("/", 1)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(text.encode("utf-8"), content_type=content_type)
+
+def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
+    """Append event JSONL to ONE local file then periodically overwrite ONE gs:// file.
+
+    This produces a single growing file in GCS (append semantics), reliable on Render.
+    """
+    global _CARDLOG_LOCAL, _CARDLOG_LAST_UPLOAD_TS, _CARDLOG_PENDING_LINES
+
+    gs_path = bucketize_path(getenv_str("CARD_LOG_JSONL_PATH", ""))
+    if not gs_path or not is_gs(gs_path):
+        return
+
+    # local file per run/day (safe for restarts)
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    if _CARDLOG_LOCAL is None:
+        _CARDLOG_LOCAL = f"/tmp/tg_cards_{day}_{RUN_ID}.jsonl"
+
+    # enrich & append locally
+    try:
+        evt = dict(event or {})
+        evt["_ts_utc"] = evt.get("_ts_utc") or _utc_iso()
+        evt["_run_id"] = evt.get("_run_id") or RUN_ID
+        with open(_CARDLOG_LOCAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+        _CARDLOG_PENDING_LINES += 1
+    except Exception as e:
+        logging.debug("cardlog local append failed: %s", e)
+        return
+
+    upload_every_sec = float(getenv_float("CARD_LOG_UPLOAD_EVERY_SEC", 10.0))
+    upload_every_lines = int(getenv_float("CARD_LOG_UPLOAD_EVERY_LINES", 50))
+    now_ts = time.time()
+
+    if (not force) and (_CARDLOG_PENDING_LINES < upload_every_lines) and (now_ts - _CARDLOG_LAST_UPLOAD_TS < upload_every_sec):
+        return
+
+    # overwrite single object in GCS with accumulated local file
+    try:
+        with open(_CARDLOG_LOCAL, "r", encoding="utf-8") as f:
+            data = f.read()
+        gcs_upload_text(gs_path, data, content_type="text/plain")
+        _CARDLOG_LAST_UPLOAD_TS = now_ts
+        _CARDLOG_PENDING_LINES = 0
+    except Exception as e:
+        logging.debug("cardlog upload failed: %s", e)
+
+def cardlog_flush() -> None:
+    """Force upload pending lines to GCS."""
+    try:
+        cardlog_append({"type": "flush"}, force=True)
+    except Exception:
+        pass
+
+# === Env helpers: куда ходим за котировками и куда отправляем ордера ===
 def price_feed_env() -> str:
     # Котировки всегда читаем с mainnet
     return "mainnet"
@@ -372,6 +444,176 @@ def getenv_list(k: str, default_list: List[str]) -> List[str]:
     if v is None or v.strip()=="":
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
+
+# ----------------- Unified entry filters (avoid duplicates) -----------------
+RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
+
+def compute_entry_flags(
+    entry_mode: str,
+    spread_bps: float,
+    net_adj: Optional[float],
+    z: Optional[float],
+    std: Optional[float],
+    entry_spread_bps: float,
+    min_net_abs: float,
+    z_in: float,
+    std_min: float,
+) -> Dict[str, Any]:
+    """Single source of truth for eco_ok / spread_ok / z_ok / std_ok.
+
+    IMPORTANT: eco_ok compares net_adj (already slippage-adjusted or total-adjusted, depending on caller)
+    against min_net_abs (derived from ENTRY_NET_PCT * CAPITAL).
+    """
+    def _is_num(x: Any) -> bool:
+        try:
+            return x is not None and float(x) == float(x)
+        except Exception:
+            return False
+
+    spread_ok = float(spread_bps) >= float(entry_spread_bps)
+
+    eco_ok = False
+    if _is_num(net_adj):
+        eco_ok = float(net_adj) > float(min_net_abs)
+
+    entry_mode = (entry_mode or "price").lower()
+    if entry_mode == "zscore":
+        z_ok = _is_num(z) and float(z) >= float(z_in)
+        std_ok = _is_num(std) and float(std) >= float(std_min)
+    else:
+        z_ok, std_ok = True, True
+
+    return {
+        "eco_ok": bool(eco_ok),
+        "spread_ok": bool(spread_ok),
+        "z_ok": bool(z_ok),
+        "std_ok": bool(std_ok),
+        "entry_mode": entry_mode,
+        "entry_spread_bps": float(entry_spread_bps),
+        "min_net_abs": float(min_net_abs),
+        "z_in": float(z_in),
+        "std_min": float(std_min),
+    }
+
+# ----------------- GCS JSONL event logging -----------------
+_TG_LOG_LOCAL = None  # type: Optional[str]
+_TG_LOG_LAST_UPLOAD_TS = 0.0
+_TG_LOG_LINES = 0
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def gcs_upload_bytes(gs_path: str, data: bytes, content_type: str = "application/json") -> None:
+    client = gcs_client()
+    bucket_name = gs_path[5:].split("/", 1)[0]
+    blob_name = gs_path[5 + len(bucket_name) + 1 :]
+    bucket = client.lookup_bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(data, content_type=content_type)
+
+def log_event_gcs(event: Dict[str, Any], force: bool = False) -> None:
+    """Write JSONL logs for every TG card / decision into GCS.
+
+    Strategy: append locally to /tmp and periodically upload (overwrite) a run-scoped file in GCS.
+    This avoids expensive GCS "append" patterns while keeping logs near-real-time.
+    """
+    global _TG_LOG_LOCAL, _TG_LOG_LAST_UPLOAD_TS, _TG_LOG_LINES
+    gs_path = bucketize_path(getenv_str("TG_LOG_JSONL_PATH", ""))
+    if not gs_path or not is_gs(gs_path):
+        return
+
+    # local file per run + date
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    if _TG_LOG_LOCAL is None:
+        _TG_LOG_LOCAL = f"/tmp/tg_cards_{day}_{RUN_ID}.jsonl"
+
+    try:
+        os.makedirs(os.path.dirname(_TG_LOG_LOCAL), exist_ok=True)
+        with open(_TG_LOG_LOCAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        _TG_LOG_LINES += 1
+    except Exception as e:
+        logging.debug("log_event_gcs local write failed: %s", e)
+        return
+
+    upload_every_sec = float(getenv_float("TG_LOG_UPLOAD_EVERY_SEC", 10.0))
+    upload_every_lines = int(getenv_float("TG_LOG_UPLOAD_EVERY_LINES", 25))
+    now_ts = time.time()
+
+    if (not force) and (_TG_LOG_LINES < upload_every_lines) and (now_ts - _TG_LOG_LAST_UPLOAD_TS < upload_every_sec):
+        return
+
+    # upload (overwrite) run file
+    try:
+        with open(_TG_LOG_LOCAL, "rb") as f:
+            data = f.read()
+        gcs_upload_bytes(gs_path, data, content_type="text/plain")
+        _TG_LOG_LAST_UPLOAD_TS = now_ts
+        _TG_LOG_LINES = 0
+    except Exception as e:
+        logging.debug("log_event_gcs upload failed: %s", e)
+
+# ----------------- entry filters (dedup) -----------------
+def compute_entry_filters(best: Dict[str, Any], entry_bps: float, entry_mode: Optional[str] = None) -> Dict[str, Any]:
+    """Единая логика фильтров входа (eco_ok / z_ok / std_ok / spread_ok).
+    Wrapper над compute_entry_flags(): читаем пороги из env и возвращаем flags + факты,
+    чтобы Telegram-карточка и реальная логика открытия всегда совпадали.
+    """
+    mode = (entry_mode or getenv_str("ENTRY_MODE", "price")).strip().lower()
+
+    # raw facts (не подменяем None на 0)
+    spread_bps = float(best.get("spread_bps") or 0.0)
+    net_adj_raw = best.get("net_usd_adj")  # может быть None
+    z_raw = best.get("z")
+    std_raw = best.get("std")
+
+    def _to_num_or_none(v):
+        try:
+            if v is None:
+                return None
+            x = float(v)
+            # nan -> None
+            return x if (x == x) else None
+        except Exception:
+            return None
+
+    net_adj = _to_num_or_none(net_adj_raw)
+    z = _to_num_or_none(z_raw)
+    std = _to_num_or_none(std_raw)
+
+    # thresholds (как в try_instant_open)
+    capital = float(getenv_float("CAPITAL", 1000.0))
+    min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0)) / 100.0) * capital
+    z_in = float(getenv_float("Z_IN", 2.0))
+    std_min = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+
+    flags = compute_entry_flags(
+        entry_mode=mode,
+        spread_bps=spread_bps,
+        net_adj=net_adj,
+        z=z,
+        std=std,
+        entry_spread_bps=float(entry_bps),
+        min_net_abs=float(min_net_abs),
+        z_in=float(z_in),
+        std_min=float(std_min),
+    )
+
+    # возвращаем совместимый payload (старые ключи тоже оставляем)
+    return {
+        "mode": mode,
+        "spread_ok": bool(flags["spread_ok"]),
+        "eco_ok": bool(flags["eco_ok"]),
+        "z_ok": bool(flags["z_ok"]),
+        "std_ok": bool(flags["std_ok"]),
+        "spread_bps": spread_bps,
+        "net_usd_adj": net_adj_raw,
+        "min_net_abs": min_net_abs,
+        "z": z_raw,
+        "z_in": z_in,
+        "std": std_raw,
+        "std_min": std_min,
+    }
 
 # ----------------- logging -----------------
 logging.basicConfig(
@@ -1051,6 +1293,10 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"🕒 {ts}",
     ])
 
+    # defaults to keep linters happy even if SHOW_ENTRY_FILTERS=False
+    eco_ok = False; spread_ok = False; z_ok = False; std_ok = False
+
+    _f = {"z_in": None, "std_min": None, "min_net_abs": None}
     if getenv_bool("SHOW_ENTRY_FILTERS", False):
         # режим открытия
         entry_mode = getenv_str("ENTRY_MODE", "price").lower()
@@ -1074,10 +1320,15 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 net_for_eco = float(net_total_rec)
         except Exception:
             pass
-        eco_ok    = (net_for_eco is not None) and (net_for_eco == net_for_eco) and (float(net_for_eco) > min_net_abs)
-        spread_ok = sp_bps >= entry_bps
-        z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
-        std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
+
+        # единый расчёт фильтров (чтобы карточка/логика совпадали везде)
+        _best_for_filters = dict(r) if isinstance(r, dict) else {}
+        _best_for_filters.update({"spread_bps": sp_bps, "net_usd_adj": net_for_eco, "z": z, "std": std})
+        _f = compute_entry_filters(_best_for_filters, float(entry_bps), entry_mode)
+        eco_ok = bool(_f["eco_ok"])
+        spread_ok = bool(_f["spread_ok"])
+        z_ok = bool(_f["z_ok"])
+        std_ok = bool(_f["std_ok"])
 
         def _flag(ok: bool) -> str:
             return "✅" if ok else "❌"
@@ -1240,7 +1491,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.41</b>")
+    lines.append(f"\n<b> ver: 2.42</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1277,6 +1528,72 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             )
     except Exception as e:
         lines.append("\n🚫 <b>Ошибка</b>NEW: show exact open skip reasons. %e\n")
+    # --- Log all card-relevant metrics to GCS (JSONL) ---
+    try:
+        evt = {
+            "type": "tg_card",
+            "ts_utc": _now_utc_iso(),
+            "run_id": RUN_ID,
+            "symbol": sym,
+            "long_ex": long_ex,
+            "short_ex": short_ex,
+            "price_source": price_source,
+            "per_leg_notional_usd": float(per_leg_notional_usd),
+            "spread_pct": float(sp_pct),
+            "spread_bps": float(sp_bps),
+            "px_low": float(px_low),
+            "px_high": float(px_high),
+            "gross_usd": float(gross),
+            "fees_roundtrip_usd": float(fees_rt),
+            "net_usd": float(net_usd),
+            "net_usd_adj": (None if net_usd_adj is None else float(net_usd_adj)),
+            "net_usd_adj_total": r.get("net_usd_adj_total", None),
+            "funding_expected_pct": r.get("funding_expected_pct", None),
+            "funding_rate_cheap": r.get("funding_rate_cheap", None),
+            "funding_rate_rich": r.get("funding_rate_rich", None),
+            "funding_cycles": r.get("funding_cycles", None),
+            "funding_hold_sec_used": r.get("funding_hold_sec_used", None),
+            "funding_min_pct_used": r.get("funding_min_pct_used", None),
+            "funding_ok": r.get("funding_ok", None),
+            "z": z,
+            "std": std,
+            "entry_mode_used": r.get("entry_mode_used", None),
+            "z_in_used": r.get("z_in_used", None),
+            "entry_bps_used": r.get("entry_bps_used", None),
+            "std_min_for_open_used": r.get("std_min_for_open_used", None),
+            "min_net_abs_used": r.get("min_net_abs_used", None),
+            "eco_ok": r.get("eco_ok", None),
+            "spread_ok": r.get("spread_ok", None),
+            "z_ok": r.get("z_ok", None),
+            "std_ok": r.get("std_ok", None),
+            "stats_ok": r.get("stats_ok", None),
+            "count": r.get("count", None),
+            "ema_var": r.get("ema_var", None),
+            "updated_ms": r.get("updated_ms", None),
+            "px_low_confirm": r.get("px_low_confirm", None),
+            "px_high_confirm": r.get("px_high_confirm", None),
+            "spread_bps_confirm": r.get("spread_bps_confirm", None),
+            "spread_ok_confirm": r.get("spread_ok_confirm", None),
+            "eco_ok_confirm": r.get("eco_ok_confirm", None),
+            "z_ok_confirm": r.get("z_ok_confirm", None),
+            "std_ok_confirm": r.get("std_ok_confirm", None),
+            "open_skip_reasons": r.get("_open_skip_reasons", None),
+        }
+        log_event_gcs(evt)
+    except Exception:
+        pass
+
+    # ---- append card metrics to ONE jsonl file in GCS ----
+    try:
+        # логируем весь рекорд r + полезные контекстные поля
+        payload = dict(r or {})
+        payload["type"] = "tg_card"
+        payload["price_source"] = price_source
+        payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
+        cardlog_append(payload)
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 def maybe_send_telegram(text: str) -> None:
@@ -2366,15 +2683,27 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     best["std_min_for_open_used"] = std_min_for_open
     best["min_net_abs_used"] = min_net_abs
 
-    eco_ok = (net_adj == net_adj) and (net_adj > min_net_abs)
-    spread_ok = spread_bps >= ENTRY_SPREAD_BPS
-    z_ok = (z == z) and (z >= Z_IN)
-    std_ok = (std == std) and (std >= std_min_for_open)
+    flags = compute_entry_flags(
+        ENTRY_MODE,
+        spread_bps=float(spread_bps),
+        net_adj=(float(net_adj) if (net_adj == net_adj) else None),
+        z=(float(z) if (z == z) else None),
+        std=(float(std) if (std == std) else None),
+        entry_spread_bps=float(ENTRY_SPREAD_BPS),
+        min_net_abs=float(min_net_abs),
+        z_in=float(Z_IN),
+        std_min=float(std_min_for_open),
+    )
 
-    best["eco_ok"] = eco_ok
-    best["spread_ok"] = spread_ok
-    best["z_ok"] = z_ok
-    best["std_ok"] = std_ok
+    best["eco_ok"] = bool(flags["eco_ok"])
+    best["spread_ok"] = bool(flags["spread_ok"])
+    best["z_ok"] = bool(flags["z_ok"])
+    best["std_ok"] = bool(flags["std_ok"])
+    # keep local vars in sync (used below in precheck reject messages)
+    eco_ok = bool(flags["eco_ok"])
+    spread_ok = bool(flags["spread_ok"])
+    z_ok = bool(flags["z_ok"])
+    std_ok = bool(flags["std_ok"])
 
     if ENTRY_MODE == "zscore":
         if not (eco_ok and z_ok and std_ok):
@@ -3187,40 +3516,11 @@ def scan_spreads_once(
     best["z"] = z
     best["std"] = std
 
-    # --- LAZY-FIX: если z/std так и остались None, пересчитываем их как в карточке ---
-    if (z is None) or (std is None):
-        try:
-            stats_df2 = read_spread_stats()
-            px_low = float(best.get("px_low") or 0.0)
-            px_high = float(best.get("px_high") or 0.0)
-            sym = str(best.get("symbol") or "")
-            ex_low = str(best.get("long_ex") or best.get("cheap_ex") or "").lower()
-            ex_high = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
-
-            if sym and px_low > 0 and px_high > 0 and ex_low and ex_high:
-                _, z2, std2 = get_z_for_pair(
-                    stats_df2,
-                    symbol=sym,
-                    ex_low=ex_low,
-                    ex_high=ex_high,
-                    px_low=px_low,
-                    px_high=px_high,
-                )
-                if z2 == z2:   # not NaN
-                    z = float(z2)
-                if std2 == std2:
-                    std = float(std2)
-        except Exception:
-            pass
-
-    # держим best синхронизированным с очищенными/пересчитанными значениями
-    best["z"] = z
-    best["std"] = std
-
-    spread_ok = spread_bps >= float(spread_bps_min)
-    eco_ok = net_usd_adj > 0
-    z_ok = (z is not None) and (z >= Z_IN_LOC)
-    std_ok = (std is not None) and (std >= std_min_for_open)
+    filters = compute_entry_filters(best, float(spread_bps_min), entry_mode_loc)
+    spread_ok = bool(filters["spread_ok"])
+    eco_ok = bool(filters["eco_ok"])
+    z_ok = bool(filters["z_ok"])
+    std_ok = bool(filters["std_ok"])
 
     cond_open = (
         open_in_scanner
@@ -3240,12 +3540,12 @@ def scan_spreads_once(
             f"• cond_open = `{cond_open}`\n"
             f"• has_open = `{has_open}`\n"
             f"• ENTRY_MODE = `{entry_mode_loc}`\n"
-           f"• Z_IN = `{Z_IN_LOC}`\n"
-            f"• std_min = `{std_min_for_open}`\n"
+            f"• Z_IN = `{filters['z_in']}`\n"
+            f"• std_min = `{filters['std_min']}`\n"
             f"• spread_ok = `{spread_ok}` ({spread_bps:.1f} ≥ {float(spread_bps_min):.1f})\n"
-            f"• eco_ok = `{eco_ok}` (net_adj={net_usd_adj:.4f})\n"
-            f"• z_ok = `{z_ok}` (z={z})\n"
-            f"• std_ok = `{std_ok}` (std={std})\n"
+            f"• eco_ok = `{eco_ok}` (net_adj={net_usd_adj} > {filters['min_net_abs']:.2f})\n"
+            f"• z_ok = `{z_ok}` (z={z} ≥ {filters['z_in']})\n"
+            f"• std_ok = `{std_ok}` (std={std} ≥ {filters['std_min']})\n"
         )
         maybe_send_telegram(card)
 
@@ -6087,14 +6387,21 @@ def positions_once(
         capital  = float(getenv_float("CAPITAL", 1000.0))
         min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
 
-        spread_ok = spread_bps >= float(entry_bps)
-        eco_ok    = net_adj > min_net_abs
-
-        if entry_mode_loc == "zscore":
-            z_ok   = (z == z) and (z >= Z_IN_LOC)
-            std_ok = (std == std) and (std >= std_min)
-        else:
-            z_ok, std_ok = True, True
+        flags = compute_entry_flags(
+            entry_mode_loc,
+            spread_bps=float(spread_bps),
+            net_adj=(float(net_adj) if (net_adj == net_adj) else None),
+            z=(float(z) if (z == z) else None),
+            std=(float(std) if (std == std) else None),
+            entry_spread_bps=float(entry_bps),
+            min_net_abs=float(min_net_abs),
+            z_in=float(Z_IN_LOC),
+            std_min=float(std_min),
+        )
+        spread_ok = bool(flags["spread_ok"])
+        eco_ok    = bool(flags["eco_ok"])
+        z_ok      = bool(flags["z_ok"])
+        std_ok    = bool(flags["std_ok"])
 
         if spread_ok and eco_ok and z_ok and std_ok:
             _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
@@ -6581,4 +6888,8 @@ def main():
         time.sleep(max(3, sleep_s))
 
 if __name__ == "__main__":
-    main()
+     try:
+         main()
+     finally:
+        # гарантируем, что последние строки долетят в один файл в GCS
+        cardlog_flush()
