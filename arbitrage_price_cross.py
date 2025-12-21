@@ -81,41 +81,6 @@ def cardlog_flush() -> None:
         cardlog_append({"type": "flush"}, force=True)
     except Exception:
         pass
-# ----------------- Cardlog: dedup (avoid double writes) -----------------
-_CARDLOG_DEDUP: Dict[str, float] = {}
-_CARDLOG_DEDUP_TTL_SEC = float(getenv_float("CARD_LOG_DEDUP_TTL_SEC", 120.0))
-
-def _cardlog_fingerprint(evt: Dict[str, Any]) -> str:
-    # stable fingerprint based on key trading fields (same card => same id)
-    keys = [
-        "symbol","long_ex","short_ex","cheap_ex","rich_ex",
-        "px_low","px_high","spread_bps","z","std",
-        "net_usd_adj","net_usd_adj_total",
-        "eco_ok","spread_ok","z_ok","std_ok","stats_ok",
-        "funding_expected_pct","funding_ok",
-        "entry_mode_used","z_in_used","entry_bps_used","std_min_for_open_used","min_net_abs_used",
-    ]
-    core = {k: evt.get(k) for k in keys if k in evt}
-    blob = json.dumps(core, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
-
-def cardlog_append_once(event: Dict[str, Any], force: bool = False) -> None:
-    """Dedup wrapper around cardlog_append() to guarantee one JSON per event."""
-    try:
-        evt = dict(event or {})
-        eid = str(evt.get("_event_id") or _cardlog_fingerprint(evt))
-        evt["_event_id"] = eid
-        now = time.time()
-        # cleanup old
-        for k, ts in list(_CARDLOG_DEDUP.items()):
-            if now - ts > _CARDLOG_DEDUP_TTL_SEC:
-                _CARDLOG_DEDUP.pop(k, None)
-        if eid in _CARDLOG_DEDUP:
-            return
-        _CARDLOG_DEDUP[eid] = now
-        cardlog_append(evt, force=force)
-    except Exception:
-        pass
 
 # === Env helpers: куда ходим за котировками и куда отправляем ордера ===
 def price_feed_env() -> str:
@@ -480,6 +445,41 @@ def getenv_list(k: str, default_list: List[str]) -> List[str]:
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
 
+# ----------------- Cardlog: dedup (avoid double writes) -----------------
+_CARDLOG_DEDUP: Dict[str, float] = {}
+_CARDLOG_DEDUP_TTL_SEC = float(getenv_float("CARD_LOG_DEDUP_TTL_SEC", 120.0))
+
+def _cardlog_fingerprint(evt: Dict[str, Any]) -> str:
+    # stable fingerprint based on key trading fields (same card => same id)
+    keys = [
+        "symbol","long_ex","short_ex","cheap_ex","rich_ex",
+        "px_low","px_high","spread_bps","z","std",
+        "net_usd_adj","net_usd_adj_total",
+        "eco_ok","spread_ok","z_ok","std_ok","stats_ok",
+        "funding_expected_pct","funding_ok",
+        "entry_mode_used","z_in_used","entry_bps_used","std_min_for_open_used","min_net_abs_used",
+    ]
+    core = {k: evt.get(k) for k in keys if k in evt}
+    blob = json.dumps(core, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+def cardlog_append_once(event: Dict[str, Any], force: bool = False) -> None:
+    """Dedup wrapper around cardlog_append() to guarantee one JSON per event."""
+    try:
+        evt = dict(event or {})
+        eid = str(evt.get("_event_id") or _cardlog_fingerprint(evt))
+        evt["_event_id"] = eid
+        now = time.time()
+        # cleanup old
+        for k, ts in list(_CARDLOG_DEDUP.items()):
+            if now - ts > _CARDLOG_DEDUP_TTL_SEC:
+                _CARDLOG_DEDUP.pop(k, None)
+        if eid in _CARDLOG_DEDUP:
+            return
+        _CARDLOG_DEDUP[eid] = now
+        cardlog_append(evt, force=force)
+    except Exception:
+        pass
 # ----------------- Unified entry filters (avoid duplicates) -----------------
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
 
