@@ -81,6 +81,41 @@ def cardlog_flush() -> None:
         cardlog_append({"type": "flush"}, force=True)
     except Exception:
         pass
+# ----------------- Cardlog: dedup (avoid double writes) -----------------
+_CARDLOG_DEDUP: Dict[str, float] = {}
+_CARDLOG_DEDUP_TTL_SEC = float(getenv_float("CARD_LOG_DEDUP_TTL_SEC", 120.0))
+
+def _cardlog_fingerprint(evt: Dict[str, Any]) -> str:
+    # stable fingerprint based on key trading fields (same card => same id)
+    keys = [
+        "symbol","long_ex","short_ex","cheap_ex","rich_ex",
+        "px_low","px_high","spread_bps","z","std",
+        "net_usd_adj","net_usd_adj_total",
+        "eco_ok","spread_ok","z_ok","std_ok","stats_ok",
+        "funding_expected_pct","funding_ok",
+        "entry_mode_used","z_in_used","entry_bps_used","std_min_for_open_used","min_net_abs_used",
+    ]
+    core = {k: evt.get(k) for k in keys if k in evt}
+    blob = json.dumps(core, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+def cardlog_append_once(event: Dict[str, Any], force: bool = False) -> None:
+    """Dedup wrapper around cardlog_append() to guarantee one JSON per event."""
+    try:
+        evt = dict(event or {})
+        eid = str(evt.get("_event_id") or _cardlog_fingerprint(evt))
+        evt["_event_id"] = eid
+        now = time.time()
+        # cleanup old
+        for k, ts in list(_CARDLOG_DEDUP.items()):
+            if now - ts > _CARDLOG_DEDUP_TTL_SEC:
+                _CARDLOG_DEDUP.pop(k, None)
+        if eid in _CARDLOG_DEDUP:
+            return
+        _CARDLOG_DEDUP[eid] = now
+        cardlog_append(evt, force=force)
+    except Exception:
+        pass
 
 # === Env helpers: куда ходим за котировками и куда отправляем ордера ===
 def price_feed_env() -> str:
@@ -1491,7 +1526,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.42</b>")
+    lines.append(f"\n<b> ver: 2.43</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1528,69 +1563,98 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             )
     except Exception as e:
         lines.append("\n🚫 <b>Ошибка</b>NEW: show exact open skip reasons. %e\n")
-    # --- Log all card-relevant metrics to GCS (JSONL) ---
-    try:
-        evt = {
-            "type": "tg_card",
-            "ts_utc": _now_utc_iso(),
-            "run_id": RUN_ID,
-            "symbol": sym,
-            "long_ex": long_ex,
-            "short_ex": short_ex,
-            "price_source": price_source,
-            "per_leg_notional_usd": float(per_leg_notional_usd),
-            "spread_pct": float(sp_pct),
-            "spread_bps": float(sp_bps),
-            "px_low": float(px_low),
-            "px_high": float(px_high),
-            "gross_usd": float(gross),
-            "fees_roundtrip_usd": float(fees_rt),
-            "net_usd": float(net_usd),
-            "net_usd_adj": (None if net_usd_adj is None else float(net_usd_adj)),
-            "net_usd_adj_total": r.get("net_usd_adj_total", None),
-            "funding_expected_pct": r.get("funding_expected_pct", None),
-            "funding_rate_cheap": r.get("funding_rate_cheap", None),
-            "funding_rate_rich": r.get("funding_rate_rich", None),
-            "funding_cycles": r.get("funding_cycles", None),
-            "funding_hold_sec_used": r.get("funding_hold_sec_used", None),
-            "funding_min_pct_used": r.get("funding_min_pct_used", None),
-            "funding_ok": r.get("funding_ok", None),
-            "z": z,
-            "std": std,
-            "entry_mode_used": r.get("entry_mode_used", None),
-            "z_in_used": r.get("z_in_used", None),
-            "entry_bps_used": r.get("entry_bps_used", None),
-            "std_min_for_open_used": r.get("std_min_for_open_used", None),
-            "min_net_abs_used": r.get("min_net_abs_used", None),
-            "eco_ok": r.get("eco_ok", None),
-            "spread_ok": r.get("spread_ok", None),
-            "z_ok": r.get("z_ok", None),
-            "std_ok": r.get("std_ok", None),
-            "stats_ok": r.get("stats_ok", None),
-            "count": r.get("count", None),
-            "ema_var": r.get("ema_var", None),
-            "updated_ms": r.get("updated_ms", None),
-            "px_low_confirm": r.get("px_low_confirm", None),
-            "px_high_confirm": r.get("px_high_confirm", None),
-            "spread_bps_confirm": r.get("spread_bps_confirm", None),
-            "spread_ok_confirm": r.get("spread_ok_confirm", None),
-            "eco_ok_confirm": r.get("eco_ok_confirm", None),
-            "z_ok_confirm": r.get("z_ok_confirm", None),
-            "std_ok_confirm": r.get("std_ok_confirm", None),
-            "open_skip_reasons": r.get("_open_skip_reasons", None),
-        }
-        log_event_gcs(evt)
-    except Exception:
-        pass
 
-    # ---- append card metrics to ONE jsonl file in GCS ----
+    # ---- log ONE JSON per TG card/tick to GCS (no duplicates) ----
     try:
-        # логируем весь рекорд r + полезные контекстные поля
         payload = dict(r or {})
         payload["type"] = "tg_card"
         payload["price_source"] = price_source
         payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
-        cardlog_append(payload)
+        # Ensure required fields exist BEFORE writing
+        entry_mode_used = str(payload.get("entry_mode_used") or getenv_str("ENTRY_MODE", "price")).lower()
+        z_in_used = float(payload.get("z_in_used") or getenv_float("Z_IN", 2.0))
+        entry_bps_used = float(payload.get("entry_bps_used") or getenv_float("ENTRY_SPREAD_BPS", 0.0))
+        std_min_used = float(payload.get("std_min_for_open_used") or getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        capital = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs_used = float(payload.get("min_net_abs_used") or (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital)
+
+        payload["entry_mode_used"] = entry_mode_used
+        payload["z_in_used"] = z_in_used
+        payload["entry_bps_used"] = entry_bps_used
+        payload["std_min_for_open_used"] = std_min_used
+        payload["min_net_abs_used"] = min_net_abs_used
+
+        # normalize skip reasons
+        if payload.get("open_skip_reasons") is None:
+            payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
+        if not isinstance(payload.get("open_skip_reasons"), list):
+            payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
+
+        # stats_ok fallback
+        if payload.get("stats_ok") is None:
+            try:
+                stdv = float(payload.get("std"))
+                payload["stats_ok"] = bool((stdv == stdv) and (stdv > 0))
+            except Exception:
+                payload["stats_ok"] = False
+
+        # funding_ok fallback
+        try:
+            fmin = float(payload.get("funding_min_pct_used") or getenv_float("FUNDING_MIN_PCT", 0.0))
+        except Exception:
+            fmin = 0.0
+        payload["funding_min_pct_used"] = payload.get("funding_min_pct_used", fmin)
+        if payload.get("funding_ok") is None:
+            if fmin <= 0:
+                payload["funding_ok"] = True
+            else:
+                try:
+                    fexp = float(payload.get("funding_expected_pct"))
+                    payload["funding_ok"] = (fexp == fexp) and (fexp >= fmin)
+                except Exception:
+                    payload["funding_ok"] = False
+
+        # entry flags fallback: eco/spread/z/std
+        if any(payload.get(k) is None for k in ("eco_ok", "spread_ok", "z_ok", "std_ok")):
+            try:
+                spread_bps = float(payload.get("spread_bps") or 0.0)
+            except Exception:
+                spread_bps = 0.0
+
+            net_total = payload.get("net_usd_adj_total")
+            if net_total is None:
+                net_total = payload.get("net_usd_adj")
+            try:
+                net_total_f = float(net_total) if net_total is not None else None
+            except Exception:
+                net_total_f = None
+
+            try:
+                z_f = float(payload.get("z")) if payload.get("z") is not None else None
+            except Exception:
+                z_f = None
+            try:
+                std_f = float(payload.get("std")) if payload.get("std") is not None else None
+            except Exception:
+                std_f = None
+
+            flags = compute_entry_flags(
+                entry_mode_used,
+                spread_bps=spread_bps,
+                net_adj=net_total_f,
+                z=z_f,
+                std=std_f,
+                entry_spread_bps=float(entry_bps_used),
+                min_net_abs=float(min_net_abs_used),
+                z_in=float(z_in_used),
+                std_min=float(std_min_used),
+            )
+            for k in ("eco_ok", "spread_ok", "z_ok", "std_ok"):
+                if payload.get(k) is None:
+                    payload[k] = bool(flags.get(k))
+
+        # write once (dedup inside)
+        cardlog_append_once(payload)
     except Exception:
         pass
 
