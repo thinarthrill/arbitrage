@@ -12,6 +12,9 @@ load_dotenv()
 
 
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
+_CARDLOG_WARNED_NO_GCS: bool = False
+_CARDLOG_WARNED_BAD_PATH: bool = False
+_CARDLOG_WARNED_UPLOAD_FAIL: bool = False
 
 _CARDLOG_LOCAL: Optional[str] = None
 _CARDLOG_LAST_UPLOAD_TS: float = 0.0
@@ -37,8 +40,24 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
     """
     global _CARDLOG_LOCAL, _CARDLOG_LAST_UPLOAD_TS, _CARDLOG_PENDING_LINES
 
-    gs_path = bucketize_path(getenv_str("CARD_LOG_JSONL_PATH", ""))
+    global _CARDLOG_WARNED_NO_GCS, _CARDLOG_WARNED_BAD_PATH, _CARDLOG_WARNED_UPLOAD_FAIL
+
+    gs_raw = getenv_str("CARD_LOG_JSONL_PATH", "").strip()
+    gs_path = bucketize_path(gs_raw)
     if not gs_path or not is_gs(gs_path):
+        # если env задан, но путь не gs:// — покажем один раз
+        if gs_raw and (not _CARDLOG_WARNED_BAD_PATH):
+            _CARDLOG_WARNED_BAD_PATH = True
+            logging.warning("CARD_LOG_JSONL_PATH is set but not a gs:// path after bucketize: raw=%r -> %r",
+                            gs_raw, gs_path)
+        return
+
+    # Если библиотека GCS недоступна — раньше это выстреливало исключением и молча глушилось ниже
+    if not GCS_AVAILABLE:
+        if not _CARDLOG_WARNED_NO_GCS:
+            _CARDLOG_WARNED_NO_GCS = True
+            logging.warning("GCS logging disabled: google-cloud-storage is not available. "
+                            "Install google-cloud-storage or ensure it's in requirements.")
         return
 
     # local file per run/day (safe for restarts)
@@ -55,7 +74,7 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
         _CARDLOG_PENDING_LINES += 1
     except Exception as e:
-        logging.debug("cardlog local append failed: %s", e)
+        logging.warning("cardlog local append failed: %s", e)
         return
 
     upload_every_sec = float(getenv_float("CARD_LOG_UPLOAD_EVERY_SEC", 10.0))
@@ -73,7 +92,12 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
         _CARDLOG_LAST_UPLOAD_TS = now_ts
         _CARDLOG_PENDING_LINES = 0
     except Exception as e:
-        logging.debug("cardlog upload failed: %s", e)
+        # ВАЖНО: раньше это было debug → на Render ты не видел ошибку вообще
+        if not _CARDLOG_WARNED_UPLOAD_FAIL:
+            _CARDLOG_WARNED_UPLOAD_FAIL = True
+            logging.warning("cardlog upload failed (first failure). gs_path=%s err=%s", gs_path, e)
+        else:
+            logging.warning("cardlog upload failed. gs_path=%s err=%s", gs_path, e)
 
 def cardlog_flush() -> None:
     """Force upload pending lines to GCS."""
@@ -1689,7 +1713,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.51</b>")
+    lines.append(f"\n<b> ver: 2.52</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1932,7 +1956,8 @@ def bucketize_path(path: Optional[str]) -> Optional[str]:
     p = path.strip()
     if is_gs(p) or os.path.isabs(p):
         return p
-    backet = getenv_str("BACKET","")
+    # fix: use GCS_BUCKET; keep BACKET for backward compatibility
+    backet = getenv_str("GCS_BUCKET","").strip() or getenv_str("BACKET","").strip()
     if backet:
         norm = p.lstrip('/').replace('\\', '/')
         return f"gs://{backet}/{norm}"
