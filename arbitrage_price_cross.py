@@ -756,6 +756,19 @@ def get_bbo(symbol: str, ex_name: str):
 # funding_rate is a fraction per period (e.g., 0.0001 = 0.01% per funding).
 # next_funding_ms is UTC epoch ms when the next funding is applied.
 
+# Keep last funding fetch diagnostics to persist into TG-card JSON logs.
+# key: (exchange, symbol) -> {"url": str, "err": str|None}
+_FUNDING_DIAG: Dict[Tuple[str, str], dict] = {}
+
+def _funding_diag_set(ex: str, sym: str, url: str, err: Optional[str]) -> None:
+    try:
+        _FUNDING_DIAG[(str(ex).lower(), str(sym).upper())] = {"url": url, "err": err}
+    except Exception:
+        pass
+
+def _funding_diag_get(ex: str, sym: str) -> dict:
+    return _FUNDING_DIAG.get((str(ex).lower(), str(sym).upper()), {})
+
 def _sym_to_okx_instid(sym: str) -> str:
     sym_u = str(sym).upper().replace('-', '').replace('_', '')
     # BTCUSDT -> BTC-USDT-SWAP
@@ -787,19 +800,27 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
     period_sec = 8 * 3600
     try:
         if ex == 'binance':
-            js = _get(f"{binance_data_base()}/fapi/v1/premiumIndex", params={'symbol': sym})
+            url = f"{binance_data_base()}/fapi/v1/premiumIndex"
+            _funding_diag_set(ex, sym, f"{url} params={{'symbol': '{sym}'}}", None)
+            js = _get(url, params={'symbol': sym})
             if not js:
+                _funding_diag_set(ex, sym, f"{url} params={{'symbol': '{sym}'}}", "empty response")
                 return None, None, period_sec
             r = float(js.get('lastFundingRate')) if js.get('lastFundingRate') is not None else None
             nft = int(js.get('nextFundingTime')) if js.get('nextFundingTime') is not None else None
             return r, nft, period_sec
 
         if ex == 'bybit':
-            js = _get(f"{bybit_data_base()}/v5/market/tickers", params={'category': 'linear', 'symbol': sym})
+            url = f"{bybit_data_base()}/v5/market/tickers"
+            _funding_diag_set(ex, sym, f"{url} params={{'category': 'linear', 'symbol': '{sym}'}}", None)
+            js = _get(url, params={'category': 'linear', 'symbol': sym})
             if not js or js.get('retCode') not in (0, '0', None):
+                _funding_diag_set(ex, sym, f"{url} params={{'category': 'linear', 'symbol': '{sym}'}}",
+                                  f"bad response retCode={((js or {}).get('retCode'))}")                
                 return None, None, period_sec
             lst = ((js.get('result') or {}).get('list') or [])
             if not lst:
+                _funding_diag_set(ex, sym, f"{url} params={{'category': 'linear', 'symbol': '{sym}'}}", "empty list")
                 return None, None, period_sec
             it = lst[0] or {}
             r = float(it.get('fundingRate')) if it.get('fundingRate') is not None else None
@@ -808,11 +829,16 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
 
         if ex == 'okx':
             inst = _sym_to_okx_instid(sym)
-            js = _get(f"{okx_base()}/api/v5/public/funding-rate", params={'instId': inst})
+            url = f"{okx_base()}/api/v5/public/funding-rate"
+            _funding_diag_set(ex, sym, f"{url} params={{'instId': '{inst}'}}", None)
+            js = _get(url, params={'instId': inst})
             if not js or js.get('code') not in ('0', 0, None):
+                _funding_diag_set(ex, sym, f"{url} params={{'instId': '{inst}'}}",
+                                  f"bad response code={((js or {}).get('code'))}")
                 return None, None, period_sec
             data = (js.get('data') or [])
             if not data:
+                _funding_diag_set(ex, sym, f"{url} params={{'instId': '{inst}'}}", "empty data")
                 return None, None, period_sec
             it = data[0] or {}
             # OKX: fundingRate, nextFundingTime in ms
@@ -823,8 +849,12 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
         if ex == 'gate':
             # Gate futures USDT: /api/v4/futures/usdt/contracts/{contract}
             contract = _sym_to_gate_contract(sym)
-            js = _get(f"{gate_base()}/api/v4/futures/usdt/contracts/{contract}")
+            # IMPORTANT: funding is public here, so use public base (not private gate_base()).
+            url = f"{_public_base('gate')}/api/v4/futures/usdt/contracts/{contract}"
+            _funding_diag_set(ex, sym, url, None)
+            js = _get(url)
             if not js:
+                _funding_diag_set(ex, sym, url, "empty response")
                 return None, None, period_sec
             # Gate fields: funding_rate, funding_next_apply (seconds or ms depending)
             r = float(js.get('funding_rate')) if js.get('funding_rate') is not None else None
@@ -840,6 +870,7 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
             return r, nft, period_sec
 
     except Exception:
+        _funding_diag_set(ex, sym, _funding_diag_get(ex, sym).get("url",""), "exception")
         return None, None, period_sec
 
     return None, None, period_sec
@@ -848,7 +879,7 @@ def _fetch_binance_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[i
     """Bulk funding snapshot for Binance USDT-M via /fapi/v1/premiumIndex (no symbol)."""
     out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
     try:
-        js = _get(f"{gate_base()}/api/v4/futures/usdt/contracts")
+        js = _get(f"{binance_data_base()}/fapi/v1/premiumIndex")
         if isinstance(js, list):
             for r in js:
                 sym = str(r.get("symbol", "")).upper()
@@ -871,7 +902,7 @@ def _fetch_bybit_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int
     """Bulk funding snapshot for Bybit linear via /v5/market/tickers?category=linear."""
     out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
     try:
-        js = _get("https://api.bybit.com/v5/market/tickers?category=linear")
+        js = _get(f"{bybit_data_base()}/v5/market/tickers", params={"category": "linear"})
         lst = (((js or {}).get("result") or {}).get("list") or [])
         for r in lst:
             sym = str(r.get("symbol", "")).upper()
@@ -1526,7 +1557,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.44</b>")
+    lines.append(f"\n<b> ver: 2.45</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1583,6 +1614,23 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         payload["entry_bps_used"] = entry_bps_used
         payload["std_min_for_open_used"] = std_min_used
         payload["min_net_abs_used"] = min_net_abs_used
+        # --- Always persist funding diagnostics fields into ONE JSON line ---
+        # Ensure keys exist even when funding check is disabled or fetch failed.
+        if payload.get("funding_err") is None and payload.get("funding_error") is not None:
+            payload["funding_err"] = payload.get("funding_error")
+        for k in (
+            "funding_expected_pct",
+            "funding_rate_cheap",
+            "funding_rate_rich",
+            "funding_cycles",
+            "funding_hold_sec_used",
+            "funding_min_pct_used",
+            "funding_expected_usd",
+            "funding_url_used",
+            "funding_err",
+        ):
+            if k not in payload:
+                payload[k] = None
 
         # normalize skip reasons
         if payload.get("open_skip_reasons") is None:
@@ -2881,6 +2929,20 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             best["funding_cycles"] = min(int(f_det.get("cycles_cheap") or 0), int(f_det.get("cycles_rich") or 0))
             best["funding_hold_sec_used"] = int(f_det.get("hold_sec") or hold_sec)
             best["funding_min_pct_used"] = FUNDING_MIN_PCT
+            # diagnostics (urls/errors) for both legs
+            try:
+                du = {
+                    "cheap": _funding_diag_get(cheap_ex, sym).get("url"),
+                    "rich":  _funding_diag_get(rich_ex, sym).get("url"),
+                }
+                de = {
+                    "cheap": _funding_diag_get(cheap_ex, sym).get("err"),
+                    "rich":  _funding_diag_get(rich_ex, sym).get("err"),
+                }
+                best["funding_url_used"] = du
+                best["funding_err"] = de
+            except Exception:
+                pass           
             # add funding into the economic picture (used by facts/card)
             try:
                 f_usd = 0.0 if f_pct is None else (float(f_pct) / 100.0) * float(per_leg_notional_usd)
@@ -2897,7 +2959,10 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         except Exception as e:
             # if funding check is enabled but fetch fails, do NOT block trading
             best["funding_ok"] = True
-            best["funding_error"] = str(e)
+            best["funding_err"] = str(e)
+            # still keep urls if any were attempted
+            best["funding_url_used"] = {"cheap": _funding_diag_get(cheap_ex, sym).get("url"),
+                                        "rich":  _funding_diag_get(rich_ex, sym).get("url")}
 
     # --- 3) Qty расчёт как в positions_once ---
     try:
