@@ -1712,18 +1712,18 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
             # expected funding (упрощённо через существующую функцию, но с локальным cache на 2 биржи)
             try:
-            ef_pct, det = expected_funding_pnl_pct(
-                sym, lex, sex, hold_sec,
-                reverse_side=False
-            )
-            if det is None:
-                det = {}
+                ef_pct, det = expected_funding_pnl_pct(
+                    sym, lex, sex, hold_sec,
+                    reverse_side=False
+                )
+                if det is None:
+                    det = {}
 
-            payload["funding_expected_pct"] = ef_pct
-            # если details содержат более точные значения — используем их
-            payload["funding_rate_cheap"] = det.get("rate_cheap", payload.get("funding_rate_cheap"))
-            payload["funding_rate_rich"]  = det.get("rate_rich",  payload.get("funding_rate_rich"))
-            payload["funding_cycles"]     = det.get("cycles",     payload.get("funding_cycles"))
+                payload["funding_expected_pct"] = ef_pct
+                # если details содержат более точные значения — используем их
+                payload["funding_rate_cheap"] = det.get("rate_cheap", payload.get("funding_rate_cheap"))
+                payload["funding_rate_rich"]  = det.get("rate_rich",  payload.get("funding_rate_rich"))
+                payload["funding_cycles"]     = det.get("cycles",     payload.get("funding_cycles"))
             except Exception as e:
                 payload["funding_expected_pct"] = None
                 payload["funding_err"] = f"{type(e).__name__}: {e}"
