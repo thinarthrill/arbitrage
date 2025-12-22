@@ -787,7 +787,7 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
     period_sec = 8 * 3600
     try:
         if ex == 'binance':
-            js = _get(f"{_public_base('binance')}/fapi/v1/premiumIndex", params={'symbol': sym})
+            js = _get(f"{binance_data_base()}/fapi/v1/premiumIndex", params={'symbol': sym})
             if not js:
                 return None, None, period_sec
             r = float(js.get('lastFundingRate')) if js.get('lastFundingRate') is not None else None
@@ -795,7 +795,7 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
             return r, nft, period_sec
 
         if ex == 'bybit':
-            js = _get(f"{_public_base('bybit')}/v5/market/tickers", params={'category': 'linear', 'symbol': sym})
+            js = _get(f"{bybit_data_base()}/v5/market/tickers", params={'category': 'linear', 'symbol': sym})
             if not js or js.get('retCode') not in (0, '0', None):
                 return None, None, period_sec
             lst = ((js.get('result') or {}).get('list') or [])
@@ -808,7 +808,7 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
 
         if ex == 'okx':
             inst = _sym_to_okx_instid(sym)
-            js = _get(f"{_public_base('okx')}/api/v5/public/funding-rate", params={'instId': inst})
+            js = _get(f"{okx_base()}/api/v5/public/funding-rate", params={'instId': inst})
             if not js or js.get('code') not in ('0', 0, None):
                 return None, None, period_sec
             data = (js.get('data') or [])
@@ -823,7 +823,7 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
         if ex == 'gate':
             # Gate futures USDT: /api/v4/futures/usdt/contracts/{contract}
             contract = _sym_to_gate_contract(sym)
-            js = _get(f"{_public_base('gate')}/api/v4/futures/usdt/contracts/{contract}")
+            js = _get(f"{gate_base()}/api/v4/futures/usdt/contracts/{contract}")
             if not js:
                 return None, None, period_sec
             # Gate fields: funding_rate, funding_next_apply (seconds or ms depending)
@@ -848,7 +848,7 @@ def _fetch_binance_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[i
     """Bulk funding snapshot for Binance USDT-M via /fapi/v1/premiumIndex (no symbol)."""
     out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
     try:
-        js = _get("https://fapi.binance.com/fapi/v1/premiumIndex")
+        js = _get(f"{gate_base()}/api/v4/futures/usdt/contracts")
         if isinstance(js, list):
             for r in js:
                 sym = str(r.get("symbol", "")).upper()
@@ -1526,7 +1526,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.43</b>")
+    lines.append(f"\n<b> ver: 2.44</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
