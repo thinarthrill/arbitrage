@@ -1689,7 +1689,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.50</b>")
+    lines.append(f"\n<b> ver: 2.51</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1838,6 +1838,9 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
             if not isinstance(payload.get("open_skip_reasons"), list):
                 payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
+
+            if payload.get("open_skip_reason") is None and payload.get("open_skip_reasons"):
+                payload["open_skip_reason"] = "; ".join(str(x) for x in payload.get("open_skip_reasons") if x)
 
             # stats_ok fallback
             if payload.get("stats_ok") is None:
@@ -2928,6 +2931,10 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         try:
             skip_reasons.append(str(msg))
             best["_open_skip_reasons"] = skip_reasons
+            # keep normalized fields for logs/telegram
+            best["open_skip_reasons"] = list(skip_reasons)
+            best["open_skip_reason"] = "; ".join(str(x) for x in skip_reasons if x)
+            best["open_ok"] = False            
         except Exception:
             pass
 
@@ -3299,6 +3306,12 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     now_ms = utc_ms_now()
 
     if ok:
+        # mark open outcome for TG/logs
+        try:
+            best["open_ok"] = True
+            best["open_attempt_id"] = attempt_id
+        except Exception:
+            pass        
         df_pos = load_positions(pos_path)
         cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max() if not df_pos.empty else None
         next_id = int(cur_max) + 1 if cur_max == cur_max and cur_max is not None else 1
@@ -3904,8 +3917,46 @@ def scan_spreads_once(
         and (not getenv_bool("RECHECK_Z_AT_OPEN", False) or (z_ok and std_ok))
     )
 
+    # ---- instant open (do it BEFORE TG so card reflects the outcome) ----
+    open_ok = None
+    if cond_open:
+        _pos_path = pos_path_for_instant or bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
+        _paper    = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
+        try:
+            open_ok = bool(try_instant_open(best, per_leg_notional_usd, taker_fee, _paper, _pos_path))
+        except Exception as e:
+            open_ok = False
+            try:
+                best["open_ok"] = False
+                best["open_skip_reasons"] = [f"exception: {e}"]
+                best["open_skip_reason"] = f"exception: {e}"
+            except Exception:
+                pass
+            # ошибку открытия try_instant_open сам покажет в TG при DEBUG_INSTANT_OPEN
+            logging.exception("[OPEN] instant open failed: %s", e)
+    else:
+        open_ok = False
+
     # ---- Telegram card with debug ----
     if best is not None:
+        try:
+            best["cond_open"] = bool(cond_open)
+            best["open_attempted"] = bool(cond_open)
+            # prefer outcome written by try_instant_open, fallback to local
+            if best.get("open_ok") is None and open_ok is not None:
+                best["open_ok"] = bool(open_ok)
+
+            # normalize open_skip_reason for TG/logs
+            if (best.get("open_ok") is False) and best.get("open_skip_reasons") and not best.get("open_skip_reason"):
+                best["open_skip_reason"] = "; ".join(str(x) for x in best.get("open_skip_reasons") if x)
+
+            if (best.get("open_ok") is False) and best.get("_open_skip_reasons") and not best.get("open_skip_reasons"):
+                best["open_skip_reasons"] = list(best.get("_open_skip_reasons") or [])
+                if not best.get("open_skip_reason"):
+                    best["open_skip_reason"] = "; ".join(str(x) for x in best.get("open_skip_reasons") if x)
+        except Exception:
+            pass
+
         card = format_signal_card(best, per_leg_notional_usd, price_source)
         card += (
             f"\n🧪 *INSTANT-OPEN DEBUG*\n"
@@ -3918,18 +3969,14 @@ def scan_spreads_once(
             f"• eco_ok = `{eco_ok}` (net_adj={net_usd_adj} > {filters['min_net_abs']:.2f})\n"
             f"• z_ok = `{z_ok}` (z={z} ≥ {filters['z_in']})\n"
             f"• std_ok = `{std_ok}` (std={std} ≥ {filters['std_min']})\n"
+            f"• open_ok = `{best.get('open_ok')}`\n"
         )
-        maybe_send_telegram(card)
+        if bool(cond_open) and (best.get("open_ok") is False):
+            rs = best.get("open_skip_reason") or ""
+            if rs:
+                card += f"• open_skip_reason = `{rs}`\n"
 
-    # ---- instant open ----
-    if cond_open:
-        _pos_path = pos_path_for_instant or bucketize_path(getenv_str("POS_CROSS_PATH", "positions_price_cross.csv"))
-        _paper    = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
-        try:
-            _ = try_instant_open(best, per_leg_notional_usd, taker_fee, _paper, _pos_path)
-        except Exception as e:
-            # ошибку открытия try_instant_open сам покажет в TG при DEBUG_INSTANT_OPEN
-            logging.exception("[OPEN] instant open failed: %s", e)
+        maybe_send_telegram(card)
 
     return best, quotes_df
 
