@@ -1713,7 +1713,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.52</b>")
+    lines.append(f"\n<b> ver: 2.53</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1795,84 +1795,84 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             merged_err = "; ".join([x for x in [err_long, err_short, payload.get("funding_err")] if x])
             payload["funding_err"] = merged_err if merged_err else None
 
-            payload["price_source"] = price_source
-            payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
-            # Ensure required fields exist BEFORE writing
-            entry_mode_used = str(payload.get("entry_mode_used") or getenv_str("ENTRY_MODE", "price")).lower()
-            z_in_used = float(payload.get("z_in_used") or getenv_float("Z_IN", 2.0))
-            entry_bps_used = float(payload.get("entry_bps_used") or getenv_float("ENTRY_SPREAD_BPS", 0.0))
-            std_min_used = float(payload.get("std_min_for_open_used") or getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-            capital = float(getenv_float("CAPITAL", 1000.0))
-            min_net_abs_used = float(payload.get("min_net_abs_used") or (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital)
+        payload["price_source"] = price_source
+        payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
+        # Ensure required fields exist BEFORE writing
+        entry_mode_used = str(payload.get("entry_mode_used") or getenv_str("ENTRY_MODE", "price")).lower()
+        z_in_used = float(payload.get("z_in_used") or getenv_float("Z_IN", 2.0))
+        entry_bps_used = float(payload.get("entry_bps_used") or getenv_float("ENTRY_SPREAD_BPS", 0.0))
+        std_min_used = float(payload.get("std_min_for_open_used") or getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+        capital = float(getenv_float("CAPITAL", 1000.0))
+        min_net_abs_used = float(payload.get("min_net_abs_used") or (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital)
 
-            payload["entry_mode_used"] = entry_mode_used
-            payload["z_in_used"] = z_in_used
-            payload["entry_bps_used"] = entry_bps_used
-            payload["std_min_for_open_used"] = std_min_used
-            payload["min_net_abs_used"] = min_net_abs_used
-            # --- Always persist funding diagnostics fields into ONE JSON line ---
-            # Ensure keys exist even when funding check is disabled or fetch failed.
-            if payload.get("funding_err") is None and payload.get("funding_error") is not None:
-                payload["funding_err"] = payload.get("funding_error")
-            for k in (
-                "funding_expected_pct",
-                "funding_rate_cheap",
-                "funding_rate_rich",
-                "funding_cycles",
-                "funding_hold_sec_used",
-                "funding_min_pct_used",
-                "funding_expected_usd",
-                "funding_url_used",
-                "funding_err",
-            ):
-                if k not in payload:
-                    payload[k] = None
-            # --- sync computed funding/net_total back into original record (so TG + filters see it) ---
-            try:
-                # aliases
-                if (payload.get("funding_expected_pct") is None) and (payload.get("funding_exp_pct") is not None):
-                    payload["funding_expected_pct"] = payload.get("funding_exp_pct")
-                if (payload.get("net_usd_adj_total") is None) and (payload.get("net_total") is not None):
-                    payload["net_usd_adj_total"] = payload.get("net_total")
+        payload["entry_mode_used"] = entry_mode_used
+        payload["z_in_used"] = z_in_used
+        payload["entry_bps_used"] = entry_bps_used
+        payload["std_min_for_open_used"] = std_min_used
+        payload["min_net_abs_used"] = min_net_abs_used
+        # --- Always persist funding diagnostics fields into ONE JSON line ---
+        # Ensure keys exist even when funding check is disabled or fetch failed.
+        if payload.get("funding_err") is None and payload.get("funding_error") is not None:
+            payload["funding_err"] = payload.get("funding_error")
+        for k in (
+            "funding_expected_pct",
+            "funding_rate_cheap",
+            "funding_rate_rich",
+            "funding_cycles",
+            "funding_hold_sec_used",
+            "funding_min_pct_used",
+            "funding_expected_usd",
+            "funding_url_used",
+            "funding_err",
+        ):
+            if k not in payload:
+                payload[k] = None
+        # --- sync computed funding/net_total back into original record (so TG + filters see it) ---
+        try:
+            # aliases
+            if (payload.get("funding_expected_pct") is None) and (payload.get("funding_exp_pct") is not None):
+                payload["funding_expected_pct"] = payload.get("funding_exp_pct")
+            if (payload.get("net_usd_adj_total") is None) and (payload.get("net_total") is not None):
+                payload["net_usd_adj_total"] = payload.get("net_total")
 
-                # derive USD / total if needed
-                if payload.get("funding_expected_usd") is None and payload.get("funding_expected_pct") is not None:
-                    try:
-                        payload["funding_expected_usd"] = (float(payload["funding_expected_pct"]) / 100.0) * (2.0 * float(per_leg_notional_usd))
-                    except Exception:
-                        pass
-                if payload.get("net_usd_adj_total") is None and payload.get("net_usd_adj") is not None and payload.get("funding_expected_usd") is not None:
-                    try:
-                        payload["net_usd_adj_total"] = float(payload.get("net_usd_adj")) + float(payload.get("funding_expected_usd"))
-                    except Exception:
-                        pass
-
-                for kk in (
-                    "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
-                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
-                    "funding_expected_usd", "net_usd_adj_total",
-                ):
-                    if (r.get(kk) is None) and (payload.get(kk) is not None):
-                        r[kk] = payload.get(kk)
-            except Exception:
-                pass
-
-            # normalize skip reasons
-            if payload.get("open_skip_reasons") is None:
-                payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
-            if not isinstance(payload.get("open_skip_reasons"), list):
-                payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
-
-            if payload.get("open_skip_reason") is None and payload.get("open_skip_reasons"):
-                payload["open_skip_reason"] = "; ".join(str(x) for x in payload.get("open_skip_reasons") if x)
-
-            # stats_ok fallback
-            if payload.get("stats_ok") is None:
+            # derive USD / total if needed
+            if payload.get("funding_expected_usd") is None and payload.get("funding_expected_pct") is not None:
                 try:
-                    stdv = float(payload.get("std"))
-                    payload["stats_ok"] = bool((stdv == stdv) and (stdv > 0))
+                    payload["funding_expected_usd"] = (float(payload["funding_expected_pct"]) / 100.0) * (2.0 * float(per_leg_notional_usd))
                 except Exception:
-                    payload["stats_ok"] = False
+                    pass
+            if payload.get("net_usd_adj_total") is None and payload.get("net_usd_adj") is not None and payload.get("funding_expected_usd") is not None:
+                try:
+                    payload["net_usd_adj_total"] = float(payload.get("net_usd_adj")) + float(payload.get("funding_expected_usd"))
+                except Exception:
+                    pass
+
+            for kk in (
+                "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
+                "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                "funding_expected_usd", "net_usd_adj_total",
+            ):
+                if (r.get(kk) is None) and (payload.get(kk) is not None):
+                    r[kk] = payload.get(kk)
+        except Exception:
+            pass
+
+        # normalize skip reasons
+        if payload.get("open_skip_reasons") is None:
+            payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
+        if not isinstance(payload.get("open_skip_reasons"), list):
+            payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
+
+        if payload.get("open_skip_reason") is None and payload.get("open_skip_reasons"):
+            payload["open_skip_reason"] = "; ".join(str(x) for x in payload.get("open_skip_reasons") if x)
+
+        # stats_ok fallback
+        if payload.get("stats_ok") is None:
+            try:
+                stdv = float(payload.get("std"))
+                payload["stats_ok"] = bool((stdv == stdv) and (stdv > 0))
+            except Exception:
+                payload["stats_ok"] = False
 
             # funding_ok fallback
             try:
@@ -1929,8 +1929,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                     if payload.get(k) is None:
                         payload[k] = bool(flags.get(k))
 
-            # write once (dedup inside)
-            cardlog_append_once(payload)
+        # write once (dedup inside)
+        cardlog_append_once(payload)
     except Exception:
         pass
 
