@@ -1650,7 +1650,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.47</b>")
+    lines.append(f"\n<b> ver: 2.48</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1712,16 +1712,18 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
             # expected funding (упрощённо через существующую функцию, но с локальным cache на 2 биржи)
             try:
-                tmp_cache = {
-                    lex: {sym: (r_long, nxt_long, per_long)},
-                    sex: {sym: (r_short, nxt_short, per_short)},
-                }
-                ef_pct, fr_c, fr_r, cycles, hold_sec_used = expected_funding_pnl_pct(
-                    sym, lex, sex, hold_sec, tmp_cache
-                )
-                payload["funding_expected_pct"] = ef_pct
-                payload["funding_cycles"] = cycles
-                payload["funding_hold_sec_used"] = hold_sec_used
+            ef_pct, det = expected_funding_pnl_pct(
+                sym, lex, sex, hold_sec,
+                reverse_side=False
+            )
+            if det is None:
+                det = {}
+
+            payload["funding_expected_pct"] = ef_pct
+            # если details содержат более точные значения — используем их
+            payload["funding_rate_cheap"] = det.get("rate_cheap", payload.get("funding_rate_cheap"))
+            payload["funding_rate_rich"]  = det.get("rate_rich",  payload.get("funding_rate_rich"))
+            payload["funding_cycles"]     = det.get("cycles",     payload.get("funding_cycles"))
             except Exception as e:
                 payload["funding_expected_pct"] = None
                 payload["funding_err"] = f"{type(e).__name__}: {e}"
