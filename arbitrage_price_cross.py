@@ -11,7 +11,7 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv()
 
 
-RUN_ID = os.getenv("RUN_ID", True) or uuid.uuid4().hex[:10]
+RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
 
 _CARDLOG_LOCAL: Optional[str] = None
 _CARDLOG_LAST_UPLOAD_TS: float = 0.0
@@ -98,6 +98,59 @@ def _public_base(exchange: str) -> str:
     if exchange == "gate":
         return "https://api.gateio.ws"
     raise ValueError(f"Unknown exchange: {exchange}")
+
+def _funding_fetch_one_diag(ex: str, symbol: str):
+    """
+    Возвращает: (rate, next_funding_ts, period_sec, url_used, err)
+    rate: float (например 0.0001 = 0.01% за период)
+    """
+    try:
+        ex = (ex or "").lower().strip()
+        if ex == "binance":
+            # Binance Futures funding: premiumIndex содержит lastFundingRate/nextFundingTime
+            url = f"{binance_data_base()}/fapi/v1/premiumIndex?symbol={symbol}"
+            j = _get(url)
+            rate = float(j.get("lastFundingRate")) if j and j.get("lastFundingRate") is not None else None
+            nxt  = int(j.get("nextFundingTime")) if j and j.get("nextFundingTime") is not None else None
+            period_sec = 8 * 3600
+            return rate, nxt, period_sec, url, None
+
+        if ex == "bybit":
+            # Bybit v5: берём последний funding из history
+            url = f"{bybit_data_base()}/v5/market/funding/history?category=linear&symbol={symbol}&limit=1"
+            j = _get(url)
+            lst = (((j or {}).get("result") or {}).get("list") or [])
+            item = lst[0] if lst else None
+            rate = float(item.get("fundingRate")) if item and item.get("fundingRate") is not None else None
+            nxt  = int(item.get("fundingRateTimestamp")) if item and item.get("fundingRateTimestamp") is not None else None
+            # fundingRateTimestamp у bybit — это время ставки, nextFundingTime не всегда есть в history
+            period_sec = 8 * 3600
+            return rate, nxt, period_sec, url, None
+
+        if ex == "gate":
+            # Gate public endpoint: futures contract info содержит funding_rate и funding_next_apply
+            # Важно: contract на Gate выглядит как BTC_USDT, поэтому конвертим
+            contract = _sym_to_gate_contract(symbol)
+            url = f"{_public_base('gate')}/api/v4/futures/usdt/contracts/{contract}"
+            j = _get(url)
+            rate = float(j.get("funding_rate")) if j and j.get("funding_rate") is not None else None
+            nft_raw = (j or {}).get("funding_next_apply")
+            nxt = None
+            if nft_raw is not None:
+                try:
+                    nft_i = int(float(nft_raw))
+                    # seconds -> ms (как у тебя в get_funding_info)
+                    nxt = nft_i * 1000 if nft_i < 10_000_000_000 else nft_i
+                except Exception:
+                    nxt = None
+            period_sec = 8 * 3600
+            return rate, nxt, period_sec, url, None
+
+        # OKX и прочие — используем существующую логику, но без точного url (чтобы не ломать маппинг instId)
+        r, nxt, period_sec = get_funding_info(ex, symbol)
+        return r, nxt, period_sec, f"get_funding_info:{ex}:{symbol}", None
+    except Exception as e:
+        return None, None, None, None, f"{type(e).__name__}: {e}"
 
 # === BULK PATCH START ===
 import time
@@ -1597,7 +1650,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.46</b>")
+    lines.append(f"\n<b> ver: 2.47</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1639,110 +1692,148 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     try:
         payload = dict(r or {})
         payload["type"] = "tg_card"
-        payload["price_source"] = price_source
-        payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
-        # Ensure required fields exist BEFORE writing
-        entry_mode_used = str(payload.get("entry_mode_used") or getenv_str("ENTRY_MODE", "price")).lower()
-        z_in_used = float(payload.get("z_in_used") or getenv_float("Z_IN", 2.0))
-        entry_bps_used = float(payload.get("entry_bps_used") or getenv_float("ENTRY_SPREAD_BPS", 0.0))
-        std_min_used = float(payload.get("std_min_for_open_used") or getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-        capital = float(getenv_float("CAPITAL", 1000.0))
-        min_net_abs_used = float(payload.get("min_net_abs_used") or (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital)
 
-        payload["entry_mode_used"] = entry_mode_used
-        payload["z_in_used"] = z_in_used
-        payload["entry_bps_used"] = entry_bps_used
-        payload["std_min_for_open_used"] = std_min_used
-        payload["min_net_abs_used"] = min_net_abs_used
-        # --- Always persist funding diagnostics fields into ONE JSON line ---
-        # Ensure keys exist even when funding check is disabled or fetch failed.
-        if payload.get("funding_err") is None and payload.get("funding_error") is not None:
-            payload["funding_err"] = payload.get("funding_error")
-        for k in (
-            "funding_expected_pct",
-            "funding_rate_cheap",
-            "funding_rate_rich",
-            "funding_cycles",
-            "funding_hold_sec_used",
-            "funding_min_pct_used",
-            "funding_expected_usd",
-            "funding_url_used",
-            "funding_err",
-        ):
-            if k not in payload:
-                payload[k] = None
+        # --- funding: гарантированно заполняем поля + diagnostics в JSON (даже если funding cache не сработал)
+        # Если funding уже рассчитан выше — не трогаем.
+        if payload.get("funding_expected_pct") is None:
+            sym = payload.get("symbol")
+            lex = payload.get("long_ex")
+            sex = payload.get("short_ex")
+            hold_h = float(os.getenv("EXPECTED_HOLDING_H", "24") or 24)
+            hold_sec = int(hold_h * 3600)
+            payload["funding_hold_sec_used"] = hold_sec
 
-        # normalize skip reasons
-        if payload.get("open_skip_reasons") is None:
-            payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
-        if not isinstance(payload.get("open_skip_reasons"), list):
-            payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
+            r_long, nxt_long, per_long, url_long, err_long = _funding_fetch_one_diag(lex, sym)
+            r_short, nxt_short, per_short, url_short, err_short = _funding_fetch_one_diag(sex, sym)
 
-        # stats_ok fallback
-        if payload.get("stats_ok") is None:
+            payload["funding_rate_cheap"] = r_long
+            payload["funding_rate_rich"]  = r_short
+            payload["funding_cycles"] = None
+
+            # expected funding (упрощённо через существующую функцию, но с локальным cache на 2 биржи)
             try:
-                stdv = float(payload.get("std"))
-                payload["stats_ok"] = bool((stdv == stdv) and (stdv > 0))
-            except Exception:
-                payload["stats_ok"] = False
+                tmp_cache = {
+                    lex: {sym: (r_long, nxt_long, per_long)},
+                    sex: {sym: (r_short, nxt_short, per_short)},
+                }
+                ef_pct, fr_c, fr_r, cycles, hold_sec_used = expected_funding_pnl_pct(
+                    sym, lex, sex, hold_sec, tmp_cache
+                )
+                payload["funding_expected_pct"] = ef_pct
+                payload["funding_cycles"] = cycles
+                payload["funding_hold_sec_used"] = hold_sec_used
+            except Exception as e:
+                payload["funding_expected_pct"] = None
+                payload["funding_err"] = f"{type(e).__name__}: {e}"
 
-        # funding_ok fallback
-        try:
-            fmin = float(payload.get("funding_min_pct_used") or getenv_float("FUNDING_MIN_PCT", 0.0))
-        except Exception:
-            fmin = 0.0
-        payload["funding_min_pct_used"] = payload.get("funding_min_pct_used", fmin)
-        if payload.get("funding_ok") is None:
-            if fmin <= 0:
-                payload["funding_ok"] = True
-            else:
+            payload["funding_url_used"] = {"long": url_long, "short": url_short}
+            merged_err = "; ".join([x for x in [err_long, err_short, payload.get("funding_err")] if x])
+            payload["funding_err"] = merged_err if merged_err else None
+
+            payload["price_source"] = price_source
+            payload["per_leg_notional_usd"] = float(per_leg_notional_usd)
+            # Ensure required fields exist BEFORE writing
+            entry_mode_used = str(payload.get("entry_mode_used") or getenv_str("ENTRY_MODE", "price")).lower()
+            z_in_used = float(payload.get("z_in_used") or getenv_float("Z_IN", 2.0))
+            entry_bps_used = float(payload.get("entry_bps_used") or getenv_float("ENTRY_SPREAD_BPS", 0.0))
+            std_min_used = float(payload.get("std_min_for_open_used") or getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+            capital = float(getenv_float("CAPITAL", 1000.0))
+            min_net_abs_used = float(payload.get("min_net_abs_used") or (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital)
+
+            payload["entry_mode_used"] = entry_mode_used
+            payload["z_in_used"] = z_in_used
+            payload["entry_bps_used"] = entry_bps_used
+            payload["std_min_for_open_used"] = std_min_used
+            payload["min_net_abs_used"] = min_net_abs_used
+            # --- Always persist funding diagnostics fields into ONE JSON line ---
+            # Ensure keys exist even when funding check is disabled or fetch failed.
+            if payload.get("funding_err") is None and payload.get("funding_error") is not None:
+                payload["funding_err"] = payload.get("funding_error")
+            for k in (
+                "funding_expected_pct",
+                "funding_rate_cheap",
+                "funding_rate_rich",
+                "funding_cycles",
+                "funding_hold_sec_used",
+                "funding_min_pct_used",
+                "funding_expected_usd",
+                "funding_url_used",
+                "funding_err",
+            ):
+                if k not in payload:
+                    payload[k] = None
+
+            # normalize skip reasons
+            if payload.get("open_skip_reasons") is None:
+                payload["open_skip_reasons"] = payload.get("_open_skip_reasons") or []
+            if not isinstance(payload.get("open_skip_reasons"), list):
+                payload["open_skip_reasons"] = [str(payload.get("open_skip_reasons"))]
+
+            # stats_ok fallback
+            if payload.get("stats_ok") is None:
                 try:
-                    fexp = float(payload.get("funding_expected_pct"))
-                    payload["funding_ok"] = (fexp == fexp) and (fexp >= fmin)
+                    stdv = float(payload.get("std"))
+                    payload["stats_ok"] = bool((stdv == stdv) and (stdv > 0))
                 except Exception:
-                    payload["funding_ok"] = False
+                    payload["stats_ok"] = False
 
-        # entry flags fallback: eco/spread/z/std
-        if any(payload.get(k) is None for k in ("eco_ok", "spread_ok", "z_ok", "std_ok")):
+            # funding_ok fallback
             try:
-                spread_bps = float(payload.get("spread_bps") or 0.0)
+                fmin = float(payload.get("funding_min_pct_used") or getenv_float("FUNDING_MIN_PCT", 0.0))
             except Exception:
-                spread_bps = 0.0
+                fmin = 0.0
+            payload["funding_min_pct_used"] = payload.get("funding_min_pct_used", fmin)
+            if payload.get("funding_ok") is None:
+                if fmin <= 0:
+                    payload["funding_ok"] = True
+                else:
+                    try:
+                        fexp = float(payload.get("funding_expected_pct"))
+                        payload["funding_ok"] = (fexp == fexp) and (fexp >= fmin)
+                    except Exception:
+                        payload["funding_ok"] = False
 
-            net_total = payload.get("net_usd_adj_total")
-            if net_total is None:
-                net_total = payload.get("net_usd_adj")
-            try:
-                net_total_f = float(net_total) if net_total is not None else None
-            except Exception:
-                net_total_f = None
+            # entry flags fallback: eco/spread/z/std
+            if any(payload.get(k) is None for k in ("eco_ok", "spread_ok", "z_ok", "std_ok")):
+                try:
+                    spread_bps = float(payload.get("spread_bps") or 0.0)
+                except Exception:
+                    spread_bps = 0.0
 
-            try:
-                z_f = float(payload.get("z")) if payload.get("z") is not None else None
-            except Exception:
-                z_f = None
-            try:
-                std_f = float(payload.get("std")) if payload.get("std") is not None else None
-            except Exception:
-                std_f = None
+                net_total = payload.get("net_usd_adj_total")
+                if net_total is None:
+                    net_total = payload.get("net_usd_adj")
+                try:
+                    net_total_f = float(net_total) if net_total is not None else None
+                except Exception:
+                    net_total_f = None
 
-            flags = compute_entry_flags(
-                entry_mode_used,
-                spread_bps=spread_bps,
-                net_adj=net_total_f,
-                z=z_f,
-                std=std_f,
-                entry_spread_bps=float(entry_bps_used),
-                min_net_abs=float(min_net_abs_used),
-                z_in=float(z_in_used),
-                std_min=float(std_min_used),
-            )
-            for k in ("eco_ok", "spread_ok", "z_ok", "std_ok"):
-                if payload.get(k) is None:
-                    payload[k] = bool(flags.get(k))
+                try:
+                    z_f = float(payload.get("z")) if payload.get("z") is not None else None
+                except Exception:
+                    z_f = None
+                try:
+                    std_f = float(payload.get("std")) if payload.get("std") is not None else None
+                except Exception:
+                    std_f = None
 
-        # write once (dedup inside)
-        cardlog_append_once(payload)
+                flags = compute_entry_flags(
+                    entry_mode_used,
+                    spread_bps=spread_bps,
+                    net_adj=net_total_f,
+                    z=z_f,
+                    std=std_f,
+                    entry_spread_bps=float(entry_bps_used),
+                    min_net_abs=float(min_net_abs_used),
+                    z_in=float(z_in_used),
+                    std_min=float(std_min_used),
+                )
+                for k in ("eco_ok", "spread_ok", "z_ok", "std_ok"):
+                    if payload.get(k) is None:
+                        payload[k] = bool(flags.get(k))
+
+            # write once (dedup inside)
+            cardlog_append_once(payload)
     except Exception:
         pass
 
