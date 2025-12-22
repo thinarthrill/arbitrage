@@ -876,7 +876,11 @@ def get_funding_info(exchange: str, symbol: str) -> Tuple[Optional[float], Optio
     return None, None, period_sec
 
 def _fetch_binance_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int], int]]:
-    """Bulk funding snapshot for Binance USDT-M via /fapi/v1/premiumIndex (no symbol)."""
+    """Bulk funding snapshot for Binance USDT-M via /fapi/v1/premiumIndex (no symbol).
+
+    Uses binance_data_base() so it follows your DATA_MAINNET / TESTNET flags.
+    Returns: symbol -> (lastFundingRate, nextFundingTime_ms, period_sec)
+    """
     out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
     try:
         js = _get(f"{binance_data_base()}/fapi/v1/premiumIndex")
@@ -899,7 +903,10 @@ def _fetch_binance_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[i
     return out
 
 def _fetch_bybit_funding_bulk() -> Dict[str, Tuple[Optional[float], Optional[int], int]]:
-    """Bulk funding snapshot for Bybit linear via /v5/market/tickers?category=linear."""
+    """Bulk funding snapshot for Bybit linear via /v5/market/tickers?category=linear.
+
+    Uses bybit_data_base() so it follows your DATA_MAINNET / TESTNET flags.
+    """
     out: Dict[str, Tuple[Optional[float], Optional[int], int]] = {}
     try:
         js = _get(f"{bybit_data_base()}/v5/market/tickers", params={"category": "linear"})
@@ -1046,6 +1053,39 @@ def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec:
         'hold_sec': int(hold_sec),
         'total_pct': total,
     }
+
+    # --- meta for logging/debug ---
+    def _funding_url(ex: str) -> str:
+        exn = str(ex or '').lower().strip()
+        try:
+            if exn == 'binance':
+                return f"{binance_data_base()}/fapi/v1/premiumIndex?symbol={sym}"
+            if exn == 'bybit':
+                return f"{bybit_data_base()}/v5/market/tickers?category=linear&symbol={sym}"
+            if exn == 'okx':
+                inst = _sym_to_okx_instid(sym)
+                return f"{okx_base()}/api/v5/public/funding-rate?instId={inst}"
+            if exn == 'gate':
+                contract = _sym_to_gate_contract(sym)
+                return f"{gate_base()}/api/v4/futures/usdt/contracts/{contract}"
+        except Exception:
+            pass
+        return ''
+
+    url_used = {
+        str(cheap_ex): _funding_url(cheap_ex),
+        str(rich_ex): _funding_url(rich_ex),
+    }
+
+    err_parts = []
+    if rA is None:
+        err_parts.append(f"missing_rate:{cheap_ex}")
+    if rB is None:
+        err_parts.append(f"missing_rate:{rich_ex}")
+    if total is None and not err_parts:
+        err_parts.append("total_none")
+    details['url_used'] = url_used
+    details['err'] = ';'.join(err_parts) if err_parts else None    
     return total, details
 
 def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
@@ -1557,7 +1597,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.45</b>")
+    lines.append(f"\n<b> ver: 2.46</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -5601,11 +5641,19 @@ def positions_once(
         funding_topk = int(getenv_float("FUNDING_TOPK", 80))
 
         pre = cands[cands["spread_ok"] & cands["std_ok"] & cands["z_ok"]].copy()
-        if not pre.empty and funding_topk > 0:
+
+        # Funding is useful for diagnostics even when z_ok/std_ok fail (you still send TG cards for top candidates).
+        # So we compute funding for a *small* top slice from overall candidates, not only from `pre`.
+        # This keeps API calls bounded while ensuring funding_* fields are always populated in logs/cards.
+        funding_slice = cands.sort_values(["z", "net_usd_adj"], ascending=[False, False]).head(max(1, min(funding_topk, max(top3_to_tg, 5)))).copy()
+
+        if not funding_slice.empty and funding_topk > 0:
             try:
-                pre_sorted = pre.sort_values(["z", "net_usd_adj"], ascending=[False, False]).head(funding_topk)
-                sym_set = sorted(set(pre_sorted["symbol"].astype(str).str.upper().tolist()))
-                ex_set = sorted(set(pre_sorted["long_ex"].astype(str).str.lower().tolist() + pre_sorted["short_ex"].astype(str).str.lower().tolist()))
+                sym_set = sorted(set(funding_slice["symbol"].astype(str).str.upper().tolist()))
+                ex_set = sorted(set(
+                    funding_slice["long_ex"].astype(str).str.lower().tolist()
+                    + funding_slice["short_ex"].astype(str).str.lower().tolist()
+                ))
                 f_cache = _build_funding_cache(sym_set, ex_set)
 
                 def _fund_row(rw):
@@ -5613,8 +5661,8 @@ def positions_once(
                         rw.get("symbol"), rw.get("long_ex"), rw.get("short_ex"), hold_sec,
                         reverse_side=False, funding_cache=f_cache
                     )
-                    if det is None:
-                        det = {}
+                    det = det or {}
+                    url_used = det.get("url_used") or {}
                     return pd.Series({
                         "funding_expected_pct": pct,
                         "funding_rate_cheap": det.get("rate_cheap"),
@@ -5622,15 +5670,18 @@ def positions_once(
                         "funding_cycles": det.get("cycles"),
                         "funding_hold_sec_used": hold_sec,
                         "funding_min_pct_used": funding_min_pct,
+                        "funding_url_used": url_used,
+                        "funding_err": det.get("err"),                        
                     })
 
-                fcols = pre_sorted.apply(_fund_row, axis=1)
-                pre_sorted = pd.concat([pre_sorted, fcols], axis=1)
+                fcols = funding_slice.apply(_fund_row, axis=1)
+                funding_slice = pd.concat([funding_slice, fcols], axis=1)
                 for col in [
                     "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
                     "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                    "funding_url_used", "funding_err",
                 ]:
-                    cands.loc[pre_sorted.index, col] = pre_sorted[col]
+                    cands.loc[funding_slice.index, col] = funding_slice[col]
             except Exception as e:
                 logging.debug("positions_once: funding topK compute failed: %s", e)
 
@@ -5751,6 +5802,8 @@ def positions_once(
                             "funding_cycles": det.get("cycles"),
                             "funding_hold_sec_used": hold_sec,
                             "funding_min_pct_used": funding_min_pct,
+                            "funding_url_used": (det.get("url_used") or {}),
+                            "funding_err": det.get("err"),                            
                         })
 
                     fcols = sub.apply(_fund_row_price, axis=1)
@@ -5758,6 +5811,7 @@ def positions_once(
                     for col in [
                         "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
                         "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                        "funding_url_used", "funding_err",
                     ]:
                         cands.loc[sub.index, col] = sub[col]
 
