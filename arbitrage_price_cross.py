@@ -1553,9 +1553,48 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         z_ok      = (z is not None) and (z == z) and (float(z) >= z_in_loc)
         std_ok    = (std is not None) and (std == std) and (float(std) >= std_min_for_open)
 
+        # --- ensure funding + net_total fields exist for TG (keeps card/filters consistent) ---
+        try:
+            # aliases (older keys)
+            if (r.get("funding_expected_pct") is None) and (r.get("funding_exp_pct") is not None):
+                r["funding_expected_pct"] = r.get("funding_exp_pct")
+            if (r.get("net_usd_adj_total") is None) and (r.get("net_total") is not None):
+                r["net_usd_adj_total"] = r.get("net_total")
+
+            # if still missing funding_expected_pct: compute lightweight here (same as logger)
+            if r.get("funding_expected_pct") is None:
+                sym0 = r.get("symbol")
+                lex0 = r.get("long_ex")
+                sex0 = r.get("short_ex")
+                if sym0 and lex0 and sex0:
+                    hold_h0 = float(os.getenv("EXPECTED_HOLDING_H", "24") or 24)
+                    hold_sec0 = int(hold_h0 * 3600)
+                    ef_pct0, det0 = expected_funding_pnl_pct(sym0, lex0, sex0, hold_sec0, reverse_side=False)
+                    det0 = det0 or {}
+                    r["funding_expected_pct"] = ef_pct0
+                    r.setdefault("funding_rate_cheap", det0.get("rate_cheap"))
+                    r.setdefault("funding_rate_rich",  det0.get("rate_rich"))
+                    r.setdefault("funding_cycles", min(int(det0.get("cycles_cheap") or 0), int(det0.get("cycles_rich") or 0)))
+                    r.setdefault("funding_hold_sec_used", int(det0.get("hold_sec") or hold_sec0))
+
+            # derive funding_expected_usd + net_usd_adj_total when possible
+            if r.get("funding_expected_usd") is None and r.get("funding_expected_pct") is not None:
+                try:
+                    r["funding_expected_usd"] = (float(r["funding_expected_pct"]) / 100.0) * (2.0 * float(per_leg_notional_usd))
+                except Exception:
+                    pass
+
+            if r.get("net_usd_adj_total") is None and (net_usd_adj is not None) and (r.get("funding_expected_usd") is not None):
+                try:
+                    r["net_usd_adj_total"] = float(net_usd_adj) + float(r.get("funding_expected_usd"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # funding facts if present in record
-        f_exp = r.get("funding_expected_pct", None)
-        net_total = r.get("net_usd_adj_total", None)
+        f_exp = r.get("funding_expected_pct", None) if r.get("funding_expected_pct", None) is not None else r.get("funding_exp_pct", None)
+        net_total = r.get("net_usd_adj_total", None) if r.get("net_usd_adj_total", None) is not None else r.get("net_total", None)
         lines.append(
             "\n📌 <b>FACT (current tick)</b>\n"
             f"   spread_bps=<code>{sp_bps:.2f}</code>\n"
@@ -1650,7 +1689,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.49</b>")
+    lines.append(f"\n<b> ver: 2.50</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1764,6 +1803,35 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             ):
                 if k not in payload:
                     payload[k] = None
+            # --- sync computed funding/net_total back into original record (so TG + filters see it) ---
+            try:
+                # aliases
+                if (payload.get("funding_expected_pct") is None) and (payload.get("funding_exp_pct") is not None):
+                    payload["funding_expected_pct"] = payload.get("funding_exp_pct")
+                if (payload.get("net_usd_adj_total") is None) and (payload.get("net_total") is not None):
+                    payload["net_usd_adj_total"] = payload.get("net_total")
+
+                # derive USD / total if needed
+                if payload.get("funding_expected_usd") is None and payload.get("funding_expected_pct") is not None:
+                    try:
+                        payload["funding_expected_usd"] = (float(payload["funding_expected_pct"]) / 100.0) * (2.0 * float(per_leg_notional_usd))
+                    except Exception:
+                        pass
+                if payload.get("net_usd_adj_total") is None and payload.get("net_usd_adj") is not None and payload.get("funding_expected_usd") is not None:
+                    try:
+                        payload["net_usd_adj_total"] = float(payload.get("net_usd_adj")) + float(payload.get("funding_expected_usd"))
+                    except Exception:
+                        pass
+
+                for kk in (
+                    "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
+                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                    "funding_expected_usd", "net_usd_adj_total",
+                ):
+                    if (r.get(kk) is None) and (payload.get(kk) is not None):
+                        r[kk] = payload.get(kk)
+            except Exception:
+                pass
 
             # normalize skip reasons
             if payload.get("open_skip_reasons") is None:
