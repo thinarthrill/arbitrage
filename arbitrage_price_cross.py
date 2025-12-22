@@ -1650,7 +1650,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.48</b>")
+    lines.append(f"\n<b> ver: 2.49</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2869,6 +2869,48 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             # отдельная карточка в TG с причинами, почему open не состоялся
             try:
                 price_source = getenv_str("PRICE_SOURCE", "mid")
+
+                # --- funding diagnostics for OPEN-SKIPPED card (no cache, per-symbol)
+                # Эта карточка строится из `best` раньше, чем считается funding для funding_slice/topK,
+                # поэтому funding_* тут часто None. Досчитываем прямо тут, чтобы в TG было значение.
+                if best.get("funding_expected_pct") is None:
+                    sym = str(best.get("symbol") or "")
+                    lex = str(best.get("long_ex") or "")
+                    sex = str(best.get("short_ex") or "")
+                    hold_h = float(os.getenv("EXPECTED_HOLDING_H", "24") or 24)
+                    hold_sec = int(hold_h * 3600)
+
+                    r_long, nxt_long, per_long, url_long, err_long = _funding_fetch_one_diag(lex, sym)
+                    r_short, nxt_short, per_short, url_short, err_short = _funding_fetch_one_diag(sex, sym)
+
+                    best["funding_rate_cheap"] = r_long
+                    best["funding_rate_rich"]  = r_short
+                    best["funding_url_used"] = {"long": url_long, "short": url_short}
+                    merged_err = "; ".join([x for x in [err_long, err_short] if x])
+                    best["funding_err"] = merged_err if merged_err else None
+
+                    # compute expected funding pct using a minimal in-memory cache (just these 2 legs)
+                    tmp_cache = {
+                        lex.lower().strip(): {sym: (r_long, nxt_long, per_long)},
+                        sex.lower().strip(): {sym: (r_short, nxt_short, per_short)},
+                    }
+                    pct, det = expected_funding_pnl_pct(
+                        sym, lex, sex, hold_sec,
+                        reverse_side=False, funding_cache=tmp_cache
+                    )
+                    best["funding_expected_pct"] = pct
+                    if det:
+                        best["funding_cycles"] = det.get("cycles")
+                        best["funding_hold_sec_used"] = det.get("hold_sec_used")
+
+                # fail loudly if funding is required by config
+                funding_min = float(os.getenv("FUNDING_MIN_PCT", "0") or 0)
+                if funding_min > 0 and best.get("funding_expected_pct") is None:
+                    raise RuntimeError(
+                        f"funding_expected_pct is None while FUNDING_MIN_PCT={funding_min}; "
+                        f"funding_err={best.get('funding_err')}; urls={best.get('funding_url_used')}"
+                    )
+                
                 card = format_signal_card(best, per_leg_notional_usd, price_source)
                 reasons_text = "\n".join(f"• {r}" for r in skip_reasons)
                 maybe_send_telegram(
