@@ -777,6 +777,10 @@ def candidate_rating_z(df: "pd.DataFrame", now_ms_val: Optional[int] = None) -> 
     n_cap       = float(getenv_float("CAND_RATING_N_CAP", 200.0))       # reaches max around this n
     stale_sec   = float(getenv_float("CAND_RATING_STALE_SEC", 3600.0))  # 1h → start discounting
 
+
+    # optional funding bonus to ranking (only when a funding event is realistically reachable)
+    fund_w = float(getenv_float("CAND_RATING_FUNDING_WEIGHT", 0.50))  # 0..1 of bonus_max_z
+    fund_scale_pct = float(getenv_float("CAND_RATING_FUNDING_SCALE_PCT", 0.50))  # pct that maps to full bonus
     if now_ms_val is None:
         now_ms_val = now_ms()
 
@@ -798,6 +802,26 @@ def candidate_rating_z(df: "pd.DataFrame", now_ms_val: Optional[int] = None) -> 
         age_sec = (now_ms_val - upd) / 1000.0
         discount = (1.0 - (age_sec / max(stale_sec, 1.0))).clip(lower=0.0, upper=1.0)
         rating = rating * discount
+
+    # funding as a bonus to ranking (does NOT block trades)
+    # Important: funding is *discrete* (settles at funding timestamp). If we won't realistically hold
+    # through at least one settlement, we do NOT treat expected funding as economic edge.
+    if fund_w > 0:
+        fcol = None
+        if "funding_expected_pct_realistic" in df.columns:
+            fcol = "funding_expected_pct_realistic"
+        elif "funding_expected_pct" in df.columns and "funding_cycles" in df.columns:
+            # use expected_pct only when cycles>=1
+            f = pd.to_numeric(df["funding_expected_pct"], errors="coerce").fillna(0.0)
+            cyc = pd.to_numeric(df["funding_cycles"], errors="coerce").fillna(0.0)
+            df = df.copy()
+            df["funding_expected_pct_realistic"] = np.where(cyc >= 1, f, 0.0)
+            fcol = "funding_expected_pct_realistic"
+        if fcol is not None:
+            f = pd.to_numeric(df[fcol], errors="coerce").fillna(0.0)
+            f_pos = f.clip(lower=0.0)
+            f_frac = (f_pos / max(fund_scale_pct, 1e-9)).clip(lower=0.0, upper=1.0)
+            rating = rating + (f_frac * bonus_max_z * fund_w)
 
     return rating.fillna(0.0)
 
@@ -1848,8 +1872,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                     pass
 
             for kk in (
-                "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
-                "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                "funding_expected_pct", "funding_expected_pct_realistic", "funding_rate_cheap", "funding_rate_rich",
+                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
                 "funding_expected_usd", "net_usd_adj_total",
             ):
                 if (r.get(kk) is None) and (payload.get(kk) is not None):
@@ -3220,17 +3244,22 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                 pass           
             # add funding into the economic picture (used by facts/card)
             try:
-                f_usd = 0.0 if f_pct is None else (float(f_pct) / 100.0) * float(per_leg_notional_usd)
+                f_cycles = float(best.get("funding_cycles") or 0.0)
+                # only count funding economically if at least one settlement is realistically reachable
+                f_pct_real = 0.0 if (f_pct is None or f_cycles < 1) else float(f_pct)
+                f_usd = (f_pct_real / 100.0) * float(per_leg_notional_usd)
                 best["funding_expected_usd"] = f_usd
+                best["funding_expected_pct_realistic"] = f_pct_real
                 if best.get("net_usd_adj") is not None:
                     best["net_usd_adj_total"] = float(best.get("net_usd_adj")) + float(f_usd)
             except Exception:
                 pass
 
-            funding_ok = (f_pct is not None) and (float(f_pct) >= FUNDING_MIN_PCT)
+            FUNDING_HARD_FILTER = os.getenv("FUNDING_HARD_FILTER", "False").lower() == "true"
+            funding_ok = (f_pct is not None) and (float(f_pct) >= FUNDING_MIN_PCT) and (float(best.get("funding_cycles") or 0) >= 1)
             best["funding_ok"] = funding_ok
-            if not funding_ok:
-                return _reject(f"precheck failed (funding): expected={f_pct}%, min={FUNDING_MIN_PCT}%")
+            if FUNDING_HARD_FILTER and FUNDING_MIN_PCT > 0 and not funding_ok:
+                return _reject(f"precheck failed (funding): expected={f_pct}%, cycles={best.get('funding_cycles')}, min={FUNDING_MIN_PCT}%")
         except Exception as e:
             # if funding check is enabled but fetch fails, do NOT block trading
             best["funding_ok"] = True
@@ -6007,14 +6036,20 @@ def positions_once(
 
                 # funding_ok and net_usd_adj_total (net + funding in USD)
                 pre_sorted["funding_ok"] = True
-                if FUNDING_MIN_PCT > 0:
+                FUNDING_HARD_FILTER = os.getenv("FUNDING_HARD_FILTER", "False").lower() == "true"
+                if FUNDING_HARD_FILTER and FUNDING_MIN_PCT > 0:
                     pre_sorted["funding_ok"] = (
                         pre_sorted["funding_expected_pct"].notna() &
                         (pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce") >= FUNDING_MIN_PCT)
                     )
 
+                # Funding is discrete: if we won't realistically reach a settlement, treat expected funding as 0 edge.
+                cyc = pd.to_numeric(pre_sorted.get("funding_cycles", 0), errors="coerce").fillna(0.0)
+                f_pct = pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce").fillna(0.0)
+                pre_sorted["funding_expected_pct_realistic"] = np.where(cyc >= 1, f_pct, 0.0)
+
                 fund_usd = (
-                    pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce").fillna(0.0) / 100.0
+                    pre_sorted["funding_expected_pct_realistic"] / 100.0
                     * (2.0 * float(per_leg_notional_usd))
                 )
                 pre_sorted["net_usd_adj_total"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + fund_usd
@@ -6029,7 +6064,8 @@ def positions_once(
             logging.debug("positions_once: funding topN compute failed: %s", e)
 
         # 1.2) если включён funding-фильтр — режем кандидатов
-        if FUNDING_MIN_PCT > 0 and "funding_ok" in cands.columns:
+        FUNDING_HARD_FILTER = os.getenv("FUNDING_HARD_FILTER", "False").lower() == "true"
+        if FUNDING_HARD_FILTER and FUNDING_MIN_PCT > 0 and "funding_ok" in cands.columns:
             cands = cands[cands["funding_ok"]].copy()
 
         # 2) если после фильтра пусто — fallback
