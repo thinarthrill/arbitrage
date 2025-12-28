@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
+from collections import deque
 # ----------------- ENV helpers -----------------
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -42,14 +43,34 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
 
     global _CARDLOG_WARNED_NO_GCS, _CARDLOG_WARNED_BAD_PATH, _CARDLOG_WARNED_UPLOAD_FAIL
 
+    # Preferred: single full gs:// path
     gs_raw = getenv_str("CARD_LOG_JSONL_PATH", "").strip()
+
+    # Backward compatible envs:
+    # - TG_LOG_JSONL_PATH=gs://bucket/object.jsonl
+   # - TG_LOG_BUCKET + TG_LOG_OBJECT
+    # - LOG_GCS_BUCKET + LOG_GCS_OBJECT (legacy from other logger)
+    if not gs_raw:
+        gs_raw = getenv_str("TG_LOG_JSONL_PATH", "").strip()
+    if not gs_raw:
+        b = (getenv_str("TG_LOG_BUCKET", "").strip()
+             or getenv_str("LOG_GCS_BUCKET", "").strip())
+        o = (getenv_str("TG_LOG_OBJECT", "").strip()
+             or getenv_str("LOG_GCS_OBJECT", "").strip())
+        if b and o:
+            gs_raw = f"gs://{b}/{o}"
+
     gs_path = bucketize_path(gs_raw)
+
     if not gs_path or not is_gs(gs_path):
         # если env задан, но путь не gs:// — покажем один раз
         if gs_raw and (not _CARDLOG_WARNED_BAD_PATH):
             _CARDLOG_WARNED_BAD_PATH = True
-            logging.warning("CARD_LOG_JSONL_PATH is set but not a gs:// path after bucketize: raw=%r -> %r",
-                            gs_raw, gs_path)
+            logging.warning(
+                "Card log path is set but not a gs:// path after bucketize: raw=%r -> %r "
+                "(supported envs: CARD_LOG_JSONL_PATH, TG_LOG_JSONL_PATH, TG_LOG_BUCKET+TG_LOG_OBJECT)",
+                gs_raw, gs_path
+            )
         return
 
     # Если библиотека GCS недоступна — раньше это выстреливало исключением и молча глушилось ниже
@@ -757,6 +778,22 @@ INSTANT_ALERT = os.getenv("INSTANT_ALERT", "True").lower() == "true"
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+# --- Spread lifetime tracker (anti "dead-fast" spreads) ---
+# key: "SYMBOL:cheap_ex:rich_ex" -> deque([ts_sec,...])
+_SPREAD_TRACKER: Dict[str, deque] = {}
+
+def track_spread_lifetime_ms(key: str, now_ts: Optional[float] = None, maxlen: int = 10) -> Tuple[int, int]:
+    """Returns (lifetime_ms, ticks_alive) for a given spread key."""
+    if now_ts is None:
+        now_ts = time.time()
+    dq = _SPREAD_TRACKER.get(key)
+    if dq is None:
+        dq = deque(maxlen=maxlen)
+        _SPREAD_TRACKER[key] = dq
+    dq.append(float(now_ts))
+    lifetime_ms = int(max(0.0, (dq[-1] - dq[0])) * 1000.0) if len(dq) >= 2 else 0
+    return lifetime_ms, len(dq)
 
 from typing import Optional
 
@@ -1754,7 +1791,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.55</b>")
+    lines.append(f"\n<b> ver: 2.59</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3094,6 +3131,23 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     if not cheap_ex or not rich_ex or cheap_ex == rich_ex:
         return _reject(f"bad exchanges: cheap_ex={cheap_ex}, rich_ex={rich_ex}")
 
+    # --- NEW: max open trades safety ---
+    try:
+        MAX_OPEN_TRADES = int(getenv_float("MAX_OPEN_TRADES", 1))
+    except Exception:
+        MAX_OPEN_TRADES = 1
+    try:
+        df_pos_chk = load_positions(pos_path)
+        open_cnt = 0
+        if df_pos_chk is not None and not df_pos_chk.empty and "status" in df_pos_chk.columns:
+            open_cnt = int(df_pos_chk["status"].isin(["open", "closing"]).sum())
+        best["open_positions_cnt"] = open_cnt
+        best["max_open_trades_used"] = int(MAX_OPEN_TRADES)
+        if MAX_OPEN_TRADES > 0 and open_cnt >= MAX_OPEN_TRADES:
+            return _reject(f"max_open_trades_reached: open_cnt={open_cnt} >= {MAX_OPEN_TRADES}")
+    except Exception:
+        pass
+
     px_low  = float(best.get("px_low")  or 0.0)
     px_high = float(best.get("px_high") or 0.0)
     if px_low <= 0 or px_high <= 0:
@@ -3160,18 +3214,56 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     spread_ok = bool(flags["spread_ok"])
     z_ok = bool(flags["z_ok"])
     std_ok = bool(flags["std_ok"])
+        
+    # --- NEW: spread lifetime gate (anti "dead-fast" spreads) ---
+    MIN_SPREAD_LIFETIME_MS = int(getenv_float("MIN_SPREAD_LIFETIME_MS", 400))
+    MIN_SPREAD_TICKS = int(getenv_float("MIN_SPREAD_TICKS", 3))
+    _k = f"{sym}:{cheap_ex}:{rich_ex}"
+    spread_lifetime_ms, spread_ticks_alive = track_spread_lifetime_ms(_k)
+    spread_alive_ok = (spread_lifetime_ms >= MIN_SPREAD_LIFETIME_MS) and (spread_ticks_alive >= MIN_SPREAD_TICKS)
+    best["spread_lifetime_ms"] = int(spread_lifetime_ms)
+    best["spread_ticks_alive"] = int(spread_ticks_alive)
+    best["spread_alive_ok"] = bool(spread_alive_ok)
+    best["min_spread_lifetime_ms_used"] = int(MIN_SPREAD_LIFETIME_MS)
+    best["min_spread_ticks_used"] = int(MIN_SPREAD_TICKS)
 
+    # --- NEW: composite candidate score (money × quality) ---
+    Z_REF = float(getenv_float("Z_REF", 2.5))
+    MAX_Z_MULT = float(getenv_float("MAX_Z_MULT", 1.5))
     if ENTRY_MODE == "zscore":
-        if not (eco_ok and z_ok and std_ok):
-            return _reject(
-                f"precheck failed (zscore): eco_ok={eco_ok}, z_ok={z_ok}, std_ok={std_ok}"
-            )
+        z_abs = abs(float(z)) if (z == z) else 0.0
+        z_mult = min(z_abs / max(Z_REF, 1e-9), MAX_Z_MULT)
     else:
-        if not (eco_ok and spread_ok):
-            return _reject(
-                f"precheck failed (price): eco_ok={eco_ok}, spread_ok={spread_ok}"
-            )
+        # In price-mode, z is not a hard factor; keep multiplier neutral
+        z_mult = 1.0
+    candidate_score = (float(net_adj) if (net_adj == net_adj) else 0.0) * float(z_mult)
+    best["z_mult"] = round(float(z_mult), 4)
+    best["candidate_score"] = round(float(candidate_score), 6)
 
+    FINAL_SCORE_MIN = float(getenv_float("FINAL_SCORE_MIN", 1.5))
+    best["final_score_min_used"] = float(FINAL_SCORE_MIN)
+
+    # --- NEW: final open gate (spread-hunter oriented)
+    # z_ok is NOT a hard gate anymore. z contributes via candidate_score.
+    open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
+
+    if not spread_alive_ok:
+        skip_reasons.append("spread_dead_fast")
+    if float(candidate_score) < float(FINAL_SCORE_MIN):
+        skip_reasons.append("low_candidate_score")
+    if not std_ok and ENTRY_MODE == "zscore":
+        skip_reasons.append("std_too_low")
+    if not spread_ok:
+        skip_reasons.append("spread_too_low")
+    if not eco_ok:
+        skip_reasons.append("eco_too_low")
+
+    best["open_ok"] = bool(open_ok)
+    best["open_skip_reasons"] = list(skip_reasons)
+
+    if not open_ok:
+        return _reject("precheck failed: " + ", ".join(skip_reasons))
+ 
     # --- 2) refresh-confirm (подтверждаем BBO на месте) ---
     REFRESH_CONFIRM = getenv_bool("REFRESH_CONFIRM", True)
     REFRESH_CONFIRM_SEC = float(getenv_float("REFRESH_CONFIRM_SEC", 0.25))
@@ -3908,7 +4000,7 @@ def scan_spreads_once(
         if not valid.empty:
             valid["__rating_z__"] = candidate_rating_z(valid)
             valid["__score__"] = (
-                (valid["z"] + valid["__rating_z__"]) * 10000
+                valid["__rating_z__"] * 10000
                 + valid.get("net_usd_adj_total", valid["net_usd_adj"]).fillna(0)
             )
             cands = valid.sort_values("__score__", ascending=False).reset_index(drop=True)
@@ -3942,13 +4034,19 @@ def scan_spreads_once(
 
     # ---- has_open: ГЛОБАЛЬНЫЙ флаг — есть ли хотя бы ОДНА открытая позиция ----
     has_open = False
+    open_cnt = 0
+    # FIX: df_pos должен быть определён всегда (иначе Pylance ругается и логика может падать)
+    df_pos = pd.DataFrame()
     try:
         df_pos = load_positions(pos_path_for_instant or pos_path)
         if df_pos is not None and not df_pos.empty and "status" in df_pos.columns:
-            # считаем, что status in ["open", "closing"] = позиция занята
-            has_open = any(df_pos["status"].isin(["open", "closing"]))
+            open_cnt = int(df_pos["status"].isin(["open", "closing"]).sum())
+            has_open = open_cnt > 0
     except Exception:
         has_open = False
+        open_cnt = 0
+
+    MAX_OPEN_TRADES = int(getenv_float("MAX_OPEN_TRADES", 1))
 
     # ---- entry filters / cond_open ----
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
@@ -6258,10 +6356,14 @@ def positions_once(
     try:
         if not df_pos.empty and "status" in df_pos.columns:
             # глобальный признак: есть ли хотя бы одна активная позиция
-            has_open = any(df_pos["status"].isin(["open", "closing"]))
+            open_cnt = int(df_pos["status"].isin(["open", "closing"]).sum())
+            has_open = open_cnt > 0
     except Exception:
         has_open = False
+        open_cnt = 0
 
+    # FIX: MAX_OPEN_TRADES используется ниже в positions_once (Pylance ругался, что переменная не определена)
+    MAX_OPEN_TRADES = int(getenv_float("MAX_OPEN_TRADES", 1))
     # ------------------------------
     # 4) проверяем открытые позиции на выход
     # ------------------------------
@@ -6945,7 +7047,7 @@ def positions_once(
 
     # 6) ЕДИНЫЙ путь ОТКРЫТИЯ (через atomic_cross_open)
     # ------------------------------
-    if (not has_open) and best is not None:
+    if best is not None and (MAX_OPEN_TRADES <= 0 or open_cnt < MAX_OPEN_TRADES):
         entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
         spread_bps = float(best.get("spread_bps") or 0.0)
@@ -6974,7 +7076,24 @@ def positions_once(
         z_ok      = bool(flags["z_ok"])
         std_ok    = bool(flags["std_ok"])
 
-        if spread_ok and eco_ok and z_ok and std_ok:
+        # spread lifetime (anti-dead-fast)
+        MIN_SPREAD_LIFETIME_MS = int(getenv_float("MIN_SPREAD_LIFETIME_MS", 400))
+        MIN_SPREAD_TICKS = int(getenv_float("MIN_SPREAD_TICKS", 3))
+        _k = f"{str(best.get('symbol') or '').upper()}:{str(best.get('long_ex') or '').lower()}:{str(best.get('short_ex') or '').lower()}"
+        spread_lifetime_ms, spread_ticks_alive = track_spread_lifetime_ms(_k)
+        spread_alive_ok = (spread_lifetime_ms >= MIN_SPREAD_LIFETIME_MS) and (spread_ticks_alive >= MIN_SPREAD_TICKS)
+
+        # composite score (money × quality)
+        Z_REF = float(getenv_float("Z_REF", 2.5))
+        MAX_Z_MULT = float(getenv_float("MAX_Z_MULT", 1.5))
+        z_mult = min((abs(z) / max(Z_REF, 1e-9)) if (z == z) else 0.0, MAX_Z_MULT) if entry_mode_loc == "zscore" else 1.0
+        candidate_score = float(net_adj) * float(z_mult)
+        FINAL_SCORE_MIN = float(getenv_float("FINAL_SCORE_MIN", 1.5))
+
+        # z_ok is NOT a hard gate anymore; it affects candidate_score only.
+        open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
+
+        if open_ok:
             _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
             ok, attempt_id, meta = atomic_cross_open(
                 symbol=str(best["symbol"]).upper(),
