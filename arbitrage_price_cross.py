@@ -13,6 +13,41 @@ load_dotenv()
 
 
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
+
+# --- Structured event logs (JSONL) for post-trade analysis ---
+# Stored in the same GCS folder as CARD_LOG_JSONL_PATH / TG_LOG_JSONL_PATH (tg_cards.jsonl)
+def _gcs_dir_from_path(gs_path: str) -> str:
+    if not gs_path or not gs_path.startswith("gs://"):
+        return ""
+    # gs://bucket/dir/file -> gs://bucket/dir
+    p = gs_path.split("gs://", 1)[1]
+    parts = p.split("/", 1)
+    bucket = parts[0]
+    obj = parts[1] if len(parts) > 1 else ""
+    if "/" in obj:
+        d = obj.rsplit("/", 1)[0]
+        return f"gs://{bucket}/{d}"
+    return f"gs://{bucket}"
+
+def _default_log_path(filename: str) -> str:
+    base = (os.getenv("CARD_LOG_JSONL_PATH","").strip()
+            or os.getenv("TG_LOG_JSONL_PATH","").strip()
+            or os.getenv("TG_LOG_BUCKET","").strip())
+    if base.startswith("gs://"):
+        d = _gcs_dir_from_path(base)
+        return f"{d}/{filename}" if d else ""
+    # legacy: TG_LOG_BUCKET may hold bucket name only
+    if base and not base.startswith("gs://"):
+        return f"gs://{base}/funding_scanner/{filename}"
+    return ""
+
+SIGNALS_LOG_JSONL_PATH = os.getenv("SIGNALS_LOG_JSONL_PATH", "").strip() or _default_log_path("signals_log.jsonl")
+ORDERS_LOG_JSONL_PATH  = os.getenv("ORDERS_LOG_JSONL_PATH", "").strip()  or _default_log_path("orders_log.jsonl")
+TRADES_LOG_JSONL_PATH  = os.getenv("TRADES_LOG_JSONL_PATH", "").strip()  or _default_log_path("trades_log.jsonl")
+
+# per-path uploader state
+_EVENTLOG_STATE: Dict[str, Dict[str, Any]] = {}
+
 _CARDLOG_WARNED_NO_GCS: bool = False
 _CARDLOG_WARNED_BAD_PATH: bool = False
 _CARDLOG_WARNED_UPLOAD_FAIL: bool = False
@@ -124,6 +159,78 @@ def cardlog_flush() -> None:
     """Force upload pending lines to GCS."""
     try:
         cardlog_append({"type": "flush"}, force=True)
+    except Exception:
+        pass
+
+def eventlog_append(gs_path: str, event: Dict[str, Any], force: bool = False) -> None:
+    """Append JSONL event to a per-path local file and periodically upload to GCS (overwrite object).
+
+    This mirrors cardlog_append() mechanics but allows multiple independent streams
+    (signals/orders/trades) in separate objects.
+    """
+    if not gs_path:
+        return
+
+    # guard: only gs:// supported
+    if not gs_path.startswith("gs://"):
+        return
+
+    # If GCS lib missing, do nothing (but warn once per path)
+    global _EVENTLOG_STATE
+    st = _EVENTLOG_STATE.get(gs_path)
+    if st is None:
+        st = {"warned_no_gcs": False, "warned_upload_fail": False, "local": None,
+              "pending": 0, "last_upload_ts": 0.0}
+        _EVENTLOG_STATE[gs_path] = st
+
+    if not GCS_AVAILABLE:
+        if not st["warned_no_gcs"]:
+            st["warned_no_gcs"] = True
+            logging.warning("GCS event logging disabled (google-cloud-storage missing). path=%s", gs_path)
+        return
+
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    if st["local"] is None:
+        # local file per stream/path per day (safe for restarts)
+        safe = hashlib.sha1(gs_path.encode("utf-8")).hexdigest()[:10]
+        st["local"] = f"/tmp/ev_{safe}_{day}_{RUN_ID}.jsonl"
+
+    try:
+        evt = dict(event or {})
+        evt["_ts_utc"] = evt.get("_ts_utc") or _utc_iso()
+        evt["_run_id"] = evt.get("_run_id") or RUN_ID
+        with open(st["local"], "a", encoding="utf-8") as f:
+           f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+        st["pending"] += 1
+    except Exception as e:
+        logging.warning("eventlog local append failed: %s", e)
+        return
+
+    upload_every_sec = float(getenv_float("EVENT_LOG_UPLOAD_EVERY_SEC", 10.0))
+    upload_every_lines = int(getenv_float("EVENT_LOG_UPLOAD_EVERY_LINES", 50))
+    now_ts = time.time()
+
+    if (not force) and (st["pending"] < upload_every_lines) and (now_ts - st["last_upload_ts"] < upload_every_sec):
+        return
+
+    try:
+        with open(st["local"], "r", encoding="utf-8") as f:
+            data = f.read()
+        gcs_upload_text(gs_path, data, content_type="text/plain")
+        st["last_upload_ts"] = now_ts
+        st["pending"] = 0
+    except Exception as e:
+        if not st["warned_upload_fail"]:
+            st["warned_upload_fail"] = True
+            logging.warning("eventlog upload failed (first failure). path=%s err=%s", gs_path, e)
+        else:
+            logging.warning("eventlog upload failed. path=%s err=%s", gs_path, e)
+
+def eventlog_flush() -> None:
+    """Force upload pending lines for all streams."""
+    try:
+        for p in list(_EVENTLOG_STATE.keys()):
+            eventlog_append(p, {"type": "flush"}, force=True)
     except Exception:
         pass
 
@@ -1791,7 +1898,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.59</b>")
+    lines.append(f"\n<b> ver: 2.60</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3122,6 +3229,32 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                 maybe_send_telegram(
                     "⚪ <b>OPEN SKIPPED</b>\n" + card + f"\nПричины:\n{reasons_text}"
                 )
+                try:
+                    best["open_skip_reasons"] = list(skip_reasons or [])
+                    eventlog_append(SIGNALS_LOG_JSONL_PATH, {
+                        "event": "signal",
+                        "stage": "open_skipped",
+                        "symbol": best.get("symbol"),
+                        "long_ex": best.get("long_ex"),
+                        "short_ex": best.get("short_ex"),
+                        "spread_bps": best.get("spread_bps"),
+                        "net_usd_adj": best.get("net_usd_adj"),
+                        "net_total": best.get("net_total"),
+                        "z": best.get("z"),
+                        "std": best.get("std"),
+                        "funding_exp_pct": best.get("funding_exp_pct"),
+                        "eco_ok": best.get("eco_ok"),
+                        "spread_ok": best.get("spread_ok"),
+                        "z_ok": best.get("z_ok"),
+                        "std_ok": best.get("std_ok"),
+                        "stats_ok": best.get("stats_ok"),
+                        "cond_open": best.get("cond_open"),
+                        "open_attempted": best.get("open_attempted"),
+                        "open_ok": best.get("open_ok"),
+                        "open_skip_reasons": best.get("open_skip_reasons", []),
+                    })
+                except Exception:
+                    pass
             except Exception:
                 # не ломаем основной поток из-за ошибок в отправке дебажной карточки
                 logging.exception("Failed to send OPEN SKIPPED card for %s", sym)
@@ -3546,6 +3679,23 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         maybe_send_telegram(
             "✅ <b>OPENED</b>\n" + format_signal_card(best_opened, per_leg_notional_usd, price_source)
         )
+        try:
+            eventlog_append(TRADES_LOG_JSONL_PATH, {
+                "event": "trade_open",
+                "trade_id": meta.get("attempt_id") or meta.get("trade_id") or "",
+                "symbol": sym,
+                "long_ex": best_opened.get("long_ex"),
+                "short_ex": best_opened.get("short_ex"),
+                "qty": meta.get("qty"),
+                "open_long_px": meta.get("open_long_px"),
+                "open_short_px": meta.get("open_short_px"),
+                "expected_net_usd_adj": best_opened.get("net_usd_adj"),
+                "z": best_opened.get("z"),
+                "std": best_opened.get("std"),
+                "spread_bps": best_opened.get("spread_bps"),
+            })
+        except Exception:
+            pass
         return True
 
     else:
@@ -3559,6 +3709,24 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             rb_warn = f"\n⚠️ ROLLBACK WARNING: check {rb_sym} on {rb_ex}"
 
         logging.warning("Instant open failed for %s: %s", sym, err)
+        try:
+            eventlog_append(TRADES_LOG_JSONL_PATH, {
+                "event": "trade_open_failed",
+                "trade_id": (meta or {}).get("attempt_id") or "",
+                "symbol": sym,
+                "long_ex": best.get("long_ex"),
+                "short_ex": best.get("short_ex"),
+                "error": err,
+                "open_skip_reasons": best.get("open_skip_reasons", []),
+                "cond_open": best.get("cond_open"),
+                "z": best.get("z"),
+                "std": best.get("std"),
+                "spread_bps": best.get("spread_bps"),
+                "net_usd_adj": best.get("net_usd_adj"),
+                "funding_exp_pct": best.get("funding_exp_pct"),
+            })
+        except Exception:
+            pass
 
         if getenv_bool("DEBUG_INSTANT_OPEN", False):
             card = format_signal_card(best, per_leg_notional_usd, getenv_str("PRICE_SOURCE", "mid"))
@@ -4308,8 +4476,40 @@ def bybit_feasible(symbol: str, qty: float, price: float) -> Tuple[bool,str,floa
 
 def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
                              paper: bool=False, cl_oid: str|None=None, reduce_only: bool=False) -> dict:
+    _order_evt_id = uuid.uuid4().hex[:12]
+    _t0 = time.time()
+    try:
+        eventlog_append(ORDERS_LOG_JSONL_PATH, {
+            "event": "order_place",
+            "order_evt_id": _order_evt_id,
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "reduce_only": bool(reduce_only),
+            "cl_oid": cl_oid or "",
+            "paper": bool(paper),
+        })
+    except Exception:
+        pass
     if paper:
-        return {"status":"FILLED","avg_price":0.0,"order_id": f"paper-{uuid.uuid4().hex[:8]}", "fee_usd":0.0}
+        res = {"status":"FILLED","avg_price":0.0,"order_id": f"paper-{uuid.uuid4().hex[:8]}", "fee_usd":0.0}
+        try:
+            eventlog_append(ORDERS_LOG_JSONL_PATH, {
+                "event": "order_result",
+                "order_evt_id": _order_evt_id,
+                "exchange": exchange,
+                "symbol": symbol,
+                "status": res.get("status"),
+                "avg_price": res.get("avg_price"),
+                "filled_qty": qty,
+                "order_id": res.get("order_id"),
+                "fee_usd": res.get("fee_usd"),
+                "latency_ms": int((time.time()-_t0)*1000),
+            })
+        except Exception:
+            pass
+        return res
     ex = exchange.lower()
     if ex == "binance":
         binance_sync_time()
@@ -4619,6 +4819,31 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
             fee = 0.0
         oid = str(data.get("id") or data.get("order_id") or "")
 
+        try:
+            _res = {
+                "status": "FILLED",
+                "avg_price": avg,
+                "order_id": oid,
+                "client_order_id": cl_oid,
+                "fee_usd": abs(fee),
+            }
+            eventlog_append(ORDERS_LOG_JSONL_PATH, {
+                "event": "order_result",
+                "order_evt_id": _order_evt_id,
+                "exchange": exchange,
+                "symbol": symbol,
+                "status": _res.get("status"),
+                "avg_price": _res.get("avg_price"),
+                "filled_qty": qty,
+                "order_id": _res.get("order_id"),
+                "client_order_id": _res.get("client_order_id"),
+                "fee_usd": _res.get("fee_usd"),
+                "latency_ms": int((time.time()-_t0)*1000),
+            })
+        except Exception:
+            _res = None
+        if _res is not None:
+            return _res
         return {
             "status": "FILLED",
             "avg_price": avg,
@@ -6315,6 +6540,35 @@ def positions_once(
     if top3_to_tg and top3_to_tg > 0 and not cands.empty:
         topN = cands.head(int(top3_to_tg)).to_dict("records")
         for rec in topN:
+            try:
+                eventlog_append(SIGNALS_LOG_JSONL_PATH, {
+                    "event": "signal",
+                    "stage": "topN",
+                    "symbol": rec.get("symbol"),
+                    "long_ex": rec.get("long_ex"),
+                    "short_ex": rec.get("short_ex"),
+                    "px_low": rec.get("px_low"),
+                    "px_high": rec.get("px_high"),
+                    "spread_bps": rec.get("spread_bps"),
+                    "spread_pct": rec.get("spread_pct"),
+                    "net_usd": rec.get("net_usd"),
+                    "net_usd_adj": rec.get("net_usd_adj"),
+                    "net_total": rec.get("net_total"),
+                    "z": rec.get("z"),
+                    "std": rec.get("std"),
+                    "funding_exp_pct": rec.get("funding_exp_pct"),
+                    "eco_ok": rec.get("eco_ok"),
+                    "spread_ok": rec.get("spread_ok"),
+                    "z_ok": rec.get("z_ok"),
+                    "std_ok": rec.get("std_ok"),
+                    "stats_ok": rec.get("stats_ok"),
+                    "cond_open": rec.get("cond_open"),
+                    "open_attempted": rec.get("open_attempted"),
+                    "open_ok": rec.get("open_ok"),
+                    "open_skip_reasons": rec.get("open_skip_reasons", []),
+                })
+            except Exception:
+                pass
             msg = format_signal_card(rec, per_leg_notional_usd, price_source)
             try:
                 maybe_send_telegram(msg)
@@ -6884,7 +7138,19 @@ def positions_once(
                             "positions_once: balances fetch failed: %s",
                             e_imp,
                         )
-
+                    try:
+                        eventlog_append(TRADES_LOG_JSONL_PATH, {
+                            "event": "trade_close",
+                            "trade_id": row.get("attempt_id") or row.get("trade_id") or "",
+                            "symbol": sym,
+                            "long_ex": ex_l,
+                            "short_ex": ex_h,
+                            "close_reason": row.get("close_reason") or "",
+                            "realized_pnl_usd": row.get("pnl_usd") if "pnl_usd" in row else None,
+                            "closed_at": row.get("closed_at") or "",
+                        })
+                    except Exception:
+                        pass
                     msg_lines = ["✅ <b>CLOSED</b>"]
                     
                     # вставляем equity сразу после заголовка, если он есть
