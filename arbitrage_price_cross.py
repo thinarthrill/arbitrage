@@ -685,6 +685,104 @@ def cardlog_append_once(event: Dict[str, Any], force: bool = False) -> None:
         cardlog_append(evt, force=force)
     except Exception:
         pass
+
+# ----------------- Generic events JSONL logger (GCS append semantics) -----------------
+_EVENTSLOG_STATE: Dict[str, Any] = {
+    "locals": {},          # key -> local_path
+    "pending": {},         # key -> [lines]
+    "last_upload": {},     # key -> ts
+    "warned_bad_path": set(),
+    "warned_upload_fail": set(),
+}
+_EVENTSLOG_DEDUP: Dict[str, float] = {}
+_EVENTSLOG_DEDUP_TTL_SEC = int(getenv_float("EVENTLOG_DEDUP_TTL_SEC", 300))
+_EVENTLOG_UPLOAD_EVERY_SEC = int(getenv_float("EVENTLOG_UPLOAD_EVERY_SEC", 15))
+
+def _eventlog_fingerprint(evt: Dict[str, Any]) -> str:
+    try:
+        keys = [
+            "event","stage","symbol","long_ex","short_ex","attempt_id",
+            "status","close_reason","open_ok","open_attempted",
+            "px_low","px_high","spread_bps","net_usd_adj",
+            "_ts_utc","_run_id"
+        ]
+        core = {k: evt.get(k) for k in keys if k in evt}
+        blob = json.dumps(core, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    except Exception:
+        return uuid.uuid4().hex
+
+def eventlog_append(gs_path: str, event: Dict[str, Any], key: str = "events") -> None:
+    """Append JSONL events to local file and periodically overwrite ONE gs:// file."""
+    try:
+        gs_path = bucketize_path(gs_path)
+        if not gs_path or not is_gs(gs_path):
+            if gs_path and (key not in _EVENTSLOG_STATE["warned_bad_path"]):
+                _EVENTSLOG_STATE["warned_bad_path"].add(key)
+                logging.warning("EVENTLOG bad gs path for %s: %s", key, gs_path)
+            return
+
+        local_path = _EVENTSLOG_STATE["locals"].get(key)
+        if not local_path:
+            local_path = f"/tmp/{key}.jsonl"
+            _EVENTSLOG_STATE["locals"][key] = local_path
+
+        evt = dict(event or {})
+        evt.setdefault("_ts_utc", now_utc_str())
+        evt.setdefault("_run_id", RUN_ID)
+
+        line = json.dumps(evt, ensure_ascii=False, default=str)
+        with open(local_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+        pend = _EVENTSLOG_STATE["pending"].setdefault(key, [])
+        pend.append(line)
+
+        now = time.time()
+        last = float(_EVENTSLOG_STATE["last_upload"].get(key, 0.0) or 0.0)
+        if (now - last) < _EVENTLOG_UPLOAD_EVERY_SEC and len(pend) < 50:
+            return
+
+        client = gcs_client()
+        bucket_name = gs_path[5:].split("/", 1)[0]
+        blob_name = gs_path[5 + len(bucket_name) + 1 :]
+        bucket = client.lookup_bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        with open(local_path, "rb") as rf:
+            blob.upload_from_file(rf, content_type="text/plain")
+
+        _EVENTSLOG_STATE["last_upload"][key] = now
+        _EVENTSLOG_STATE["pending"][key] = []
+    except Exception as e:
+        if key not in _EVENTSLOG_STATE["warned_upload_fail"]:
+            _EVENTSLOG_STATE["warned_upload_fail"].add(key)
+            logging.warning("EVENTLOG upload failed for %s: %s", key, e)
+
+def eventlog_append_once(gs_path: str, event: Dict[str, Any], key: str = "events") -> None:
+    """Dedup wrapper to avoid double-writing same event."""
+    try:
+        evt = dict(event or {})
+        eid = str(evt.get("_event_id") or _eventlog_fingerprint(evt))
+        evt["_event_id"] = eid
+        now = time.time()
+        for k, ts in list(_EVENTSLOG_DEDUP.items()):
+            if now - ts > _EVENTSLOG_DEDUP_TTL_SEC:
+                _EVENTSLOG_DEDUP.pop(k, None)
+        if eid in _EVENTSLOG_DEDUP:
+            return
+        _EVENTSLOG_DEDUP[eid] = now
+        eventlog_append(gs_path, evt, key=key)
+    except Exception:
+        pass
+
+def get_events_log_path() -> str:
+    """Where to store aggregated events.jsonl in GCS."""
+    p = getenv_str("EVENTS_JSONL_PATH", "").strip()
+    if p:
+        return bucketize_path(p)
+    prefix = getenv_str("LOG_PREFIX", "").strip() or getenv_str("TG_LOG_PREFIX", "").strip() or "funding_scanner"
+    return bucketize_path(f"{prefix.rstrip('/')}/events.jsonl")
+
 # ----------------- Unified entry filters (avoid duplicates) -----------------
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
 
@@ -1898,7 +1996,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.60</b>")
+    lines.append(f"\n<b> ver: 2.61</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2116,6 +2214,14 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # write once (dedup inside)
         cardlog_append_once(payload)
+        # Also persist the full card payload for later signal/trade analytics
+        try:
+            _ev = dict(payload)
+            _ev.setdefault("event", "signal")
+            _ev.setdefault("stage", "telegram")
+            eventlog_append_once(get_events_log_path(), _ev, key="events")
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -3172,7 +3278,28 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             # keep normalized fields for logs/telegram
             best["open_skip_reasons"] = list(skip_reasons)
             best["open_skip_reason"] = "; ".join(str(x) for x in skip_reasons if x)
-            best["open_ok"] = False            
+            best["open_ok"] = False        
+            # ---- eventlog: open skip ----
+            try:
+                _ev = {
+                    "event": "trade",
+                    "stage": "open_skip",
+                    "symbol": str(best.get("symbol") or best.get("sym") or ""),
+                    "long_ex": str(best.get("cheap_ex") or best.get("long_ex") or ""),
+                    "short_ex": str(best.get("rich_ex") or best.get("short_ex") or ""),
+                    "attempt_id": attempt_id,
+                    "open_ok": False,
+                    "open_skip_reasons": list(best.get("open_skip_reasons") or best.get("_open_skip_reasons") or []),
+                    "open_skip_reason": best.get("open_skip_reason") or "",
+                    "spread_bps": best.get("spread_bps"),
+                    "net_usd_adj": best.get("net_usd_adj"),
+                    "z": best.get("z"),
+                    "std": best.get("std"),
+                    "funding_expected_pct": best.get("funding_expected_pct") or best.get("funding_exp_pct"),
+                }
+                eventlog_append_once(get_events_log_path(), _ev, key="events")
+            except Exception:
+                pass    
         except Exception:
             pass
 
@@ -5344,6 +5471,25 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
     Без reduce_only. Возвращаем метаданные и клиентские id.
     """
     attempt_id = new_attempt_id()
+    # ---- eventlog: open attempt (before any early returns) ----
+    try:
+        _ev = {
+            "event": "trade",
+            "stage": "open_attempt",
+            "symbol": str(symbol or ""),
+            "long_ex": str(cheap_ex or ""),
+            "short_ex": str(rich_ex or ""),
+            "attempt_id": attempt_id,
+            "open_attempted": True,
+            "qty_req": float(qty) if qty is not None else None,
+            "px_low_req": float(price_low) if price_low is not None else None,
+            "px_high_req": float(price_high) if price_high is not None else None,
+            "paper": bool(paper),
+            "reverse_side": bool(reverse_side),
+        }
+        eventlog_append_once(get_events_log_path(), _ev, key="events")
+    except Exception:
+        pass
 
     # проверяем исполнимость по шагам/минимумам
     if cheap_ex.lower() == "bybit":
@@ -6689,6 +6835,28 @@ def positions_once(
                     except Exception:
                         pass
 
+                    # ---- eventlog: close ok ----
+                    try:
+                        _row = df_pos.loc[i].to_dict()
+                        _ev = {
+                            "event": "trade",
+                            "stage": "close_ok",
+                            "symbol": str(_row.get("symbol") or ""),
+                            "long_ex": str(_row.get("long_ex") or ""),
+                            "short_ex": str(_row.get("short_ex") or ""),
+                            "attempt_id": str(_row.get("attempt_id") or _row.get("open_attempt_id") or ""),
+                            "status": "closed",
+                            "close_reason": str(_row.get("close_reason") or ""),
+                            "net_total": _row.get("net_total"),
+                            "pnl_usd": _row.get("pnl_usd") or _row.get("pnl"),
+                            "hold_sec": _row.get("hold_sec"),
+                            "opened_at": _row.get("opened_at"),
+                            "closed_at": _row.get("closed_at"),
+                        }
+                        eventlog_append_once(get_events_log_path(), _ev, key="events")
+                    except Exception:
+                        pass
+
                     # PnL из meta в CSV (аналогично обычному exit-блоку)
                     pnl = 0.0
                     try:
@@ -7038,6 +7206,28 @@ def positions_once(
                     df_pos.at[i, "close_reason"] = "exit"
                     try:
                         df_pos.at[i, "closed_at"] = now_utc_str()
+                    except Exception:
+                        pass
+
+                    # ---- eventlog: close ok ----
+                    try:
+                        _row = df_pos.loc[i].to_dict()
+                        _ev = {
+                            "event": "trade",
+                            "stage": "close_ok",
+                            "symbol": str(_row.get("symbol") or ""),
+                            "long_ex": str(_row.get("long_ex") or ""),
+                            "short_ex": str(_row.get("short_ex") or ""),
+                            "attempt_id": str(_row.get("attempt_id") or _row.get("open_attempt_id") or ""),
+                            "status": "closed",
+                            "close_reason": str(_row.get("close_reason") or ""),
+                            "net_total": _row.get("net_total"),
+                            "pnl_usd": _row.get("pnl_usd") or _row.get("pnl"),
+                            "hold_sec": _row.get("hold_sec"),
+                            "opened_at": _row.get("opened_at"),
+                            "closed_at": _row.get("closed_at"),
+                        }
+                        eventlog_append_once(get_events_log_path(), _ev, key="events")
                     except Exception:
                         pass
 
