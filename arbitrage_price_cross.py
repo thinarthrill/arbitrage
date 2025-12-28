@@ -1277,6 +1277,23 @@ def per_leg_notional_from_capital(capital_usd: float, leverage: float) -> float:
     if leverage <= 0: return max(0.0, float(capital_usd))
     return float(capital_usd) / (1.0 + 1.0/float(leverage))
 
+def _funding_effective_usd(funding_usd_full: float, hold_sec_used: int, hold_sec_effective: int) -> float:
+    """Scale expected funding (full-period) to a realistic holding time.
+
+    Scanner can compute funding for a long horizon (8h/24h),
+    but in practice you often close far earlier (e.g. 600s).
+    We apply: funding_effective = funding_full * min(hold_eff / hold_used, 1).
+    """
+    try:
+        hs = int(hold_sec_used or 0)
+        he = int(hold_sec_effective or 0)
+        if hs <= 0 or he <= 0:
+            return 0.0
+        w = min(float(he) / float(hs), 1.0)
+        return float(funding_usd_full or 0.0) * w
+    except Exception:
+        return 0.0
+
 # округление цены и qty по шагу
 def _round_to_step(x: float, step: float, mode="round"):
     if step <= 0:
@@ -1737,7 +1754,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.54</b>")
+    lines.append(f"\n<b> ver: 2.55</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -1964,14 +1981,42 @@ def maybe_send_telegram(text: str) -> None:
     token = getenv_str("TELEGRAM_BOT_TOKEN","")
     chat_id = getenv_str("TELEGRAM_CHAT_ID","")
     if not token or not chat_id: return
-    try:
-        r = SESSION.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                         json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True, "parse_mode": "HTML"},
-                         timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            logging.warning("Telegram send failed: %s %s", r.status_code, r.text[:200])
-    except Exception as e:
-        logging.warning("Telegram exception: %s", e)
+    # IMPORTANT:
+    # Telegram parse_mode="HTML" is very strict (unescaped '<', '&' can break delivery).
+    # Historically we had mixed content (plain text, markdown-ish, and sometimes <b> tags),
+    # which could silently stop notifications.
+    # Default: no parse_mode (most robust). You can force it via TELEGRAM_PARSE_MODE=HTML|Markdown|MarkdownV2.
+    parse_mode = getenv_str("TELEGRAM_PARSE_MODE", "").strip()
+
+    # Telegram message limit is 4096 chars; split to avoid 400 errors.
+    max_len = int(getenv_float("TELEGRAM_MAX_LEN", 3900))
+    chunks: list[str] = []
+    s = str(text or "")
+    while len(s) > max_len:
+        cut = s.rfind("\n", 0, max_len)
+        if cut < 100:  # no good newline → hard cut
+            cut = max_len
+        chunks.append(s[:cut])
+        s = s[cut:]
+        if s.startswith("\n"):
+            s = s[1:]
+    if s:
+        chunks.append(s)
+
+    for part in chunks:
+        try:
+            payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": True}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            r = SESSION.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code != 200:
+                logging.warning("Telegram send failed: %s %s", r.status_code, r.text[:400])
+        except Exception as e:
+            logging.warning("Telegram exception: %s", e)
 
 # ----------------- CSV / GCS -----------------
 def is_gs(path: Optional[str]) -> bool: return bool(path) and str(path).startswith("gs://")
@@ -5941,10 +5986,14 @@ def positions_once(
         cands["z_ok"]      = cands["z"].notna() & (cands["z"] >= Z_IN_LOC)
         # -------- funding-aware economics (compute funding only for a small top-K subset) --------
         hold_sec = int(float(getenv_float("FUNDING_HOLD_SEC", getenv_float("MAX_HOLD_SEC", 8*3600))))
+        # Realistic hold time for *economic* effect of funding (e.g. 600s max-hold),
+        # can be different from hold_sec used for computing funding horizon.
+        hold_sec_effective = int(float(getenv_float(
+            "FUNDING_EFFECTIVE_HOLD_SEC",
+            getenv_float("MAX_HOLD_SEC", 600.0)
+        )))
         funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
         funding_topk = int(getenv_float("FUNDING_TOPK", 80))
-
-        pre = cands[cands["spread_ok"] & cands["std_ok"] & cands["z_ok"]].copy()
 
         # Funding is useful for diagnostics even when z_ok/std_ok fail (you still send TG cards for top candidates).
         # So we compute funding for a *small* top slice from overall candidates, not only from `pre`.
@@ -5973,6 +6022,7 @@ def positions_once(
                         "funding_rate_rich": det.get("rate_rich"),
                         "funding_cycles": det.get("cycles"),
                         "funding_hold_sec_used": hold_sec,
+                        "funding_hold_sec_effective_used": hold_sec_effective,
                         "funding_min_pct_used": funding_min_pct,
                         "funding_url_used": url_used,
                         "funding_err": det.get("err"),                        
@@ -5982,7 +6032,8 @@ def positions_once(
                 funding_slice = pd.concat([funding_slice, fcols], axis=1)
                 for col in [
                     "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
-                    "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                    "funding_cycles", "funding_hold_sec_used", "funding_hold_sec_effective_used",
+                    "funding_min_pct_used",
                     "funding_url_used", "funding_err",
                 ]:
                     cands.loc[funding_slice.index, col] = funding_slice[col]
@@ -5990,21 +6041,27 @@ def positions_once(
                 logging.debug("positions_once: funding topK compute failed: %s", e)
 
         cands["funding_expected_pct"] = pd.to_numeric(cands.get("funding_expected_pct"), errors="coerce")
-        cands["funding_expected_usd"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * float(per_leg_notional_usd)
+        # Treat funding_expected_pct as % of TOTAL notional (both legs).
+        cands["funding_expected_usd_full"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * (2.0 * float(per_leg_notional_usd))
+        # Scale funding effect to realistic holding time (e.g. 600s).
+        cands["funding_expected_usd"] = cands["funding_expected_usd_full"].apply(
+            lambda x: _funding_effective_usd(float(x or 0.0), hold_sec, hold_sec_effective)
+        )
+        cands["net_usd_adj_total_full"] = cands["net_usd_adj"].fillna(0.0) + cands["funding_expected_usd_full"].fillna(0.0)
         cands["net_usd_adj_total"] = cands["net_usd_adj"].fillna(0.0) + cands["funding_expected_usd"].fillna(0.0)
+
         cands["eco_ok"]    = cands["net_usd_adj_total"].notna() & (cands["net_usd_adj_total"] > min_net_abs)
         cands["funding_ok"] = cands["funding_expected_pct"].notna() & (cands["funding_expected_pct"] >= funding_min_pct)
         if funding_min_pct <= 0:
             cands["funding_ok"] = True
-        # 1) фильтруем только валидные сигналы
-        cands = cands[
-            cands["z_ok"] &
-            cands["std_ok"] &
-            cands["spread_ok"] &
-            cands["eco_ok"]
-        ].copy()
-        # 1) фильтруем только валидные сигналы (без funding)
-        m = cands["z_ok"] & cands["std_ok"] & cands["spread_ok"] & cands["eco_ok"]
+        # 1) открывающий гейт (по умолчанию БЕЗ hard-гейтов z/std; их можно включить env-ами)
+        hard_z = getenv_bool("HARD_Z_FILTER", False)
+        hard_std = getenv_bool("HARD_STD_FILTER", False)
+        m = cands["spread_ok"] & cands["eco_ok"]
+        if hard_z:
+            m = m & cands["z_ok"]
+        if hard_std:
+            m = m & cands["std_ok"]
         cands = cands[m].copy()
 
         # 1.1) опционально: считаем expected funding только для небольшого top-N,
@@ -6048,16 +6105,23 @@ def positions_once(
                 f_pct = pd.to_numeric(pre_sorted["funding_expected_pct"], errors="coerce").fillna(0.0)
                 pre_sorted["funding_expected_pct_realistic"] = np.where(cyc >= 1, f_pct, 0.0)
 
-                fund_usd = (
+                # Treat funding_expected_pct as % of TOTAL notional (both legs).
+                pre_sorted["funding_expected_usd_full"] = (
                     pre_sorted["funding_expected_pct_realistic"] / 100.0
                     * (2.0 * float(per_leg_notional_usd))
                 )
-                pre_sorted["net_usd_adj_total"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + fund_usd
+                # Scale to realistic holding time (e.g. 600s) so eco_ok is not inflated.
+                pre_sorted["funding_expected_usd"] = pre_sorted["funding_expected_usd_full"].apply(
+                    lambda x: _funding_effective_usd(float(x or 0.0), hold_sec, hold_sec_effective)
+                )
+                pre_sorted["net_usd_adj_total_full"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + pre_sorted["funding_expected_usd_full"].fillna(0.0)
+                pre_sorted["net_usd_adj_total"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + pre_sorted["funding_expected_usd"].fillna(0.0)
 
                 for col in [
                     "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
                     "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
-                    "funding_ok", "net_usd_adj_total",
+                    "funding_ok", "funding_expected_usd_full", "funding_expected_usd",
+                    "net_usd_adj_total_full", "net_usd_adj_total",
                 ]:
                     cands.loc[pre_sorted.index, col] = pre_sorted[col]
         except Exception as e:
@@ -6073,13 +6137,15 @@ def positions_once(
             sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
             cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
         else:
-            # 3) сортировка с приоритетом zscore
-            # сначала z (убывание), затем net_adj
+            # 3) сортировка (soft-scoring вместо hard-gate по z/std)
+            # base: экономика после slippage + funding_effective
             cands["__rating_z__"] = candidate_rating_z(cands)
-            cands["__score__"] = (
-                (cands["z"] + cands["__rating_z__"]) * 10000 +
-                cands.get("net_usd_adj_total", cands["net_usd_adj"]).fillna(0)
-            )
+            net_base = cands.get("net_usd_adj_total", cands.get("net_usd_adj")).fillna(0.0)
+            z_bonus  = pd.to_numeric(cands.get("z"), errors="coerce").fillna(0.0).clip(lower=0.0) * 0.10
+            std_pen  = pd.to_numeric(cands.get("std"), errors="coerce").fillna(0.0) * 0.02
+            f_bonus  = pd.to_numeric(cands.get("funding_expected_usd"), errors="coerce").fillna(0.0) * 0.05
+            cands["__score__"] = net_base + f_bonus + z_bonus - std_pen + cands["__rating_z__"].fillna(0.0)
+
             cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
     else:
         # price режим — как раньше
@@ -6089,7 +6155,10 @@ def positions_once(
         # Optional: attach funding info for the small set we might send to Telegram
         try:
             if getenv_bool("SHOW_FUNDING_ON_CARD", True) and not cands.empty:
-                hold_sec = int(float(getenv_float("FUNDING_HOLD_SEC", getenv_float("MAX_HOLD_SEC", 8*3600))))
+                hold_sec_effective = int(float(getenv_float(
+                    "FUNDING_EFFECTIVE_HOLD_SEC",
+                    getenv_float("MAX_HOLD_SEC", 600.0)
+                )))
                 funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
                 topk = max(int(top3_to_tg or 0), int(getenv_float("FUNDING_TOPK", 80)))
                 topk = max(0, min(topk, len(cands)))
@@ -6112,6 +6181,7 @@ def positions_once(
                             "funding_rate_rich": det.get("rate_rich"),
                             "funding_cycles": det.get("cycles"),
                             "funding_hold_sec_used": hold_sec,
+                            "funding_hold_sec_effective_used": hold_sec_effective,
                             "funding_min_pct_used": funding_min_pct,
                             "funding_url_used": (det.get("url_used") or {}),
                             "funding_err": det.get("err"),                            
@@ -6121,14 +6191,21 @@ def positions_once(
                     sub = pd.concat([sub, fcols], axis=1)
                     for col in [
                         "funding_expected_pct", "funding_rate_cheap", "funding_rate_rich",
-                        "funding_cycles", "funding_hold_sec_used", "funding_min_pct_used",
+                        "funding_cycles", "funding_hold_sec_used", "funding_hold_sec_effective_used",
+                        "funding_min_pct_used",
                         "funding_url_used", "funding_err",
                     ]:
                         cands.loc[sub.index, col] = sub[col]
 
                     cands["funding_expected_pct"] = pd.to_numeric(cands.get("funding_expected_pct"), errors="coerce")
-                    cands["funding_expected_usd"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * float(per_leg_notional_usd)
+                    # Treat funding_expected_pct as % of TOTAL notional (both legs) and scale to realistic hold.
+                    cands["funding_expected_usd_full"] = (cands["funding_expected_pct"].fillna(0.0) / 100.0) * (2.0 * float(per_leg_notional_usd))
+                    cands["funding_expected_usd"] = cands["funding_expected_usd_full"].apply(
+                        lambda x: _funding_effective_usd(float(x or 0.0), hold_sec, hold_sec_effective)
+                    )
+                    cands["net_usd_adj_total_full"] = pd.to_numeric(cands.get("net_usd_adj"), errors="coerce").fillna(0.0) + cands["funding_expected_usd_full"].fillna(0.0)
                     cands["net_usd_adj_total"] = pd.to_numeric(cands.get("net_usd_adj"), errors="coerce").fillna(0.0) + cands["funding_expected_usd"].fillna(0.0)
+
         except Exception as e:
             logging.debug("positions_once: funding attach (price mode) failed: %s", e)
 
