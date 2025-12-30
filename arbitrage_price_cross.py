@@ -3004,6 +3004,83 @@ def okx_inst_from_symbol(symbol: str) -> str:
     base = s[:-4]
     return f"{base}-USDT-SWAP"
 
++
+# ---- OKX instrument specs cache (lotSz/ctVal/minSz) ----
+OKX_INST_CACHE: dict[str, dict] = {}
+
+def okx_get_swap_specs(inst_id: str) -> dict:
+    """
+    Возвращает спеки OKX для SWAP инструмента:
+      lotSz - шаг по контрактам (обычно "1")
+      ctVal - стоимость 1 контракта в базовой валюте (сколько монет в 1 контракте)
+      minSz - минимальный размер ордера в контрактах
+    """
+    inst_id = str(inst_id or "").strip()
+    if not inst_id:
+        return {}
+    if inst_id in OKX_INST_CACHE:
+        return OKX_INST_CACHE[inst_id]
+
+    tj = _get(f"{okx_base()}/api/v5/public/instruments", {"instType": "SWAP", "instId": inst_id}) or {}
+    arr = (tj.get("data") or [])
+    if not arr:
+        OKX_INST_CACHE[inst_id] = {}
+        return {}
+
+    x = arr[0] or {}
+    # поля — строковые, приводим аккуратно
+    def _f(v, default=None):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    specs = {
+        "instId": inst_id,
+        "lotSz": _f(x.get("lotSz"), 1.0),
+        "ctVal": _f(x.get("ctVal"), None),
+        "minSz": _f(x.get("minSz"), 1.0),
+        "ctType": x.get("ctType"),
+        "settleCcy": x.get("settleCcy"),
+    }
+    OKX_INST_CACHE[inst_id] = specs
+    return specs
+
+def okx_qty_base_to_sz_contracts(symbol: str, qty_base: float) -> tuple[float, dict]:
+    """
+    qty_base: количество монет (как у Binance/Bybit qty)
+    Возвращает sz в контрактах OKX, округлённый вниз до lotSz.
+    """
+    inst_id = okx_inst_from_symbol(symbol)
+    sp = okx_get_swap_specs(inst_id) or {}
+    lot = float(sp.get("lotSz") or 1.0)
+    min_sz = float(sp.get("minSz") or 1.0)
+    ct_val = sp.get("ctVal", None)
+
+    if qty_base is None or not (qty_base == qty_base) or float(qty_base) <= 0:
+        raise RuntimeError(f"OKX: bad qty_base={qty_base}")
+
+    # Для SWAP OKX sz обычно в контрактах. Если ctVal известен — переводим монеты -> контракты.
+    if ct_val is None or ct_val == 0:
+        # fallback: считаем, что qty уже в контрактах (лучше так, чем отправлять дробные монеты)
+        sz_raw = float(qty_base)
+    else:
+        sz_raw = float(qty_base) / float(ct_val)
+
+    # округляем вниз до кратности lotSz
+    if lot <= 0:
+        lot = 1.0
+    sz_adj = (math.floor(sz_raw / lot) * lot) if sz_raw > 0 else 0.0
+
+    # защита от 0 после округления
+    if sz_adj + 1e-12 < min_sz:
+        raise RuntimeError(
+            f"OKX: sz too small after rounding. "
+            f"symbol={symbol} instId={inst_id} qty_base={qty_base} -> sz_raw={sz_raw:.8f} -> sz_adj={sz_adj:.8f}, "
+            f"minSz={min_sz}, lotSz={lot}, ctVal={ct_val}"
+        )
+
+    return float(sz_adj), sp
 
 def okx_quote(symbol: str, price_source: str = "mid"):
     """
@@ -4795,13 +4872,21 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float,
         base = okx_base()
         inst_id = okx_inst_from_symbol(symbol)
         td_mode = getenv_str("OKX_TD_MODE", "cross")  # cross | isolated
+        # OKX ожидает sz в КОНТРАКТАХ и кратность lotSz (иначе sCode=51121).
+        # В коде qty приходит как "монеты" (как на Binance), поэтому переводим.
+        sz_adj, sp = okx_qty_base_to_sz_contracts(symbol, float(qty))
+        logging.info(
+            "[OKX] qty convert: symbol=%s instId=%s qty_base=%.8f -> sz=%.8f (lotSz=%s minSz=%s ctVal=%s)",
+            symbol, inst_id, float(qty), float(sz_adj),
+            sp.get("lotSz"), sp.get("minSz"), sp.get("ctVal"),
+        )
 
         body_dict = {
             "instId": inst_id,
             "tdMode": td_mode,
             "side": side.lower(),        # buy / sell
             "ordType": "market",
-            "sz": str(qty),
+            "sz": str(sz_adj),
         }
         if reduce_only:
             # у OKX reduceOnly есть только для отдельных режимов, но в демо можно попробовать
