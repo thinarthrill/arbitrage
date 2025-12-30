@@ -1996,7 +1996,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.61</b>")
+    lines.append(f"\n<b> ver: 2.62</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3004,7 +3004,6 @@ def okx_inst_from_symbol(symbol: str) -> str:
     base = s[:-4]
     return f"{base}-USDT-SWAP"
 
-+
 # ---- OKX instrument specs cache (lotSz/ctVal/minSz) ----
 OKX_INST_CACHE: dict[str, dict] = {}
 
