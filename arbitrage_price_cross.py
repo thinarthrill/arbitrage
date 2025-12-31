@@ -1528,7 +1528,7 @@ def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                 eq_after = float(snap2.get("total") or 0.0)
                 if eq_before is not None:
                     meta["pnl_usd_real"] = float(eq_after - eq_before)
-           except Exception as e:
+            except Exception as e:
                 meta["equity_after_err"] = str(e)
 
         # Backward compatibility: expose pnl_usd for existing code paths
