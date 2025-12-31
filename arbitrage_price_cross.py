@@ -1434,58 +1434,106 @@ def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec:
 def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                        qty: float, paper: bool) -> Tuple[bool, dict]:
     """
-    Закрытие кросса.
+    Закрытие кросса (две ноги), с фиксацией фактического PnL по equity delta.
 
-    По умолчанию (REVERSE_SIDE=0), закрываем:
-      cheap_ex -> SELL reduce_only (закрываем LONG)
-      rich_ex  -> BUY  reduce_only (закрываем SHORT)
+    Факт-логика:
+      - берём снимок USDT equity на обеих биржах ДО close
+      - исполняем два reduce_only market/IOC ордера
+      - берём снимок ПОСЛЕ close
+      - pnl_usd_real = (eq_after_total - eq_before_total)
 
-    Если REVERSE_SIDE=1 (на входе делали SHORT на cheap_ex и LONG на rich_ex),
-    то для закрытия делаем наоборот:
-      cheap_ex -> BUY  reduce_only (закрываем SHORT)
-      rich_ex  -> SELL reduce_only (закрываем LONG)
+    Это автоматически включает комиссии/проскальзывание/частичные исполнения,
+    т.к. они отражаются в equity.
     """
 
     attempt_id = new_attempt_id()
-    cl_close_long  = _gen_cloid("CLOSEA", attempt_id, "A")
-    cl_close_short = _gen_cloid("CLOSEB", attempt_id, "B")
+    cl_close_a  = _gen_cloid("CLOSEA", attempt_id, "A")
+    cl_close_b  = _gen_cloid("CLOSEB", attempt_id, "B")
 
-    meta = {"attempt_id": attempt_id}
+    meta: Dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "symbol": symbol,
+        "cheap_ex": cheap_ex,
+        "rich_ex": rich_ex,
+        "qty": float(qty),
+    }
 
     # тот же флаг, что и при открытии
     reverse_side = getenv_bool("REVERSE_SIDE", False)
 
-    side_a_close = "SELL"
-    side_b_close = "BUY"
+    side_a_close = "SELL"  # закрываем LONG на cheap_ex
+    side_b_close = "BUY"   # закрываем SHORT на rich_ex
+
     if reverse_side:
         side_a_close, side_b_close = "BUY", "SELL"
+
+    # --- 1) equity snapshot BEFORE ---
+    dryrun_pnl = getenv_bool("DRYRUN_PNL", False)
+    eq_before = None
+    if (not paper) and (not dryrun_pnl):
+        try:
+            snap = _equity_snapshot([str(cheap_ex).upper(), str(rich_ex).upper()])
+            meta["equity_before"] = snap
+            eq_before = float(snap.get("total") or 0.0)
+        except Exception as e:
+            meta["equity_before_err"] = str(e)
+
     try:
-        # закрываем позицию на дешёвой
+        # --- 2) place close orders ---
         oa = _place_perp_market_order(
             cheap_ex, symbol, side_a_close, qty,
-            paper=paper, cl_oid=cl_close_long, reduce_only=True
+            paper=paper, cl_oid=cl_close_a, reduce_only=True
         )
         if oa.get("status") != "FILLED":
             raise RuntimeError(f"legA close not filled: {oa}")
 
-        # закрываем позицию на дорогой
         ob = _place_perp_market_order(
             rich_ex, symbol, side_b_close, qty,
-            paper=paper, cl_oid=cl_close_short, reduce_only=True
+            paper=paper, cl_oid=cl_close_b, reduce_only=True
         )
         if ob.get("status") != "FILLED":
             raise RuntimeError(f"legB close not filled: {ob}")
 
-        close_long_px  = float(oa.get("avgPrice") or oa.get("price") or 0.0)
-        close_short_px = float(ob.get("avgPrice") or ob.get("price") or 0.0)
+        # _place_perp_market_order нормализует ключи: avg_price / fee_usd / order_id
+        close_a_px  = float(oa.get("avg_price") or oa.get("avgPrice") or oa.get("price") or 0.0)
+        close_b_px  = float(ob.get("avg_price") or ob.get("avgPrice") or ob.get("price") or 0.0)
+
+        fee_a = to_float(oa.get("fee_usd")) or 0.0
+        fee_b = to_float(ob.get("fee_usd")) or 0.0
 
         meta.update({
-            "close_long_order_id": oa.get("orderId") or oa.get("id") or "",
-            "close_short_order_id": ob.get("orderId") or ob.get("id") or "",
-            "close_long_px": close_long_px,
-            "close_short_px": close_short_px,
+            "close_leg_a": {
+                "exchange": str(cheap_ex),
+                "side": side_a_close,
+                "order_id": oa.get("order_id") or oa.get("orderId") or oa.get("id") or "",
+                "client_order_id": oa.get("client_order_id") or oa.get("clientOrderId") or cl_close_a,
+                "avg_px": close_a_px,
+                "fee_usd_reported": fee_a,
+            },
+            "close_leg_b": {
+                "exchange": str(rich_ex),
+                "side": side_b_close,
+                "order_id": ob.get("order_id") or ob.get("orderId") or ob.get("id") or "",
+                "client_order_id": ob.get("client_order_id") or ob.get("clientOrderId") or cl_close_b,
+                "avg_px": close_b_px,
+                "fee_usd_reported": fee_b,
+            },
+            "close_fee_usd_reported": float(fee_a + fee_b),
         })
+        # --- 3) equity snapshot AFTER + realized pnl ---
+        if (not paper) and (not dryrun_pnl):
+            try:
+                snap2 = _equity_snapshot([str(cheap_ex).upper(), str(rich_ex).upper()])
+                meta["equity_after"] = snap2
+                eq_after = float(snap2.get("total") or 0.0)
+                if eq_before is not None:
+                    meta["pnl_usd_real"] = float(eq_after - eq_before)
+           except Exception as e:
+                meta["equity_after_err"] = str(e)
 
+        # Backward compatibility: expose pnl_usd for existing code paths
+        if "pnl_usd_real" in meta and "pnl_usd" not in meta:
+            meta["pnl_usd"] = meta["pnl_usd_real"]
         return True, meta
 
     except Exception as e:
@@ -1510,6 +1558,56 @@ def to_float(x) -> Optional[float]:
         if x is None: return None
         return float(x)
     except: return None
+
+def _json_sanitize(v: Any) -> Any:
+    """Convert NaN/inf/numpy types to JSON-safe primitives.
+
+    Facts-first logging: writing NaN into JSONL makes downstream analysis ambiguous.
+    """
+    try:
+        if v is None:
+            return None
+        # numpy scalars
+        if isinstance(v, (np.generic,)):
+            v = v.item()
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                return None
+        return v
+    except Exception:
+        return None
+
+def _equity_snapshot(ex_list: List[str]) -> Dict[str, Any]:
+    """Snapshot USDT equity per exchange + total.
+
+    Uses existing per-exchange balance getters (BINANCE/BYBIT/OKX/GATE).
+    Returns: {"per_ex": {EX: equity}, "total": float, "ts": utc}
+    """
+    per_ex: Dict[str, float] = {}
+    for ex in (ex_list or []):
+        exu = str(ex or "").strip().upper()
+        try:
+            if exu == "BINANCE":
+                b = binance_usdt_futures_balance()
+                if b:
+                    per_ex[exu] = float(b.get("equity") or b.get("wallet") or 0.0)
+            elif exu == "BYBIT":
+                b = bybit_unified_usdt_balance()
+                if b:
+                    per_ex[exu] = float(b.get("equity") or b.get("wallet") or 0.0)
+            elif exu == "OKX":
+                b = okx_usdt_balance()
+                if b:
+                    per_ex[exu] = float(b.get("equity") or b.get("wallet") or 0.0)
+            elif exu == "GATE":
+                b = gate_usdt_futures_balance()
+                if b:
+                    per_ex[exu] = float(b.get("equity") or b.get("wallet") or 0.0)
+        except Exception:
+            # balance snapshot should never break trading loop
+            continue
+    total = float(sum(per_ex.values())) if per_ex else 0.0
+    return {"per_ex": per_ex, "total": total, "ts": _utc_iso()}
 
 def _round_step(value: float, step: float) -> float:
     if not step or step <= 0: return value
@@ -1996,7 +2094,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.62</b>")
+    lines.append(f"\n<b> ver: 2.63</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3369,8 +3467,8 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                     "open_skip_reason": best.get("open_skip_reason") or "",
                     "spread_bps": best.get("spread_bps"),
                     "net_usd_adj": best.get("net_usd_adj"),
-                    "z": best.get("z"),
-                    "std": best.get("std"),
+                    "z": _json_sanitize(best.get("z")),
+                    "std": _json_sanitize(best.get("std")),
                     "funding_expected_pct": best.get("funding_expected_pct") or best.get("funding_exp_pct"),
                 }
                 eventlog_append_once(get_events_log_path(), _ev, key="events")
@@ -3442,7 +3540,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                         "short_ex": best.get("short_ex"),
                         "spread_bps": best.get("spread_bps"),
                         "net_usd_adj": best.get("net_usd_adj"),
-                        "net_total": best.get("net_total"),
+                        "net_total": _json_sanitize(best.get("net_total")),
                         "z": best.get("z"),
                         "std": best.get("std"),
                         "funding_exp_pct": best.get("funding_exp_pct"),
@@ -6783,9 +6881,9 @@ def positions_once(
                     "spread_pct": rec.get("spread_pct"),
                     "net_usd": rec.get("net_usd"),
                     "net_usd_adj": rec.get("net_usd_adj"),
-                    "net_total": rec.get("net_total"),
-                    "z": rec.get("z"),
-                    "std": rec.get("std"),
+                    "net_total": _json_sanitize(rec.get("net_total")),
+                    "z": _json_sanitize(rec.get("z")),
+                    "std": _json_sanitize(rec.get("std")),
                     "funding_exp_pct": rec.get("funding_exp_pct"),
                     "eco_ok": rec.get("eco_ok"),
                     "spread_ok": rec.get("spread_ok"),
@@ -6881,8 +6979,11 @@ def positions_once(
             except Exception:
                 pass
 
-            # --- ЖЁСТКИЙ ВЫХОД ПО ТАЙМЕРУ (MAX_HOLD_SEC) ---
-            if max_hold_sec > 0 and max_hold_reached:
+            # --- HARD TIME EXIT (disabled by default) ---
+            # По фактам из логов: прежний жёсткий тайм-аут закрывал сделки как основной сценарий.
+            # Теперь это включается только если TIME_EXIT_HARD=1 (аварийный режим).
+            if max_hold_sec > 0 and max_hold_reached and getenv_bool("TIME_EXIT_HARD", False):
+            
                 try:
                     logging.info(
                         "positions_once: FORCE TIME EXIT %s %s↔%s age=%.0fs >= MAX_HOLD_SEC=%s",
@@ -7263,9 +7364,11 @@ def positions_once(
                 except Exception:
                     # если z посчитать не смогли — разрешаем выход только по времени
                     z_ok = bool(max_hold_reached)
-
-            # Если достигли MAX_HOLD_SEC — разрешаем выход строго по таймингу,
-            # даже если условия по z / pnl_est формально не выполняются.
+            # Если достигли MAX_HOLD_SEC:
+            # - по умолчанию НЕ закрываем "как есть" сразу, чтобы не превращать timeout в основной выход.
+            # - даём GRACE окно (MAX_HOLD_GRACE_SEC) закрыться по z/price или по положительному pnl_est,
+            #   если включён EXIT_REQUIRE_POSITIVE.
+            # - аварийное закрытие "как есть" разрешается только если TIME_EXIT_ALLOW_NEGATIVE=1.
             if max_hold_reached:
                 exit_ok = True
                 z_ok = True
