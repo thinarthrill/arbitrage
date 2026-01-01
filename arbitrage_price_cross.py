@@ -2094,7 +2094,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.63</b>")
+    lines.append(f"\n<b> ver: 2.65</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4452,29 +4452,23 @@ def scan_spreads_once(
         if "net_usd_adj" not in cands.columns:
             cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd"), errors="coerce")
 
-        # фильтр валидных zscore-сигналов
-        Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
+        # Soft-scoring: economics first, z-score as PRIORITY (not hard gate).
+        # This makes z "work for money": bigger z gets higher rank, but we still require actual edge.
         std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-        cands["z"] = pd.to_numeric(cands["z"], errors="coerce")
-        cands["std"] = pd.to_numeric(cands["std"], errors="coerce")
-        cands["net_usd_adj"] = pd.to_numeric(cands["net_usd_adj"], errors="coerce")
+        cands["z"] = pd.to_numeric(cands.get("z"), errors="coerce").fillna(0.0)
+        cands["std"] = pd.to_numeric(cands.get("std"), errors="coerce")
+        cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd_adj", cands.get("net_usd")), errors="coerce").fillna(0.0)
 
-        valid = cands[
-            cands["z"].notna() &
-            (cands["z"] >= Z_IN_LOC) &
-            cands["std"].notna() &
-            (cands["std"] >= std_min_for_open)
-        ].copy()
-
-        if not valid.empty:
-            valid["__rating_z__"] = candidate_rating_z(valid)
-            valid["__score__"] = (
-                valid["__rating_z__"] * 10000
-                + valid.get("net_usd_adj_total", valid["net_usd_adj"]).fillna(0)
-            )
-            cands = valid.sort_values("__score__", ascending=False).reset_index(drop=True)
+        # keep only rows with usable stats (otherwise z is meaningless)
+        cands = cands[cands["std"].notna() & (cands["std"] >= std_min_for_open)].copy()
+        if not cands.empty:
+            cands["__rating_z__"] = candidate_rating_z(cands)
+            net_base = cands.get("net_usd_adj_total", cands["net_usd_adj"]).fillna(0.0)
+            z_bonus  = cands["z"].clip(lower=0.0) * 0.10
+            std_pen  = pd.to_numeric(cands["std"], errors="coerce").fillna(0.0) * 0.02
+            cands["__score__"] = net_base + z_bonus - std_pen + cands["__rating_z__"].fillna(0.0)
+            cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
         else:
-            # fallback по прибыли
             sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
             cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
     else:
@@ -6563,17 +6557,23 @@ def positions_once(
             elif "ema_spread_bps" in qual.columns:
                 qual["ema_bps"] = pd.to_numeric(qual["ema_spread_bps"], errors="coerce")
 
-            if "std_spread_bps" not in qual.columns and "ema_var" in qual.columns:
-                qual["std_bps"] = np.sqrt(pd.to_numeric(qual["ema_var"], errors="coerce").clip(lower=0.0)) * 1e4
+            # --- STD NORMALIZATION ---
+            # We keep BOTH:
+            #   - std      : in log-spread units (same scale as get_z_for_pair -> compare to STD_MIN_FOR_OPEN correctly)
+            #   - std_bps  : convenience view in bps (std * 1e4)
+            if "ema_var" in qual.columns:
+                qual["std"] = np.sqrt(pd.to_numeric(qual["ema_var"], errors="coerce").clip(lower=0.0))
+                qual["std_bps"] = qual["std"] * 1e4
             elif "std_spread_bps" in qual.columns:
                 qual["std_bps"] = pd.to_numeric(qual["std_spread_bps"], errors="coerce")
+                qual["std"] = qual["std_bps"] / 1e4
 
             if "zscore" in qual.columns:
                 qual["z"] = pd.to_numeric(qual["zscore"], errors="coerce")
 
             # мерджим только то, что реально посчитали
             keep = ["symbol", "long_ex", "short_ex"]
-            for k in ["ema_bps", "std_bps", "z", "count", "ema_var", "updated_ms"]:
+            for k in ["ema_bps", "std", "std_bps", "z", "count", "ema_var", "updated_ms"]:
                 if k in qual.columns:
                     keep.append(k)
             qual = qual[keep]
@@ -6598,12 +6598,9 @@ def positions_once(
         # --- FIX: гарантируем наличие z/std/net_usd_adj и алиасы из stats ---
         if "z" not in cands.columns:
            cands["z"] = np.nan
-        # stats-мердж кладёт std_bps/ema_bps → делаем алиасы под try_instant_open
+        # stats-мердж теперь кладёт std (log units) + std_bps (view)
         if "std" not in cands.columns:
-            if "std_bps" in cands.columns:
-                cands["std"] = cands["std_bps"]
-            else:
-                cands["std"] = np.nan
+            cands["std"] = np.nan
         if "ema" not in cands.columns and "ema_bps" in cands.columns:
             cands["ema"] = cands["ema_bps"]
         if "net_usd_adj" not in cands.columns:
@@ -6617,16 +6614,8 @@ def positions_once(
 
         # --- NEW: funding settings (shared with try_instant_open) ---
         FUNDING_MIN_PCT = float(getenv_float("FUNDING_MIN_PCT", 0.0))
-        max_hold_sec = int(getenv_float("MAX_HOLD_SEC", 0))
-        exp_h = float(getenv_float("EXPECTED_HOLDING_H", 0.0))
-        hold_sec = int(max(0, exp_h * 3600)) if exp_h > 0 else 0
-        # if both are set, be conservative: take min positive
-        if max_hold_sec > 0 and hold_sec > 0:
-            hold_sec = min(max_hold_sec, hold_sec)
-        elif max_hold_sec > 0:
-            hold_sec = max_hold_sec
-        elif hold_sec <= 0:
-            hold_sec = 8 * 3600  # fallback: 1 funding window
+        # funding hold must ALWAYS equal MAX_HOLD_SEC (both horizon and effective)
+        hold_sec = int(getenv_float("MAX_HOLD_SEC", 600.0))
         cands["spread_bps"]  = pd.to_numeric(cands.get("spread_bps"), errors="coerce")
         cands["z"]           = pd.to_numeric(cands.get("z"), errors="coerce")
         cands["std"]         = pd.to_numeric(cands.get("std"), errors="coerce")
@@ -6636,13 +6625,9 @@ def positions_once(
         cands["std_ok"]    = cands["std"].notna() & (cands["std"] >= std_min_for_open)
         cands["z_ok"]      = cands["z"].notna() & (cands["z"] >= Z_IN_LOC)
         # -------- funding-aware economics (compute funding only for a small top-K subset) --------
-        hold_sec = int(float(getenv_float("FUNDING_HOLD_SEC", getenv_float("MAX_HOLD_SEC", 8*3600))))
-        # Realistic hold time for *economic* effect of funding (e.g. 600s max-hold),
-        # can be different from hold_sec used for computing funding horizon.
-        hold_sec_effective = int(float(getenv_float(
-            "FUNDING_EFFECTIVE_HOLD_SEC",
-            getenv_float("MAX_HOLD_SEC", 600.0)
-        )))
+        # funding hold must ALWAYS equal MAX_HOLD_SEC (both horizon and effective)
+        hold_sec = int(getenv_float("MAX_HOLD_SEC", 600.0))
+        hold_sec_effective = hold_sec
         funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
         funding_topk = int(getenv_float("FUNDING_TOPK", 80))
 
@@ -6763,7 +6748,7 @@ def positions_once(
                 )
                 # Scale to realistic holding time (e.g. 600s) so eco_ok is not inflated.
                 pre_sorted["funding_expected_usd"] = pre_sorted["funding_expected_usd_full"].apply(
-                    lambda x: _funding_effective_usd(float(x or 0.0), hold_sec, hold_sec_effective)
+                    lambda x: _funding_effective_usd(float(x or 0.0), hold_sec_effective, hold_sec_effective)
                 )
                 pre_sorted["net_usd_adj_total_full"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + pre_sorted["funding_expected_usd_full"].fillna(0.0)
                 pre_sorted["net_usd_adj_total"] = pd.to_numeric(pre_sorted["net_usd_adj"], errors="coerce").fillna(0.0) + pre_sorted["funding_expected_usd"].fillna(0.0)
@@ -6806,10 +6791,9 @@ def positions_once(
         # Optional: attach funding info for the small set we might send to Telegram
         try:
             if getenv_bool("SHOW_FUNDING_ON_CARD", True) and not cands.empty:
-                hold_sec_effective = int(float(getenv_float(
-                    "FUNDING_EFFECTIVE_HOLD_SEC",
-                    getenv_float("MAX_HOLD_SEC", 600.0)
-                )))
+                # funding should be scaled to the REALISTIC holding horizon.
+                # Use MAX_HOLD_SEC directly (do NOT let it silently become 24h).
+                hold_sec_effective = int(float(getenv_float("MAX_HOLD_SEC", 600.0)))
                 funding_min_pct = float(getenv_float("FUNDING_MIN_PCT", 0.0))
                 topk = max(int(top3_to_tg or 0), int(getenv_float("FUNDING_TOPK", 80)))
                 topk = max(0, min(topk, len(cands)))
