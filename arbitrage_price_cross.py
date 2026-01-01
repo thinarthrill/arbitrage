@@ -1829,7 +1829,21 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     px_low   = float(to_float(r.get("px_low")) or 0.0)
     px_high  = float(to_float(r.get("px_high")) or 0.0)
     sp_pct   = float(to_float(r.get("spread_pct")) or 0.0)
-    sp_bps   = float(to_float(r.get("spread_bps")) or 0.0)
+    # In zscore-mode show the *gating* spread (residual/used) if present.
+    sp_bps_raw = float(to_float(r.get("spread_bps")) or 0.0)
+    sp_bps_used = sp_bps_raw
+    try:
+        if str(os.getenv("ENTRY_MODE", "")).lower() == "zscore":
+            v = r.get("spread_bps_used", None)
+            if v is None:
+                v = r.get("spread_res_bps", None)
+            if v is not None:
+                vv = float(v)
+                if vv == vv:  # not NaN
+                    sp_bps_used = vv
+    except Exception:
+        pass
+    sp_bps = float(sp_bps_used)
     net_usd  = float(to_float(r.get("net_usd")) or 0.0)
     gross    = float(to_float(r.get("gross_usd")) or 0.0)
     fees_rt  = float(to_float(r.get("fees_roundtrip_usd")) or 0.0)
@@ -2027,6 +2041,18 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             f"   std=<code>{'NaN' if std_fact is None else f'{float(std_fact):.6f}'}</code>"
         )
 
+        # If residual diagnostics exist — show them (helps validate ENTRY_SPREAD_BPS gating)
+        try:
+            if (r.get("spread_bps_used") is not None) or (r.get("spread_res_bps") is not None):
+                raw = r.get("spread_bps_raw", sp_bps_raw)
+                used = r.get("spread_bps_used", sp_bps_used)
+                res = r.get("spread_res_bps", None)
+                lines.append(
+                    f"   spread_dbg=<code>raw:{float(raw):.1f} used:{float(used):.1f} res:{'None' if res is None else f'{float(res):.1f}'}</code>"
+                )
+        except Exception:
+            pass
+
         # если в best пришли метаданные статистики — покажем их (помогает понять, почему NaN)
         if "count" in r or "ema_var" in r or "updated_ms" in r or "stats_ok" in r:
             try:
@@ -2111,7 +2137,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.68</b>")
+    lines.append(f"\n<b> ver: 2.69</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
