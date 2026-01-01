@@ -900,7 +900,18 @@ def compute_entry_filters(best: Dict[str, Any], entry_bps: float, entry_mode: Op
     mode = (entry_mode or getenv_str("ENTRY_MODE", "price")).strip().lower()
 
     # raw facts (не подменяем None на 0)
-    spread_bps = float(best.get("spread_bps") or 0.0)
+    spread_bps_raw = float(best.get("spread_bps") or 0.0)
+    spread_bps_used = spread_bps_raw
+    try:
+        if mode == "zscore":
+            res = best.get("spread_res_bps")
+            if res is not None:
+                res_f = float(res)
+                if res_f == res_f:
+                    spread_bps_used = res_f
+    except Exception:
+        pass
+    spread_bps = float(spread_bps_used)
     net_adj_raw = best.get("net_usd_adj")  # может быть None
     z_raw = best.get("z")
     std_raw = best.get("std")
@@ -951,6 +962,12 @@ def compute_entry_filters(best: Dict[str, Any], entry_bps: float, entry_mode: Op
         "z_in": z_in,
         "std": std_raw,
         "std_min": std_min,
+        # debugging/analysis: what we compared against ENTRY_SPREAD_BPS
+        "spread_bps_raw": spread_bps_raw,
+        "spread_bps_used": spread_bps_used,
+        "spread_res_bps": best.get("spread_res_bps"),
+        "spread_mu": best.get("spread_mu"),
+        "log_spread_x": best.get("log_spread_x"),
     }
 
 # ----------------- logging -----------------
@@ -1927,7 +1944,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         if (z is None or std is None or (z != z) or (std != std)):
             try:
                 stats_df = read_spread_stats()
-                _, z_calc, std_calc = get_z_for_pair(
+                _, z_calc, std_calc, _mu = get_z_for_pair(
                     stats_df, symbol=sym,
                     ex_low=long_ex.lower(), ex_high=short_ex.lower(),
                     px_low=px_low, px_high=px_high
@@ -2094,7 +2111,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.65</b>")
+    lines.append(f"\n<b> ver: 2.66</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3308,18 +3325,18 @@ def gate_quote(symbol: str, price_source: str = "mid"):
     return {"exchange":"gate","symbol":symbol.upper(),"bid":bid,"ask":ask,"mid":mid,"last":last,"mark":mark,"ts":utc_ms_now()}
 
 def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
-                   px_low: float, px_high: float) -> Tuple[float,float,float]:
-    """Возвращает (x, z, std). Если статданные недостоверны — z=nan."""
+                   px_low: float, px_high: float) -> Tuple[float,float,float,float]:
+    """Возвращает (x, z, std, mu). Если статданные недостоверны — z=nan, mu=0."""
 
     # --- 0) sanity check ---
     if px_low <= 0 or px_high <= 0:
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), 0.0
 
     # текущий лог-спред
     try:
         x = math.log(px_high / px_low)
     except Exception:
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), 0.0
 
     s = symbol.upper()
     a = ex_low.lower()
@@ -3347,7 +3364,7 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
 
     if sub.empty:
         # нет статистики ни в прямом, ни в обратном порядке
-        return x, float("nan"), float("nan")
+        return x, float("nan"), float("nan"), 0.0
 
     row  = sub.iloc[-1]   # всегда берём последнюю статистику
     mean = to_float(row.get("ema_mean"))
@@ -3366,12 +3383,12 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
     if cnt < min_cnt:
         logging.debug("[ZMISS] count too low for %s (%s->%s): cnt=%s < %s",
                       s, a, b, cnt, min_cnt)
-        return x, float("nan"), float("nan")
+        return x, float("nan"), float("nan"), 0.0
 
     if upd > 0 and (now - upd) > SPREAD_STALE_SEC:
         logging.debug("[ZMISS] stats stale for %s (%s->%s): age=%.1fs > %ss",
                       s, a, b, now - upd, SPREAD_STALE_SEC)
-        return x, float("nan"), float("nan")
+        return x, float("nan"), float("nan"), float(mean or 0.0)
 
     # --- 3) std ---
     try:
@@ -3380,13 +3397,13 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
         std = float("nan")
 
     if std != std or std <= 0:
-        return x, float("nan"), float("nan")
+        return x, float("nan"), float("nan"), float(mean or 0.0)
 
     std = max(std, SPREAD_STD_FLOOR)
 
     # при flipped — mean меняет знак, чтобы соответствовать перевёрнутому x
     if flipped and (mean is not None):
-       mean = -mean
+        mean = -mean
 
     # --- 4) z-score ---
     try:
@@ -3394,7 +3411,8 @@ def get_z_for_pair(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str,
     except Exception:
         z = float("nan")
 
-    return x, z, std
+    # also return mean for residual computations upstream
+    return x, z, std, (mean if mean is not None else 0.0)
 
 def get_pair_reco(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str) -> tuple[float, float]:
     """
@@ -3587,7 +3605,23 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     if px_low <= 0 or px_high <= 0:
         return _reject(f"bad prices: px_low={px_low}, px_high={px_high}")
 
-    spread_bps = float(best.get("spread_bps") or 0.0)
+    # raw spread from quotes (absolute)
+    spread_bps_raw = float(best.get("spread_bps") or 0.0)
+
+    # In zscore-mode we want ENTRY_SPREAD_BPS to work on deviation (residual),
+    # not on absolute structural spread.
+    spread_bps_used = spread_bps_raw
+    try:
+        if str(entry_mode_loc).lower() == "zscore":
+            res = best.get("spread_res_bps")
+            if res is not None:
+                res_f = float(res)
+                if res_f == res_f:  # not NaN
+                    spread_bps_used = res_f
+    except Exception:
+        pass
+
+    spread_bps = spread_bps_used
     z_raw      = best.get("z")
     std_raw    = best.get("std")
     net_adj_raw = best.get("net_usd_adj")
@@ -3616,6 +3650,20 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
     Z_IN = float(getenv_float("Z_IN", 2.0))
     ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+
+    try:
+        if ENTRY_MODE == "zscore":
+            res = best.get("spread_res_bps")
+            if res is not None:
+                res_f = float(res)
+                if res_f == res_f:  # not NaN
+                    spread_bps_used = res_f
+    except Exception:
+        pass
+
+    spread_bps = float(spread_bps_used)
+    best["spread_bps_raw"] = float(spread_bps_raw)
+    best["spread_bps_used"] = float(spread_bps_used)
 
     std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
     capital = float(getenv_float("CAPITAL", 1000.0))
@@ -4167,7 +4215,7 @@ def scan_all_with_instant_alerts(
 
 
         # Считаем Z и экономику (всегда), чтобы решить вопрос об ОТКРЫТИИ
-        _, z, std = get_z_for_pair(
+        x_log, z, std, mu = get_z_for_pair(
             stats_df,
             symbol=str(best["symbol"]),
             ex_low=str(best["long_ex"]),
@@ -4175,6 +4223,20 @@ def scan_all_with_instant_alerts(
             px_low=float(best["px_low"]),
             px_high=float(best["px_high"]),
         )
+        # --- NEW: residual spread in bps (deviation from baseline / mean) ---
+        try:
+            # residual in log-space
+            res_log = float(x_log) - float(mu)
+            # convert to bps in price space: exp(res)-1
+            res_bps = (math.exp(res_log) - 1.0) * 1e4
+            best["log_spread_x"] = float(x_log)
+            best["spread_mu"] = float(mu)
+            best["spread_res_bps"] = float(res_bps)
+        except Exception:
+            best["log_spread_x"] = None
+            best["spread_mu"] = None
+            best["spread_res_bps"] = None
+
         SLIPPAGE_BPS_DYNAMIC = getenv_bool("SLIPPAGE_BPS_DYNAMIC", True)
         slip_bps = SLIPPAGE_BPS
         if SLIPPAGE_BPS_DYNAMIC:
@@ -4416,6 +4478,9 @@ def scan_spreads_once(
         stats_key = stats_df.set_index(["symbol", "ex_low", "ex_high"])
 
         z_list, std_list, n_list = [], [], []
+        mu_list = []
+        res_bps_list = []
+        x_bps_list = []
         for _, r in cands.iterrows():
             key = (str(r["symbol"]).upper(), str(r["ex_low"]).lower(), str(r["ex_high"]).lower())
             if key in stats_key.index:
@@ -4428,18 +4493,31 @@ def scan_spreads_once(
                 z_list.append(z)
                 std_list.append(sd)
                 n_list.append(n)
+                mu_list.append(mu)
+                # log_spread is ln(px_high/px_low). Convert delta-to-mean to "bps-like" scale for gating.
+                res_bps_list.append((x - mu) * 1e4)
+                x_bps_list.append(x * 1e4)
             else:
                 z_list.append(np.nan)
                 std_list.append(np.nan)
                 n_list.append(0)
+                mu_list.append(np.nan)
+                res_bps_list.append(np.nan)
+                x_bps_list.append(np.nan)
 
         cands["z"] = z_list
         cands["std"] = std_list
         cands["n"] = n_list
+        cands["spread_mu"] = mu_list
+        cands["spread_res_bps"] = res_bps_list
+        cands["log_spread_bps"] = x_bps_list
     else:
         cands["z"] = np.nan
         cands["std"] = np.nan
         cands["n"] = 0
+        cands["spread_mu"] = np.nan
+        cands["spread_res_bps"] = np.nan
+        cands["log_spread_bps"] = np.nan
 
     # ---------- 5) правильный выбор best (как в positions_once) ----------
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
@@ -4491,7 +4569,7 @@ def scan_spreads_once(
         ex_low = best.get("long_ex")
         ex_high = best.get("short_ex")
 
-        x2, z2, std2 = get_z_for_pair(stats_df, sym, ex_low, ex_high, px_low, px_high)
+        x2, z2, std2, _mu2 = get_z_for_pair(stats_df, sym, ex_low, ex_high, px_low, px_high)
         best["z"] = z2
         best["std"] = std2
 
@@ -4517,7 +4595,6 @@ def scan_spreads_once(
     Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
     std_min_for_open = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
 
-    spread_bps = float(best.get("spread_bps") or 0.0)
     net_usd_adj = float(best.get("net_usd_adj") or best.get("net_usd") or 0.0)
     z = to_float(best.get("z"))
     std = to_float(best.get("std"))
@@ -4542,7 +4619,7 @@ def scan_spreads_once(
             ex_high = str(best.get("short_ex") or best.get("rich_ex") or "").lower()
 
             if sym and px_low > 0 and px_high > 0 and ex_low and ex_high:
-                _, z2, std2 = get_z_for_pair(
+                _, z2, std2, _mu2 = get_z_for_pair(
                     stats_df2,
                     symbol=sym,
                     ex_low=ex_low,
@@ -4561,7 +4638,16 @@ def scan_spreads_once(
     best["z"] = z
     best["std"] = std
 
-    filters = compute_entry_filters(best, float(spread_bps_min), entry_mode_loc)
+    # pull diagnostics from the actual gating logic (compute_entry_filters),
+    # so TG/logs show what ENTRY_SPREAD_BPS compared against.
+    try:
+        if isinstance(filters, dict):
+            if "spread_bps_raw" in filters:  best["spread_bps_raw"]  = filters.get("spread_bps_raw")
+            if "spread_bps_used" in filters: best["spread_bps_used"] = filters.get("spread_bps_used")
+            if "spread_res_bps" in filters:  best["spread_res_bps"]  = filters.get("spread_res_bps")
+    except Exception:
+        pass
+
     spread_ok = bool(filters["spread_ok"])
     eco_ok = bool(filters["eco_ok"])
     z_ok = bool(filters["z_ok"])
@@ -7325,7 +7411,7 @@ def positions_once(
                         if stats_df2 is not None and not stats_df2.empty:
                             try:
                                 # z для текущего спреда по текущим ценам
-                                _, z_val, _ = get_z_for_pair(
+                                _, z_val, _std_val, _mu_val = get_z_for_pair(
                                     stats_df2,
                                     symbol=sym,
                                     ex_low=str(ex_l).lower(),
@@ -7635,24 +7721,12 @@ def positions_once(
                             # открыть новый best тем же механизмом, что в блоке 6 (atomic_cross_open)
                             entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
 
-                            spread_bps = float(best.get("spread_bps") or 0.0)
-                            net_adj    = float(best.get("net_usd_adj") or 0.0)
-                            z          = float(best.get("z") or float("nan"))
-                            std        = float(best.get("std") or float("nan"))
-
-                            Z_IN_LOC = float(getenv_float("Z_IN", 2.0))
-                            std_min  = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
-                            capital  = float(getenv_float("CAPITAL", 1000.0))
-                            min_net_abs = (float(getenv_float("ENTRY_NET_PCT", 1.0))/100.0) * capital
-
-                            spread_ok = spread_bps >= float(entry_bps)
-                            eco_ok    = net_adj > min_net_abs
-
-                            if entry_mode_loc == "zscore":
-                                z_ok   = (z == z) and (z >= Z_IN_LOC)
-                                std_ok = (std == std) and (std >= std_min)
-                            else:
-                                z_ok, std_ok = True, True
+                            entry_bps = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+                            filters = compute_entry_filters(best, entry_bps=entry_bps, entry_mode=entry_mode_loc)
+                            spread_ok = bool(filters.get("spread_ok"))
+                            eco_ok    = bool(filters.get("eco_ok"))
+                            z_ok      = bool(filters.get("z_ok"))
+                            std_ok    = bool(filters.get("std_ok"))
 
                             if spread_ok and eco_ok and z_ok and std_ok:
                                 _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
@@ -7661,7 +7735,7 @@ def positions_once(
                                     cheap_ex=str(best["long_ex"]).lower(),
                                     rich_ex=str(best["short_ex"]).lower(),
                                     qty=float(best["qty_est"]),
-                                   price_low=float(best["px_low"]),
+                                    price_low=float(best["px_low"]),
                                     price_high=float(best["px_high"]),
                                     paper=_paper
                                 )
