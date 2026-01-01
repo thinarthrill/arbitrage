@@ -2111,7 +2111,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.66</b>")
+    lines.append(f"\n<b> ver: 2.67</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4541,10 +4541,23 @@ def scan_spreads_once(
         cands = cands[cands["std"].notna() & (cands["std"] >= std_min_for_open)].copy()
         if not cands.empty:
             cands["__rating_z__"] = candidate_rating_z(cands)
+            # Rank by expected net AFTER slippage, weighted by |z| and residual bps (no new env vars).
             net_base = cands.get("net_usd_adj_total", cands["net_usd_adj"]).fillna(0.0)
-            z_bonus  = cands["z"].clip(lower=0.0) * 0.10
-            std_pen  = pd.to_numeric(cands["std"], errors="coerce").fillna(0.0) * 0.02
-            cands["__score__"] = net_base + z_bonus - std_pen + cands["__rating_z__"].fillna(0.0)
+
+            z_abs = pd.to_numeric(cands.get("z"), errors="coerce").fillna(0.0).abs()
+            res_abs = pd.to_numeric(cands.get("spread_res_bps"), errors="coerce").fillna(0.0).abs()
+
+            # multipliers are capped to avoid runaway scores
+            z_mult = 1.0 + 0.20 * z_abs.clip(upper=5.0)          # up to x2.0
+            res_mult = 1.0 + 0.001 * res_abs.clip(upper=500.0)   # up to x1.5
+
+            # keep diagnostics for TG/logs if needed
+            cands["__z_abs__"] = z_abs
+            cands["__res_abs__"] = res_abs
+            cands["__z_mult__"] = z_mult
+            cands["__res_mult__"] = res_mult
+
+            cands["__score__"] = (net_base * z_mult * res_mult) + 0.05 * cands["__rating_z__"].fillna(0.0)
             cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
         else:
             sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
