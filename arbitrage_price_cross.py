@@ -2111,7 +2111,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.67</b>")
+    lines.append(f"\n<b> ver: 2.68</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4558,7 +4558,20 @@ def scan_spreads_once(
             cands["__res_mult__"] = res_mult
 
             cands["__score__"] = (net_base * z_mult * res_mult) + 0.05 * cands["__rating_z__"].fillna(0.0)
-            cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
+
+            # anti-noise tie-breaker:
+            # when __score__/net/z are close, prefer smaller gap_bps (less real slippage risk)
+            if "gap_bps" not in cands.columns:
+                try:
+                    px_low = pd.to_numeric(cands.get("px_low"), errors="coerce")
+                    px_high = pd.to_numeric(cands.get("px_high"), errors="coerce")
+                    cands["gap_bps"] = ((px_high - px_low) / px_low) * 1e4
+                except Exception:
+                    cands["gap_bps"] = np.nan
+            cands["gap_bps"] = pd.to_numeric(cands.get("gap_bps"), errors="coerce").fillna(1e9).clip(lower=0.0)
+
+            # primary: score desc, tie-break: gap asc
+            cands = cands.sort_values(["__score__", "gap_bps"], ascending=[False, True]).reset_index(drop=True)
         else:
             sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
             cands = cands.sort_values(sort_col, ascending=False).reset_index(drop=True)
@@ -6881,7 +6894,19 @@ def positions_once(
             f_bonus  = pd.to_numeric(cands.get("funding_expected_usd"), errors="coerce").fillna(0.0) * 0.05
             cands["__score__"] = net_base + f_bonus + z_bonus - std_pen + cands["__rating_z__"].fillna(0.0)
 
-            cands = cands.sort_values("__score__", ascending=False).reset_index(drop=True)
+            # anti-noise tie-breaker:
+            # when __score__/net/z are close, prefer smaller gap_bps (less real slippage risk)
+            if "gap_bps" not in cands.columns:
+                try:
+                    px_low = pd.to_numeric(cands.get("px_low"), errors="coerce")
+                    px_high = pd.to_numeric(cands.get("px_high"), errors="coerce")
+                    cands["gap_bps"] = ((px_high - px_low) / px_low) * 1e4
+                except Exception:
+                    cands["gap_bps"] = np.nan
+            cands["gap_bps"] = pd.to_numeric(cands.get("gap_bps"), errors="coerce").fillna(1e9).clip(lower=0.0)
+
+            # primary: score desc, tie-break: gap asc
+            cands = cands.sort_values(["__score__", "gap_bps"], ascending=[False, True]).reset_index(drop=True)
     else:
         # price режим — как раньше
         sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
