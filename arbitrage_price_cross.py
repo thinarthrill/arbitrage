@@ -2158,7 +2158,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.70</b>")
+    lines.append(f"\n<b> ver: 2.71</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2582,52 +2582,21 @@ def drive_download_bytes(gdrive_path: str) -> Optional[bytes]:
 def is_gdrive(path: Optional[str]) -> bool:
     return bool(path) and str(path).startswith("gdrive://")
 
-
-def gdrive_write_text(gd_path: str, text: str):
+def gdrive_write_text(gd_path: str, text: str) -> None:
     """
-    gdrive://folder/sub/file.txt
+    Backward-compatible helper.
+    Preferred path form:
+      gdrive://<FOLDER_ID>/some/sub/path/file.txt
     """
-    service = gdrive_client()
-    root_id = getenv_str("GDRIVE_ROOT_ID")
-    if not root_id:
-        raise RuntimeError("GDRIVE_ROOT_ID is not set")
+    p = str(gd_path or "").strip()
+    if not p.startswith("gdrive://") and not p.startswith("drive://"):
+        raise ValueError("gdrive_write_text expects gdrive://... path")
+    drive_upload_bytes(p, text.encode("utf-8"), content_type="text/plain")
 
-    parts = gd_path.replace("gdrive://", "").strip("/").split("/")
-    folder_id = root_id
+# Backward-compat alias (some older patches used gdrive_client())
+def gdrive_client():
+    return drive_service()
 
-    # create / traverse folders
-    for name in parts[:-1]:
-        q = f"name='{name}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        res = service.files().list(q=q, fields="files(id,name)").execute()
-        files = res.get("files", [])
-        if files:
-            folder_id = files[0]["id"]
-        else:
-            meta = {
-                "name": name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [folder_id],
-            }
-            folder_id = service.files().create(body=meta, fields="id").execute()["id"]
-
-    filename = parts[-1]
-
-    media = MediaInMemoryUpload(
-        text.encode("utf-8"),
-        mimetype="text/plain"
-    )
-
-    # overwrite if exists
-    q = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-    res = service.files().list(q=q, fields="files(id)").execute()
-    files = res.get("files", [])
-    if files:
-        service.files().update(fileId=files[0]["id"], media_body=media).execute()
-    else:
-        service.files().create(
-            body={"name": filename, "parents": [folder_id]},
-            media_body=media
-        ).execute()
 
 def gcs_client():
     if not GCS_AVAILABLE: raise RuntimeError("google-cloud-storage not installed")
@@ -4977,6 +4946,16 @@ def scan_spreads_once(
             pass
 
         card = format_signal_card(best, per_leg_notional_usd, price_source)
+        # spread_bps was not defined here ранее — берём из best (used/raw) для debug
+        try:
+            spread_bps_dbg = float(
+                best.get("spread_bps_used")
+                or best.get("spread_bps")
+                or best.get("spread_bps_raw")
+                or 0.0
+            )
+        except Exception:
+            spread_bps_dbg = 0.0
         card += (
             f"\n🧪 *INSTANT-OPEN DEBUG*\n"
             f"• cond_open = `{cond_open}`\n"
@@ -4984,7 +4963,7 @@ def scan_spreads_once(
             f"• ENTRY_MODE = `{entry_mode_loc}`\n"
             f"• Z_IN = `{filters['z_in']}`\n"
             f"• std_min = `{filters['std_min']}`\n"
-            f"• spread_ok = `{spread_ok}` ({spread_bps:.1f} ≥ {float(spread_bps_min):.1f})\n"
+            f"• spread_ok = `{spread_ok}` ({spread_bps_dbg:.1f} ≥ {float(spread_bps_min):.1f})\n"
             f"• eco_ok = `{eco_ok}` (net_adj={net_usd_adj} > {filters['min_net_abs']:.2f})\n"
             f"• z_ok = `{z_ok}` (z={z} ≥ {filters['z_in']})\n"
             f"• std_ok = `{std_ok}` (std={std} ≥ {filters['std_min']})\n"
