@@ -2251,7 +2251,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.83</b>")
+    lines.append(f"\n<b> ver: 2.84</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -7182,9 +7182,12 @@ def positions_once(
                 .rename(columns={"ex_low": "long_ex", "ex_high": "short_ex"})
             )
 
-            # если нет готовых bps/zscore — оценим из log-спреда
+            # если нет готовых bps/zscore — оценим baseline из ema_mean.
+            # В stats_store.update_pair() x = log(px_high/px_low), поэтому:
+            # baseline_bps = (exp(ema_mean) - 1) * 1e4
             if "ema_spread_bps" not in qual.columns and "ema_mean" in qual.columns:
-                qual["ema_bps"] = pd.to_numeric(qual["ema_mean"], errors="coerce") * 1e4
+                _ema_mean_log = pd.to_numeric(qual["ema_mean"], errors="coerce")
+                qual["ema_bps"] = (np.exp(_ema_mean_log) - 1.0) * 1e4
             elif "ema_spread_bps" in qual.columns:
                 qual["ema_bps"] = pd.to_numeric(qual["ema_spread_bps"], errors="coerce")
 
@@ -7204,12 +7207,35 @@ def positions_once(
 
             # мерджим только то, что реально посчитали
             keep = ["symbol", "long_ex", "short_ex"]
-            for k in ["ema_bps", "std", "std_bps", "z", "count", "ema_var", "updated_ms"]:
+            # ВАЖНО: оставляем ema_mean (log-space), чтобы ниже считать baseline/delta
+            for k in ["ema_mean", "ema_bps", "std", "std_bps", "z", "count", "ema_var", "updated_ms"]:
                 if k in qual.columns:
                     keep.append(k)
             qual = qual[keep]
 
             cands = cands.merge(qual, on=["symbol", "long_ex", "short_ex"], how="left")
+
+            # --- DELTA spread (raw - baseline) for zscore-mode ---
+            # raw spread is already in cands["spread_bps"] (price-space bps)
+            if "spread_bps_raw" not in cands.columns:
+                cands["spread_bps_raw"] = cands.get("spread_bps")
+            if "spread_bps_used" not in cands.columns:
+                cands["spread_bps_used"] = cands.get("spread_bps_raw")
+
+            try:
+                if str(getenv_str("ENTRY_MODE", "price")).lower() == "zscore":
+                    mu_log = pd.to_numeric(cands.get("ema_mean"), errors="coerce")
+                    baseline_bps = (np.exp(mu_log) - 1.0) * 1e4
+                    raw_bps = pd.to_numeric(cands.get("spread_bps_raw"), errors="coerce")
+                    delta_bps = raw_bps - baseline_bps
+                    cands["spread_mu"] = mu_log
+                    cands["spread_mu_bps"] = baseline_bps
+                    cands["spread_delta_bps"] = delta_bps
+                    # backward-compat name: gating/filters use spread_res_bps in other parts
+                    cands["spread_res_bps"] = delta_bps
+                    cands["spread_bps_used"] = delta_bps
+            except Exception:
+                pass
         except Exception as e:
             logging.debug("positions_once: merge stats failed: %s", e)
 
@@ -7252,7 +7278,10 @@ def positions_once(
         cands["std"]         = pd.to_numeric(cands.get("std"), errors="coerce")
         cands["net_usd_adj"] = pd.to_numeric(cands.get("net_usd_adj"), errors="coerce")
 
-        cands["spread_ok"] = cands["spread_bps"] >= float(entry_bps)
+        # spread_ok: in zscore-mode проверяем DELTA (spread_bps_used), иначе raw spread_bps
+        _sb = cands["spread_bps_used"] if "spread_bps_used" in cands.columns else cands["spread_bps"]
+        _sb = pd.to_numeric(_sb, errors="coerce")
+        cands["spread_ok"] = _sb >= float(entry_bps)
         cands["std_ok"]    = cands["std"].notna() & (cands["std"] >= std_min_for_open)
         cands["z_ok"]      = cands["z"].notna() & (cands["z"] >= Z_IN_LOC)
         # -------- funding-aware economics (compute funding only for a small top-K subset) --------
@@ -7412,6 +7441,18 @@ def positions_once(
             std_pen  = pd.to_numeric(cands.get("std"), errors="coerce").fillna(0.0) * 0.02
             f_bonus  = pd.to_numeric(cands.get("funding_expected_usd"), errors="coerce").fillna(0.0) * 0.05
             cands["__score__"] = net_base + f_bonus + z_bonus - std_pen + cands["__rating_z__"].fillna(0.0)
+            # secondary: use delta-spread (spread_bps_used) as tie-breaker in zscore-mode
+            # prefer explicit 'spread_bps_used' first, then fall back to delta/residual, then raw spread.
+            _su = None
+            if "spread_bps_used" in cands.columns:
+                _su = cands["spread_bps_used"]
+            elif "spread_delta_bps" in cands.columns:
+                _su = cands["spread_delta_bps"]
+            elif "spread_res_bps" in cands.columns:
+                _su = cands["spread_res_bps"]
+            else:
+                _su = cands.get("spread_bps")
+            cands["__spread_used__"] = pd.to_numeric(_su, errors="coerce").fillna(-1e18)
 
             # anti-noise tie-breaker:
             # when __score__/net/z are close, prefer smaller gap_bps (less real slippage risk)
@@ -7424,8 +7465,9 @@ def positions_once(
                     cands["gap_bps"] = np.nan
             cands["gap_bps"] = pd.to_numeric(cands.get("gap_bps"), errors="coerce").fillna(1e9).clip(lower=0.0)
 
-            # primary: score desc, tie-break: gap asc
-            cands = cands.sort_values(["__score__", "gap_bps"], ascending=[False, True]).reset_index(drop=True)
+            # primary: score desc, then prefer larger delta spread, then smaller gap
+            cands = cands.sort_values(["__score__", "__spread_used__", "gap_bps"],
+                                      ascending=[False, False, True]).reset_index(drop=True)
     else:
         # price режим — как раньше
         sort_col = "net_usd_adj" if "net_usd_adj" in cands.columns else "net_usd"
