@@ -1906,6 +1906,8 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         if str(os.getenv("ENTRY_MODE", "")).lower() == "zscore":
             v = r.get("spread_bps_used", None)
             if v is None:
+                v = r.get("spread_delta_bps", None)
+            if v is None:
                 v = r.get("spread_res_bps", None)
             if v is not None:
                 vv = float(v)
@@ -2249,7 +2251,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.81</b>")
+    lines.append(f"\n<b> ver: 2.82</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4757,8 +4759,15 @@ def scan_all_with_instant_alerts(
             except Exception as e:
                 logging.warning("Instant open exception for %s: %s", best.get("symbol"), e)
 
-        # 2) ТЕЛЕГРАМ-АЛЕРТ — оставляем защиту по спреду и антиспам
-        if float(best["spread_pct"]) >= float(alert_spread_pct):
+        # 2) ТЕЛЕГРАМ-АЛЕРТ — в zscore-mode сравниваем DELTA (used), иначе raw
+        try:
+            entry_mode_loc = str(os.getenv("ENTRY_MODE", "price")).lower()
+        except Exception:
+            entry_mode_loc = "price"
+        sp_pct_for_alert = float(best.get("spread_pct") or 0.0)
+        if entry_mode_loc == "zscore":
+            sp_pct_for_alert = float(best.get("spread_pct_used") or sp_pct_for_alert)
+        if sp_pct_for_alert >= float(alert_spread_pct):
             last_ts = _LAST_ALERT_TS.get(best["symbol"], 0.0)
             if (now - last_ts) >= cooldown_sec:
                 if "net_usd_adj" not in best or best.get("net_usd_adj") is None:
@@ -5028,6 +5037,29 @@ def scan_spreads_once(
         best = cands.iloc[0].to_dict()
     else:
         return None, quotes_df
+
+    # ---- ENSURE: spread_bps_used / spread_pct_used are present for gating + Telegram card ----
+    try:
+        entry_mode_loc = str(os.getenv("ENTRY_MODE", "price")).lower()
+        spread_raw_bps = float(best.get("spread_bps") or 0.0)
+        spread_used_bps = spread_raw_bps
+        if entry_mode_loc == "zscore":
+            v = best.get("spread_delta_bps")
+            if v is None:
+                v = best.get("spread_res_bps")
+            if v is not None:
+                vf = float(v)
+                if vf == vf:  # not NaN
+                    spread_used_bps = vf
+        best["spread_bps_used"] = float(spread_used_bps)
+        best["spread_pct_used"] = float(spread_used_bps) / 1e4 * 100.0
+    except Exception:
+        # if something goes wrong, fall back to raw
+        try:
+            best["spread_bps_used"] = float(best.get("spread_bps") or 0.0)
+            best["spread_pct_used"] = float(best["spread_bps_used"]) / 1e4 * 100.0
+        except Exception:
+            pass
 
     # ---- FIX: если z/std NaN в cands, подставляем реальные из get_z_for_pair ----
     if (best.get("z") is None or best.get("z") != best.get("z")) or \
