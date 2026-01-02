@@ -1914,6 +1914,12 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     except Exception:
         pass
     sp_bps = float(sp_bps_used)
+    # used bps -> used pct (for delta-spread display in zscore-mode)
+    sp_pct_used = sp_pct
+    try:
+        sp_pct_used = (float(sp_bps) / 1e4) * 100.0
+    except Exception:
+        sp_pct_used = sp_pct
     net_usd  = float(to_float(r.get("net_usd")) or 0.0)
     gross    = float(to_float(r.get("gross_usd")) or 0.0)
     fees_rt  = float(to_float(r.get("fees_roundtrip_usd")) or 0.0)
@@ -1923,6 +1929,16 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     z           = r.get("z", None)
     std         = r.get("std", None)
     net_usd_adj = r.get("net_usd_adj", None)  # НЕ пересчитываем тут, только отображаем
+    net_total   = r.get("net_usd_adj_total", None)
+
+    # What to show as "Net" in the card:
+    # Prefer net_usd_adj (after slippage). If total exists, show it too.
+    net_show = net_usd
+    if net_usd_adj is not None and net_usd_adj == net_usd_adj:
+        try:
+            net_show = float(net_usd_adj)
+        except Exception:
+            net_show = net_usd
 
     lines = [
         "──────────────",
@@ -1933,6 +1949,12 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
     # Net after slippage (только если реально посчитан апстримом)
     if net_usd_adj is not None and net_usd_adj == net_usd_adj:
         lines.append(f"🧮 Net after slippage: ${float(net_usd_adj):.2f}")
+        # If total (adj + funding) exists, show it explicitly
+        if net_total is not None and net_total == net_total:
+            try:
+                lines.append(f"🧾 Net total (adj+funding): ${float(net_total):.2f}")
+            except Exception:
+                pass
 
     # Z / σ
     if z is not None and z == z:  # not NaN
@@ -1947,11 +1969,23 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         lines.append(f"\n🎯 <code>Entry ≥ {float(entry_bps_sugg):.0f} bps</code>")
 
     # Основные метрики
+    entry_mode = str(os.getenv("ENTRY_MODE", "")).lower()
+    if entry_mode == "zscore":
+        # In zscore-mode, the meaningful spread is delta/residual (sp_bps_used), while sp_pct/sp_bps_raw are the raw gap.
+        lines.extend([
+            f"\n🧮 ΔSPREAD: {sp_pct_used:.2f}% ({sp_bps:.0f} bps)",
+            f"🧮 SPREAD (raw): {sp_pct:.2f}% ({sp_bps_raw:.0f} bps)",
+        ])
+    else:
+        lines.append(f"\n🧮 SPREAD: {sp_pct:.2f}% ({sp_bps:.0f} bps)")
+
     lines.extend([
-        f"\n🧮 SPREAD: {sp_pct:.2f}% ({sp_bps:.0f} bps)",
         #f"💵 Gross: ${gross:.2f}",
         #f"💸 Fees RT: ${fees_rt:.2f}",
-        f"✅ Net: ${net_usd:.2f}",
+        # Show delta/slippage-adjusted net as the primary Net to avoid confusion
+        f"✅ Net (adj): ${float(net_show):.2f}",
+        # Optionally keep the raw net for diagnostics if adj exists
+        (f"   (raw net: ${net_usd:.2f})" if (net_usd_adj is not None and net_usd_adj == net_usd_adj) else ""),
         f"📊 Prices [{price_lbl}]",
         f"   Low @ {long_ex}:  {px_low:.6f}",
         f"   High @ {short_ex}: {px_high:.6f}",
@@ -2207,7 +2241,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.79</b>")
+    lines.append(f"\n<b> ver: 2.80</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
