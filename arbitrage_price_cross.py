@@ -2251,7 +2251,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.84</b>")
+    lines.append(f"\n<b> ver: 2.85</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -7353,6 +7353,10 @@ def positions_once(
         # 1) открывающий гейт (по умолчанию БЕЗ hard-гейтов z/std; их можно включить env-ами)
         hard_z = getenv_bool("HARD_Z_FILTER", False)
         hard_std = getenv_bool("HARD_STD_FILTER", False)
+
+        # keep pre-filter candidates for Telegram topN (so TG doesn't go silent)
+        cands_pre = cands.copy()
+
         m = cands["spread_ok"] & cands["eco_ok"]
         if hard_z:
             m = m & cands["z_ok"]
@@ -7533,9 +7537,47 @@ def positions_once(
     if not cands.empty:
         best = dict(cands.iloc[0])
 
+    # Telegram topN:
+    # - normally: from filtered cands (trade-eligible)
+    # - if filtered cands empty: fall back to pre-filter set (so TG doesn't stop)
+    tg_df = None
+    try:
+        if (top3_to_tg and int(top3_to_tg) > 0):
+            if cands is not None and not cands.empty:
+                tg_df = cands
+            else:
+                tg_df = cands_pre
+    except Exception:
+        tg_df = None
 
-    if top3_to_tg and top3_to_tg > 0 and not cands.empty:
-        topN = cands.head(int(top3_to_tg)).to_dict("records")
+    if tg_df is not None and not tg_df.empty and top3_to_tg and int(top3_to_tg) > 0:
+        # ensure scoring columns exist for stable sorting
+        if "__score__" not in tg_df.columns:
+            try:
+                tg_df = tg_df.copy()
+                tg_df["__rating_z__"] = candidate_rating_z(tg_df)
+                net_base = tg_df.get("net_usd_adj_total", tg_df.get("net_usd_adj")).fillna(0.0)
+                z_bonus  = pd.to_numeric(tg_df.get("z"), errors="coerce").fillna(0.0).clip(lower=0.0) * 0.10
+                std_pen  = pd.to_numeric(tg_df.get("std"), errors="coerce").fillna(0.0) * 0.02
+                f_bonus  = pd.to_numeric(tg_df.get("funding_expected_usd"), errors="coerce").fillna(0.0) * 0.05
+                tg_df["__score__"] = net_base + f_bonus + z_bonus - std_pen + tg_df["__rating_z__"].fillna(0.0)
+            except Exception:
+                pass
+        # delta spread tie-breaker
+        _su = tg_df["spread_bps_used"] if "spread_bps_used" in tg_df.columns else tg_df.get("spread_bps")
+        tg_df = tg_df.copy()
+        tg_df["__spread_used__"] = pd.to_numeric(_su, errors="coerce").fillna(-1e18)
+        if "gap_bps" not in tg_df.columns:
+            try:
+                px_low = pd.to_numeric(tg_df.get("px_low"), errors="coerce")
+                px_high = pd.to_numeric(tg_df.get("px_high"), errors="coerce")
+                tg_df["gap_bps"] = ((px_high - px_low) / px_low) * 1e4
+            except Exception:
+                tg_df["gap_bps"] = np.nan
+        tg_df["gap_bps"] = pd.to_numeric(tg_df.get("gap_bps"), errors="coerce").fillna(1e9).clip(lower=0.0)
+
+        tg_df = tg_df.sort_values(["__score__", "__spread_used__", "gap_bps"], ascending=[False, False, True]).reset_index(drop=True)
+        topN = tg_df.head(int(top3_to_tg)).to_dict("records")
         for rec in topN:
             try:
                 eventlog_append(SIGNALS_LOG_JSONL_PATH, {
@@ -7567,6 +7609,12 @@ def positions_once(
             except Exception:
                 pass
             msg = format_signal_card(rec, per_leg_notional_usd, price_source)
+            # mark if this is a fallback (not trade-eligible by filters)
+            try:
+                if cands is None or cands.empty:
+                    msg = "⚪ <b>FILTERED (TG fallback)</b>\n" + msg
+            except Exception:
+                pass
             try:
                 maybe_send_telegram(msg)
             except Exception:
