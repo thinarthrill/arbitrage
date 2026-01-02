@@ -2246,7 +2246,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.74</b>")
+    lines.append(f"\n<b> ver: 2.75</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2619,6 +2619,13 @@ def drive_service():
     global _drive_service
     if _drive_service is not None:
         return _drive_service
+    # If you are using gdrive:// paths, the Google Drive client libraries must be installed.
+    # Otherwise you will silently get empty symbols/matrix/positions and quotes=0.
+    if not DRIVE_AVAILABLE:
+        raise RuntimeError(
+            "Google Drive backend is configured but google-api-python-client is not installed. "
+            "Add 'google-api-python-client' to requirements.txt (Render) and redeploy."
+        )
 
     sa_info = _load_service_account_info()
     scopes = ["https://www.googleapis.com/auth/drive"]
@@ -8234,19 +8241,30 @@ COMMON_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","LINKUSDT",
 
 def load_matrix_df(matrix_path: str) -> pd.DataFrame:
     p = bucketize_path(matrix_path)
-    if not p: return pd.DataFrame()
+    if not p:
+        return pd.DataFrame()
     try:
+        # GCS
         if is_gs(p):
             client = gcs_client()
-            bucket_name = p[5:].split("/",1)[0]; blob_name = p[5+len(bucket_name)+1:]
-            bucket = client.lookup_bucket(bucket_name); blob = bucket.blob(blob_name)
-            if not blob.exists(): return pd.DataFrame()
+            bucket_name = p[5:].split("/", 1)[0]
+            blob_name = p[5 + len(bucket_name) + 1 :]
+            bucket = client.lookup_bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            if not blob.exists():
+                return pd.DataFrame()
             data = blob.download_as_bytes()
             return pd.read_csv(pd.io.common.BytesIO(data))
-        else:
-            return pd.read_csv(p)
+
+        # Google Drive (gdrive://<folder_id>/file.csv)
+        if is_gdrive(p):
+            data = drive_download_bytes(p)
+            return pd.read_csv(pd.io.common.BytesIO(data))
+
+        # Local path
+        return pd.read_csv(p)
     except Exception:
-        logging.warning("Matrix read error: %s", p); return pd.DataFrame()
+        return pd.DataFrame()
 
 def symbols_from_matrix(matrix_path: str, exchanges: List[str], mode: str = "union") -> List[str]:
     df = load_matrix_df(matrix_path)
