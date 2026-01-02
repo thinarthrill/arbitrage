@@ -7,12 +7,15 @@ from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 from collections import deque
+from pathlib import Path
+import logging
 # ----------------- ENV helpers -----------------
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
 
 
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
+logger = logging.getLogger(__name__)
 
 def getenv_str(k: str, d: str = "") -> str:
     v = os.getenv(k)
@@ -2158,7 +2161,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.72</b>")
+    lines.append(f"\n<b> ver: 2.73</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2488,34 +2491,91 @@ try:
 except Exception:
     DRIVE_AVAILABLE = False
 
-def drive_service():
-    """Google Drive API v3 service (service account recommended).
+def _load_service_account_info() -> dict:
+    """Load service account JSON from env.
 
-    Credentials sources (first match wins):
-      - DRIVE_KEY_JSON (raw service-account JSON)
-      - GCS_KEY_JSON (reuse same service-account JSON)
-      - GOOGLE_APPLICATION_CREDENTIALS (path)
-
-    IMPORTANT: Share your target Drive folder with the service account email.
+    Supported env vars (first found wins):
+      - DRIVE_KEY_JSON (raw JSON)
+      - GDRIVE_KEY_JSON (raw JSON)
+      - GCS_KEY_JSON (raw JSON)
+      - DRIVE_KEY_JSON_B64 / DRIVE_SA_JSON_B64 / GDRIVE_SA_JSON_B64 / GCS_KEY_JSON_B64 (base64 JSON)
+      - GOOGLE_APPLICATION_CREDENTIALS (file path)
     """
-    if not DRIVE_AVAILABLE:
-        raise RuntimeError("google-api-python-client not installed")
-    key_str = (os.getenv("DRIVE_KEY_JSON", "") or os.getenv("GCS_KEY_JSON", "")).strip()
-    if key_str:
-        info = json.loads(key_str)
-        creds = service_account.Credentials.from_service_account_info(
-            info,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if key_path:
-        creds = service_account.Credentials.from_service_account_file(
-            key_path,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    raise RuntimeError("Drive credentials not found (set DRIVE_KEY_JSON/GCS_KEY_JSON or GOOGLE_APPLICATION_CREDENTIALS)")
+    # raw JSON first
+    for k in ("DRIVE_KEY_JSON", "GDRIVE_KEY_JSON", "GCS_KEY_JSON"):
+        v = os.getenv(k)
+        if v and v.strip().startswith("{"):
+            return json.loads(v)
+
+    # base64 JSON
+    for k in ("DRIVE_KEY_JSON_B64", "DRIVE_SA_JSON_B64", "GDRIVE_SA_JSON_B64", "GCS_KEY_JSON_B64"):
+        v = os.getenv(k)
+        if not v:
+            continue
+        try:
+            decoded = base64.b64decode(v.strip()).decode("utf-8")
+            return json.loads(decoded)
+        except Exception as e:
+            raise RuntimeError(f"Invalid base64 JSON in {k}: {e}")
+
+    # file path
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path and os.path.exists(creds_path):
+        return json.loads(Path(creds_path).read_text(encoding="utf-8"))
+
+    raise RuntimeError(
+        "No Google service account credentials found. "
+        "Set DRIVE_KEY_JSON (raw) or GDRIVE_SA_JSON_B64 (base64) or GOOGLE_APPLICATION_CREDENTIALS."
+    )
+
+def drive_service():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+
+    sa_info = _load_service_account_info()
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+def bucketize_path(path: Optional[str]) -> Optional[str]:
+    """Normalize relative paths to the configured storage backend.
+
+    Rules:
+      - If `path` already starts with gs:// or gdrive:// (or is absolute), return as-is.
+      - Otherwise, if STORAGE_BACKEND is 'gdrive' (or a Drive folder id is provided),
+        prefix with gdrive://<DRIVE_FOLDER_ID>/<path>.
+      - Otherwise, if a GCS bucket is provided, prefix with gs://<BUCKET>/<path>.
+      - If nothing is configured, return the original `path`.
+    """
+    if not path:
+        return None
+    p = str(path).strip()
+    if not p:
+        return None
+
+    # already-qualified
+    if p.startswith("gs://") or p.startswith("gdrive://") or os.path.isabs(p):
+        return p
+
+    storage_backend = (os.getenv("STORAGE_BACKEND") or "").strip().lower()
+    drive_folder = (os.getenv("DRIVE_FOLDER_ID") or os.getenv("GDRIVE_ROOT_ID") or os.getenv("GDRIVE_FOLDER_ID") or "").strip()
+    bucket = (os.getenv("GCS_BUCKET") or os.getenv("BUCKET") or os.getenv("GCS_BUCKET_NAME") or "").strip()
+
+    if storage_backend in ("gdrive", "drive") or drive_folder:
+        if not drive_folder:
+            # This is the #1 причина "не читает файлы на Render": silently falls back to local path.
+            # Make it loud so misconfig is obvious.
+            logger.error("Drive backend requested but DRIVE_FOLDER_ID/GDRIVE_ROOT_ID is NOT set. "
+                         "Refusing to use local path on Render. path=%s", p)
+            return None
+        return f"gdrive://{drive_folder}/{p.lstrip('/')}"
+
+    if bucket:
+        return f"gs://{bucket}/{p.lstrip('/')}"
+
+    return p
 
 def _drive_split(gdrive_path: str) -> Tuple[str, str]:
     p = gdrive_path.replace("drive://", "gdrive://", 1)
