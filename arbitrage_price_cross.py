@@ -2251,7 +2251,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.82</b>")
+    lines.append(f"\n<b> ver: 2.83</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -5071,9 +5071,39 @@ def scan_spreads_once(
         ex_low = best.get("long_ex")
         ex_high = best.get("short_ex")
 
-        x2, z2, std2, _mu2 = get_z_for_pair(stats_df, sym, ex_low, ex_high, px_low, px_high)
+        x2, z2, std2, mu2 = get_z_for_pair(stats_df, sym, ex_low, ex_high, px_low, px_high)
         best["z"] = z2
         best["std"] = std2
+        # --- IMPORTANT: also recompute baseline/delta so TG card doesn't fall back to raw ---
+        try:
+            if mu2 is not None and isinstance(mu2, float) and np.isnan(mu2):
+                mu2 = None
+        except Exception:
+            pass
+        try:
+            if x2 is not None and isinstance(x2, float) and np.isnan(x2):
+                x2 = None
+        except Exception:
+            pass
+        try:
+            if mu2 is not None:
+                mu_log = float(mu2)
+                baseline_bps = (math.exp(mu_log) - 1.0) * 1e4
+                raw_bps = float(best.get("spread_bps") or 0.0)
+                if raw_bps <= 0 and x2 is not None:
+                    raw_bps = (math.exp(float(x2)) - 1.0) * 1e4
+                delta_bps = raw_bps - baseline_bps
+                best["spread_mu"] = float(mu_log)              # log-space mean
+                best["spread_mu_bps"] = float(baseline_bps)    # baseline in bps
+                best["spread_delta_bps"] = float(delta_bps)    # delta in bps
+                best["spread_res_bps"] = float(delta_bps)      # compat for gating/ranking
+                best["log_spread_x"] = float(x2) if x2 is not None else best.get("log_spread_x")
+                # used spread for checks/telegram
+                if entry_mode_loc == "zscore":
+                    best["spread_bps_used"] = float(delta_bps)
+                    best["spread_pct_used"] = float(delta_bps) / 1e4 * 100.0
+        except Exception:
+            pass
 
     # ---- has_open: ГЛОБАЛЬНЫЙ флаг — есть ли хотя бы ОДНА открытая позиция ----
     has_open = False
