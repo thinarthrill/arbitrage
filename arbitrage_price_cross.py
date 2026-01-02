@@ -14,6 +14,24 @@ load_dotenv()
 
 RUN_ID = os.getenv("RUN_ID") or uuid.uuid4().hex[:10]
 
+def getenv_str(k: str, d: str = "") -> str:
+    v = os.getenv(k)
+    return d if v is None or v.strip()=="" else v.strip()
+def getenv_bool(k: str, d: bool=False) -> bool:
+    v = os.getenv(k)
+    if v is None: return d
+    return v.strip().lower() in ("1","true","t","yes","y","on")
+def getenv_float(k: str, d: float) -> float:
+    v = os.getenv(k)
+    try: return float(v) if v is not None and v.strip()!="" else d
+    except: return d
+def getenv_list(k: str, default_list: List[str]) -> List[str]:
+    v = os.getenv(k)
+    if v is None or v.strip()=="":
+        return default_list
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
 # --- Structured event logs (JSONL) for post-trade analysis ---
 # Stored in the same GCS folder as CARD_LOG_JSONL_PATH / TG_LOG_JSONL_PATH (tg_cards.jsonl)
 def _gcs_dir_from_path(gs_path: str) -> str:
@@ -43,7 +61,10 @@ def _default_log_path(filename: str) -> str:
 
 SIGNALS_LOG_JSONL_PATH = os.getenv("SIGNALS_LOG_JSONL_PATH", "").strip() or _default_log_path("signals_log.jsonl")
 ORDERS_LOG_JSONL_PATH  = os.getenv("ORDERS_LOG_JSONL_PATH", "").strip()  or _default_log_path("orders_log.jsonl")
-TRADES_LOG_JSONL_PATH  = os.getenv("TRADES_LOG_JSONL_PATH", "").strip()  or _default_log_path("trades_log.jsonl")
+TRADES_LOG_JSONL_PATH = getenv_str(
+    "TRADES_LOG_JSONL_PATH",
+    "gdrive://funding_scanner/trades.jsonl"
+)
 
 # per-path uploader state
 _EVENTLOG_STATE: Dict[str, Dict[str, Any]] = {}
@@ -95,25 +116,31 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
         if b and o:
             gs_raw = f"gs://{b}/{o}"
 
-    gs_path = bucketize_path(gs_raw)
+    remote_path = bucketize_path(gs_raw)
 
-    if not gs_path or not is_gs(gs_path):
-        # если env задан, но путь не gs:// — покажем один раз
+    if not remote_path or not is_remote(remote_path):
+        # если env задан, но путь не gs:// / gdrive:// — покажем один раз
         if gs_raw and (not _CARDLOG_WARNED_BAD_PATH):
             _CARDLOG_WARNED_BAD_PATH = True
             logging.warning(
-                "Card log path is set but not a gs:// path after bucketize: raw=%r -> %r "
-                "(supported envs: CARD_LOG_JSONL_PATH, TG_LOG_JSONL_PATH, TG_LOG_BUCKET+TG_LOG_OBJECT)",
-                gs_raw, gs_path
+                "Card log path is set but not a remote path after bucketize: raw=%r -> %r "
+                "(supported: gs://... OR gdrive://<folder_id>/...; envs: CARD_LOG_JSONL_PATH, TG_LOG_JSONL_PATH, TG_LOG_BUCKET+TG_LOG_OBJECT)",
+                gs_raw, remote_path
             )
         return
 
-    # Если библиотека GCS недоступна — раньше это выстреливало исключением и молча глушилось ниже
-    if not GCS_AVAILABLE:
+    # If remote backend libs are missing, do nothing (warn once)
+    if is_gs(remote_path) and (not GCS_AVAILABLE):
         if not _CARDLOG_WARNED_NO_GCS:
             _CARDLOG_WARNED_NO_GCS = True
             logging.warning("GCS logging disabled: google-cloud-storage is not available. "
                             "Install google-cloud-storage or ensure it's in requirements.")
+        return
+    if is_gdrive(remote_path) and (not DRIVE_AVAILABLE):
+        if not _CARDLOG_WARNED_NO_GCS:
+            _CARDLOG_WARNED_NO_GCS = True
+            logging.warning("Drive logging disabled: google-api-python-client is not available. "
+                            "Install google-api-python-client.")
         return
 
     # local file per run/day (safe for restarts)
@@ -144,16 +171,19 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
     try:
         with open(_CARDLOG_LOCAL, "r", encoding="utf-8") as f:
             data = f.read()
-        gcs_upload_text(gs_path, data, content_type="text/plain")
+        if is_gs(remote_path):
+            gcs_upload_text(remote_path, data, content_type="text/plain")
+        else:
+            drive_upload_bytes(remote_path, data.encode("utf-8"), content_type="text/plain")
         _CARDLOG_LAST_UPLOAD_TS = now_ts
         _CARDLOG_PENDING_LINES = 0
     except Exception as e:
         # ВАЖНО: раньше это было debug → на Render ты не видел ошибку вообще
         if not _CARDLOG_WARNED_UPLOAD_FAIL:
             _CARDLOG_WARNED_UPLOAD_FAIL = True
-            logging.warning("cardlog upload failed (first failure). gs_path=%s err=%s", gs_path, e)
+            logging.warning("cardlog upload failed (first failure). path=%s err=%s", remote_path, e)
         else:
-            logging.warning("cardlog upload failed. gs_path=%s err=%s", gs_path, e)
+            logging.warning("cardlog upload failed. path=%s err=%s", remote_path, e)
 
 def cardlog_flush() -> None:
     """Force upload pending lines to GCS."""
@@ -162,37 +192,42 @@ def cardlog_flush() -> None:
     except Exception:
         pass
 
-def eventlog_append(gs_path: str, event: Dict[str, Any], force: bool = False) -> None:
-    """Append JSONL event to a per-path local file and periodically upload to GCS (overwrite object).
+def eventlog_append(path: str, event: Dict[str, Any], force: bool = False) -> None:
+    """Append JSONL event to a per-path local file and periodically upload to remote storage.
 
     This mirrors cardlog_append() mechanics but allows multiple independent streams
     (signals/orders/trades) in separate objects.
     """
-    if not gs_path:
+    if not path:
         return
 
-    # guard: only gs:// supported
-    if not gs_path.startswith("gs://"):
+    remote_path = bucketize_path(path)
+    if not remote_path or not is_remote(remote_path):
         return
 
     # If GCS lib missing, do nothing (but warn once per path)
     global _EVENTLOG_STATE
-    st = _EVENTLOG_STATE.get(gs_path)
+    st = _EVENTLOG_STATE.get(remote_path)
     if st is None:
         st = {"warned_no_gcs": False, "warned_upload_fail": False, "local": None,
               "pending": 0, "last_upload_ts": 0.0}
-        _EVENTLOG_STATE[gs_path] = st
+        _EVENTLOG_STATE[remote_path] = st
 
-    if not GCS_AVAILABLE:
+    if is_gs(remote_path) and (not GCS_AVAILABLE):
         if not st["warned_no_gcs"]:
             st["warned_no_gcs"] = True
-            logging.warning("GCS event logging disabled (google-cloud-storage missing). path=%s", gs_path)
+            logging.warning("GCS event logging disabled (google-cloud-storage missing). path=%s", remote_path)
+        return
+    if is_gdrive(remote_path) and (not DRIVE_AVAILABLE):
+        if not st["warned_no_gcs"]:
+            st["warned_no_gcs"] = True
+            logging.warning("Drive event logging disabled (google-api-python-client missing). path=%s", remote_path)
         return
 
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     if st["local"] is None:
         # local file per stream/path per day (safe for restarts)
-        safe = hashlib.sha1(gs_path.encode("utf-8")).hexdigest()[:10]
+        safe = hashlib.sha1(remote_path.encode("utf-8")).hexdigest()[:10]
         st["local"] = f"/tmp/ev_{safe}_{day}_{RUN_ID}.jsonl"
 
     try:
@@ -216,15 +251,18 @@ def eventlog_append(gs_path: str, event: Dict[str, Any], force: bool = False) ->
     try:
         with open(st["local"], "r", encoding="utf-8") as f:
             data = f.read()
-        gcs_upload_text(gs_path, data, content_type="text/plain")
+        if is_gs(remote_path):
+            gcs_upload_text(remote_path, data, content_type="text/plain")
+        else:
+            drive_upload_bytes(remote_path, data.encode("utf-8"), content_type="text/plain")
         st["last_upload_ts"] = now_ts
         st["pending"] = 0
     except Exception as e:
         if not st["warned_upload_fail"]:
             st["warned_upload_fail"] = True
-            logging.warning("eventlog upload failed (first failure). path=%s err=%s", gs_path, e)
+            logging.warning("eventlog upload failed (first failure). path=%s err=%s", remote_path, e)
         else:
-            logging.warning("eventlog upload failed. path=%s err=%s", gs_path, e)
+            logging.warning("eventlog upload failed. path=%s err=%s", remote_path, e)
 
 def eventlog_flush() -> None:
     """Force upload pending lines for all streams."""
@@ -632,23 +670,6 @@ def _private_base(exchange: str) -> str:
         # поэтому всегда используем основной хост
         return "https://www.okx.com"
     raise ValueError(f"Unknown exchange: {exchange}")
-
-def getenv_str(k: str, d: str = "") -> str:
-    v = os.getenv(k)
-    return d if v is None or v.strip()=="" else v.strip()
-def getenv_bool(k: str, d: bool=False) -> bool:
-    v = os.getenv(k)
-    if v is None: return d
-    return v.strip().lower() in ("1","true","t","yes","y","on")
-def getenv_float(k: str, d: float) -> float:
-    v = os.getenv(k)
-    try: return float(v) if v is not None and v.strip()!="" else d
-    except: return d
-def getenv_list(k: str, default_list: List[str]) -> List[str]:
-    v = os.getenv(k)
-    if v is None or v.strip()=="":
-        return default_list
-    return [x.strip() for x in v.split(",") if x.strip()]
 
 # ----------------- Cardlog: dedup (avoid double writes) -----------------
 _CARDLOG_DEDUP: Dict[str, float] = {}
@@ -2137,7 +2158,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.69</b>")
+    lines.append(f"\n<b> ver: 2.70</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2409,17 +2430,41 @@ def maybe_send_telegram(text: str) -> None:
         except Exception as e:
             logging.warning("Telegram exception: %s", e)
 
-# ----------------- CSV / GCS -----------------
-def is_gs(path: Optional[str]) -> bool: return bool(path) and str(path).startswith("gs://")
+# ----------------- CSV / Remote storage (GCS or Google Drive) -----------------
+def is_gs(path: Optional[str]) -> bool:
+    return bool(path) and str(path).startswith("gs://")
+
+def is_gdrive(path: Optional[str]) -> bool:
+    return bool(path) and (str(path).startswith("gdrive://") or str(path).startswith("drive://"))
+
+def is_remote(path: Optional[str]) -> bool:
+    return is_gs(path) or is_gdrive(path)
+
 def bucketize_path(path: Optional[str]) -> Optional[str]:
-    if not path or path.strip()=="": return path
-    p = path.strip()
-    if is_gs(p) or os.path.isabs(p):
+    """Normalize storage path.
+
+    Supported:
+      - gs://bucket/obj (GCS)
+      - gdrive://<folder_id>/path/file (Google Drive)
+      - local path
+
+    If user provides a relative path and DRIVE_FOLDER_ID is set, we default to Drive.
+    Else, if GCS_BUCKET/BACKET is set, we default to GCS.
+    """
+    if not path or str(path).strip() == "":
+        return path
+    p = str(path).strip()
+    if is_gs(p) or is_gdrive(p) or os.path.isabs(p):
         return p
-    # fix: use GCS_BUCKET; keep BACKET for backward compatibility
-    backet = getenv_str("GCS_BUCKET","").strip() or getenv_str("BACKET","").strip()
+
+    drive_folder = getenv_str("DRIVE_FOLDER_ID", "").strip()
+    if drive_folder:
+        norm = p.lstrip("/").replace("\\", "/")
+        return f"gdrive://{drive_folder}/{norm}"
+
+    backet = getenv_str("GCS_BUCKET", "").strip() or getenv_str("BACKET", "").strip()
     if backet:
-        norm = p.lstrip('/').replace('\\', '/')
+        norm = p.lstrip("/").replace("\\", "/")
         return f"gs://{backet}/{norm}"
     return p
 
@@ -2429,10 +2474,160 @@ _OPEN_LOCK_TTL_SEC = int(getenv_float("OPEN_LOCK_TTL_SEC", 30))
 
 GCS_AVAILABLE = True
 try:
-    from google.cloud import storage  # type: ignore
-    from google.oauth2 import service_account  # type: ignore
+    from google.cloud import storage
+    from google.oauth2 import service_account
 except Exception:
     GCS_AVAILABLE = False
+
+
+DRIVE_AVAILABLE = True
+try:
+    from googleapiclient.discovery import build  # type: ignore
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload  # type: ignore
+    from google.oauth2 import service_account  # type: ignore
+except Exception:
+    DRIVE_AVAILABLE = False
+
+def drive_service():
+    """Google Drive API v3 service (service account recommended).
+
+    Credentials sources (first match wins):
+      - DRIVE_KEY_JSON (raw service-account JSON)
+      - GCS_KEY_JSON (reuse same service-account JSON)
+      - GOOGLE_APPLICATION_CREDENTIALS (path)
+
+    IMPORTANT: Share your target Drive folder with the service account email.
+    """
+    if not DRIVE_AVAILABLE:
+        raise RuntimeError("google-api-python-client not installed")
+    key_str = (os.getenv("DRIVE_KEY_JSON", "") or os.getenv("GCS_KEY_JSON", "")).strip()
+    if key_str:
+        info = json.loads(key_str)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if key_path:
+        creds = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    raise RuntimeError("Drive credentials not found (set DRIVE_KEY_JSON/GCS_KEY_JSON or GOOGLE_APPLICATION_CREDENTIALS)")
+
+def _drive_split(gdrive_path: str) -> Tuple[str, str]:
+    p = gdrive_path.replace("drive://", "gdrive://", 1)
+    rest = p.split("gdrive://", 1)[1]
+    folder_id, rel = rest.split("/", 1) if "/" in rest else (rest, "")
+    return folder_id.strip(), rel.strip("/")
+
+def _drive_find_child(service, parent_id: str, name: str, mime: Optional[str] = None) -> Optional[str]:
+    safe_name = name.replace("'", "\\'")
+    q = [f"'{parent_id}' in parents", "trashed=false", f"name='{safe_name}'"]
+    if mime:
+        q.append(f"mimeType='{mime}'")
+    res = service.files().list(q=" and ".join(q), fields="files(id,name,mimeType)", pageSize=10).execute()
+    files = res.get("files", []) or []
+    return files[0]["id"] if files else None
+
+def _drive_ensure_folder(service, parent_id: str, name: str) -> str:
+    folder_mime = "application/vnd.google-apps.folder"
+    fid = _drive_find_child(service, parent_id, name, mime=folder_mime)
+    if fid:
+        return fid
+    meta = {"name": name, "mimeType": folder_mime, "parents": [parent_id]}
+    created = service.files().create(body=meta, fields="id").execute()
+    return created["id"]
+
+def _drive_resolve_parent(service, root_folder_id: str, rel_path: str) -> Tuple[str, str]:
+    parts = [p for p in rel_path.split("/") if p]
+    if not parts:
+        raise ValueError("Empty gdrive path")
+    *dirs, filename = parts
+    parent = root_folder_id
+    for d in dirs:
+        parent = _drive_ensure_folder(service, parent, d)
+    return parent, filename
+def drive_upload_bytes(gdrive_path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    folder_id, rel = _drive_split(gdrive_path)
+    service = drive_service()
+    parent_id, filename = _drive_resolve_parent(service, folder_id, rel)
+    existing_id = _drive_find_child(service, parent_id, filename)
+    from io import BytesIO
+    media = MediaIoBaseUpload(BytesIO(data), mimetype=content_type, resumable=False)
+    if existing_id:
+        service.files().update(fileId=existing_id, media_body=media).execute()
+    else:
+        meta = {"name": filename, "parents": [parent_id]}
+        service.files().create(body=meta, media_body=media, fields="id").execute()
+
+def drive_download_bytes(gdrive_path: str) -> Optional[bytes]:
+    folder_id, rel = _drive_split(gdrive_path)
+    service = drive_service()
+    parent_id, filename = _drive_resolve_parent(service, folder_id, rel)
+    fid = _drive_find_child(service, parent_id, filename)
+    if not fid:
+        return None
+    from io import BytesIO
+    buf = BytesIO()
+    req = service.files().get_media(fileId=fid)
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+def is_gdrive(path: Optional[str]) -> bool:
+    return bool(path) and str(path).startswith("gdrive://")
+
+
+def gdrive_write_text(gd_path: str, text: str):
+    """
+    gdrive://folder/sub/file.txt
+    """
+    service = gdrive_client()
+    root_id = getenv_str("GDRIVE_ROOT_ID")
+    if not root_id:
+        raise RuntimeError("GDRIVE_ROOT_ID is not set")
+
+    parts = gd_path.replace("gdrive://", "").strip("/").split("/")
+    folder_id = root_id
+
+    # create / traverse folders
+    for name in parts[:-1]:
+        q = f"name='{name}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        res = service.files().list(q=q, fields="files(id,name)").execute()
+        files = res.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+        else:
+            meta = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [folder_id],
+            }
+            folder_id = service.files().create(body=meta, fields="id").execute()["id"]
+
+    filename = parts[-1]
+
+    media = MediaInMemoryUpload(
+        text.encode("utf-8"),
+        mimetype="text/plain"
+    )
+
+    # overwrite if exists
+    q = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
+    res = service.files().list(q=q, fields="files(id)").execute()
+    files = res.get("files", [])
+    if files:
+        service.files().update(fileId=files[0]["id"], media_body=media).execute()
+    else:
+        service.files().create(
+            body={"name": filename, "parents": [folder_id]},
+            media_body=media
+        ).execute()
 
 def gcs_client():
     if not GCS_AVAILABLE: raise RuntimeError("google-cloud-storage not installed")
@@ -2475,7 +2670,14 @@ def gcs_write_csv(gs_path: str, df: pd.DataFrame):
 def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
     if not path or path.strip()=="": return
     p = bucketize_path(path)
-    if is_gs(p): gcs_write_csv(p, df); return
+    if is_gs(p):
+        gcs_write_csv(p, df)
+        return
+    if is_gdrive(p):
+        from io import StringIO
+        buf = StringIO(); df.to_csv(buf, index=False)
+        drive_upload_bytes(p, buf.getvalue().encode("utf-8"), content_type="text/csv")
+        return
     import os
     os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
     df.to_csv(p, index=False)
@@ -2483,7 +2685,21 @@ def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
 def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
     if not path or path.strip()=="": return pd.DataFrame(columns=columns)
     p = bucketize_path(path)
-    if is_gs(p): return gcs_read_csv(p, columns)
+    if is_gs(p):
+        return gcs_read_csv(p, columns)
+    if is_gdrive(p):
+        try:
+            data = drive_download_bytes(p)
+            if not data:
+                return pd.DataFrame(columns=columns)
+            df = pd.read_csv(pd.io.common.BytesIO(data))
+            for c in columns:
+                if c not in df.columns:
+                    df[c] = None
+            return df[columns]
+        except Exception as e:
+            logging.warning("Drive read error %s: %s", p, e)
+            return pd.DataFrame(columns=columns)
     import os
     if not os.path.exists(p): return pd.DataFrame(columns=columns)
     try:
@@ -3637,6 +3853,8 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     # In zscore-mode we want ENTRY_SPREAD_BPS to work on deviation (residual),
     # not on absolute structural spread.
     spread_bps_used = spread_bps_raw
+    # determine mode for gating math (avoid undefined var in this scope)
+    entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
     try:
         if str(entry_mode_loc).lower() == "zscore":
             res = best.get("spread_res_bps")
@@ -3675,7 +3893,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     ENTRY_MODE = getenv_str("ENTRY_MODE", "price").lower()
     Z_IN = float(getenv_float("Z_IN", 2.0))
-    ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+    
 
     try:
         if ENTRY_MODE == "zscore":
@@ -4689,6 +4907,9 @@ def scan_spreads_once(
     # держим best синхронизированным с очищенными/пересчитанными значениями
     best["z"] = z
     best["std"] = std
+
+    # compute gating filters ONCE (was missing -> Pylance errors + could break runtime)
+    filters = compute_entry_filters(best, entry_bps=float(ENTRY_SPREAD_BPS), entry_mode=entry_mode_loc)
 
     # pull diagnostics from the actual gating logic (compute_entry_filters),
     # so TG/logs show what ENTRY_SPREAD_BPS compared against.
