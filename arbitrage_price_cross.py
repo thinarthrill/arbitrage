@@ -777,14 +777,14 @@ def _eventlog_fingerprint(evt: Dict[str, Any]) -> str:
     except Exception:
         return uuid.uuid4().hex
 
-def eventlog_append(gs_path: str, event: Dict[str, Any], key: str = "events") -> None:
-    """Append JSONL events to local file and periodically overwrite ONE gs:// file."""
+def events_agg_append(path: str, event: Dict[str, Any], key: str = "events") -> None:
+    """Append JSONL events to local file and periodically overwrite ONE remote file (gs:// or gdrive://)."""
     try:
-        gs_path = bucketize_path(gs_path)
-        if not gs_path or not is_gs(gs_path):
-            if gs_path and (key not in _EVENTSLOG_STATE["warned_bad_path"]):
+        remote_path = bucketize_path(path)
+        if not remote_path or not is_remote(remote_path):
+            if remote_path and (key not in _EVENTSLOG_STATE["warned_bad_path"]):
                 _EVENTSLOG_STATE["warned_bad_path"].add(key)
-                logging.warning("EVENTLOG bad gs path for %s: %s", key, gs_path)
+                logging.warning("EVENTLOG bad remote path for %s: %s", key, remote_path)
             return
 
         local_path = _EVENTSLOG_STATE["locals"].get(key)
@@ -808,13 +808,18 @@ def eventlog_append(gs_path: str, event: Dict[str, Any], key: str = "events") ->
         if (now - last) < _EVENTLOG_UPLOAD_EVERY_SEC and len(pend) < 50:
             return
 
-        client = gcs_client()
-        bucket_name = gs_path[5:].split("/", 1)[0]
-        blob_name = gs_path[5 + len(bucket_name) + 1 :]
-        bucket = client.lookup_bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        with open(local_path, "rb") as rf:
-            blob.upload_from_file(rf, content_type="text/plain")
+        # Upload full local file to remote object
+        if is_gs(remote_path):
+            client = gcs_client()
+            bucket_name = remote_path[5:].split("/", 1)[0]
+            blob_name = remote_path[5 + len(bucket_name) + 1 :]
+            bucket = client.lookup_bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            with open(local_path, "rb") as rf:
+                blob.upload_from_file(rf, content_type="text/plain")
+        else:
+            with open(local_path, "rb") as rf:
+                drive_upload_bytes(remote_path, rf.read(), content_type="text/plain")
 
         _EVENTSLOG_STATE["last_upload"][key] = now
         _EVENTSLOG_STATE["pending"][key] = []
@@ -823,7 +828,7 @@ def eventlog_append(gs_path: str, event: Dict[str, Any], key: str = "events") ->
             _EVENTSLOG_STATE["warned_upload_fail"].add(key)
             logging.warning("EVENTLOG upload failed for %s: %s", key, e)
 
-def eventlog_append_once(gs_path: str, event: Dict[str, Any], key: str = "events") -> None:
+def events_agg_append_once(path: str, event: Dict[str, Any], key: str = "events") -> None:
     """Dedup wrapper to avoid double-writing same event."""
     try:
         evt = dict(event or {})
@@ -836,7 +841,7 @@ def eventlog_append_once(gs_path: str, event: Dict[str, Any], key: str = "events
         if eid in _EVENTSLOG_DEDUP:
             return
         _EVENTSLOG_DEDUP[eid] = now
-        eventlog_append(gs_path, evt, key=key)
+        events_agg_append(path, evt, key=key)
     except Exception:
         pass
 
@@ -2202,7 +2207,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.78</b>")
+    lines.append(f"\n<b> ver: 2.79</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2425,7 +2430,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
             _ev = dict(payload)
             _ev.setdefault("event", "signal")
             _ev.setdefault("stage", "telegram")
-            eventlog_append_once(get_events_log_path(), _ev, key="events")
+            events_agg_append_once(get_events_log_path(), _ev, key="events")
         except Exception:
             pass
     except Exception:
@@ -3830,7 +3835,7 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
                     "std": _json_sanitize(best.get("std")),
                     "funding_expected_pct": best.get("funding_expected_pct") or best.get("funding_exp_pct"),
                 }
-                eventlog_append_once(get_events_log_path(), _ev, key="events")
+                events_agg_append_once(get_events_log_path(), _ev, key="events")
             except Exception:
                 pass    
         except Exception:
@@ -6131,7 +6136,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             "paper": bool(paper),
             "reverse_side": bool(reverse_side),
         }
-        eventlog_append_once(get_events_log_path(), _ev, key="events")
+        events_agg_append_once(get_events_log_path(), _ev, key="events")
     except Exception:
         pass
 
@@ -7502,7 +7507,7 @@ def positions_once(
                             "opened_at": _row.get("opened_at"),
                             "closed_at": _row.get("closed_at"),
                         }
-                        eventlog_append_once(get_events_log_path(), _ev, key="events")
+                        events_agg_append_once(get_events_log_path(), _ev, key="events")
                     except Exception:
                         pass
 
@@ -7878,7 +7883,7 @@ def positions_once(
                             "opened_at": _row.get("opened_at"),
                             "closed_at": _row.get("closed_at"),
                         }
-                        eventlog_append_once(get_events_log_path(), _ev, key="events")
+                        events_agg_append_once(get_events_log_path(), _ev, key="events")
                     except Exception:
                         pass
 
