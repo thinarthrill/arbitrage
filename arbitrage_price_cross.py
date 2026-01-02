@@ -435,50 +435,6 @@ import time
 import traceback
 import sys
 
-def ensure_gcs_credentials_from_env():
-    """
-    Использует именно твои env-переменные:
-      - GCS_KEY_JSON (строка с service account json)
-      - GOOGLE_APPLICATION_CREDENTIALS (если уже задан — не трогаем)
-    Делает:
-      1) парсит json
-      2) пишет во временный файл
-      3) устанавливает GOOGLE_APPLICATION_CREDENTIALS
-    """
-    import os, json, tempfile, logging
-
-    # если путь уже задан (например, через Render Secret File) — ок
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        logging.info("[GCS] GOOGLE_APPLICATION_CREDENTIALS already set")
-        return
-
-    raw = os.getenv("GCS_KEY_JSON")
-    if not raw:
-        logging.warning("[GCS] GCS_KEY_JSON is empty -> GCS writes will be anonymous")
-        return
-
-    # в env у тебя значение обёрнуто в одинарные кавычки ' {...} '
-    raw = raw.strip()
-    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
-        raw = raw[1:-1].strip()
-
-    try:
-        sa = json.loads(raw)
-    except Exception as e:
-        logging.error("[GCS] Failed to parse GCS_KEY_JSON: %s", e)
-        return
-
-    try:
-        fd, path = tempfile.mkstemp(prefix="gcs_sa_", suffix=".json")
-        os.close(fd)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(sa, f)
-
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-        logging.info("[GCS] Credentials loaded from GCS_KEY_JSON into %s", path)
-    except Exception as e:
-        logging.error("[GCS] Failed to write temp credentials file: %s", e)
-
 def _bulk_binance():
     url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
     try:
@@ -2246,7 +2202,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.77</b>")
+    lines.append(f"\n<b> ver: 2.78</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2584,31 +2540,44 @@ def _load_service_account_info() -> dict:
     Supported env vars (first found wins):
       - DRIVE_KEY_JSON (raw JSON)
       - GDRIVE_KEY_JSON (raw JSON)
-      - GCS_KEY_JSON (raw JSON)
-      - DRIVE_KEY_JSON_B64 / DRIVE_SA_JSON_B64 / GDRIVE_SA_JSON_B64 / GCS_KEY_JSON_B64 (base64 JSON)
+      - DRIVE_KEY_JSON_B64 / DRIVE_SA_JSON_B64 / GDRIVE_SA_JSON_B64 (base64 JSON)
       - GOOGLE_APPLICATION_CREDENTIALS (file path)
     """
+    def _log_sa_source(src: str, sa: dict) -> None:
+        try:
+            pid = sa.get("project_id")
+            email = sa.get("client_email")
+            logger.info(f"[GDRIVE] creds source={src} project_id={pid} client_email={email}")
+        except Exception:
+            pass
+
     # raw JSON first
-    for k in ("DRIVE_KEY_JSON", "GDRIVE_KEY_JSON", "GCS_KEY_JSON"):
+    for k in ("DRIVE_KEY_JSON", "GDRIVE_KEY_JSON"):
         v = os.getenv(k)
         if v and v.strip().startswith("{"):
-            return json.loads(v)
+            sa = json.loads(v)
+            _log_sa_source(k, sa)
+            return sa
 
     # base64 JSON
-    for k in ("DRIVE_KEY_JSON_B64", "DRIVE_SA_JSON_B64", "GDRIVE_SA_JSON_B64", "GCS_KEY_JSON_B64"):
+    for k in ("DRIVE_KEY_JSON_B64", "DRIVE_SA_JSON_B64", "GDRIVE_SA_JSON_B64"):
         v = os.getenv(k)
         if not v:
             continue
         try:
             decoded = base64.b64decode(v.strip()).decode("utf-8")
-            return json.loads(decoded)
+            sa = json.loads(decoded)
+            _log_sa_source(k, sa)
+            return sa
         except Exception as e:
             raise RuntimeError(f"Invalid base64 JSON in {k}: {e}")
 
     # file path
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
-        return json.loads(Path(creds_path).read_text(encoding="utf-8"))
+        sa = json.loads(Path(creds_path).read_text(encoding="utf-8"))
+        _log_sa_source("GOOGLE_APPLICATION_CREDENTIALS", sa)
+        return sa
 
     raise RuntimeError(
         "No Google service account credentials found. "
@@ -8498,12 +8467,6 @@ def main():
     must_check = _is_true("CHECK_EXCHANGES_AT_START", True)
     must_quit  = _is_true("QUIT_ON_CONNECTIVITY_FAIL", True)
     probe_sym  = os.getenv("CONNECTIVITY_PROBE_SYMBOL", "BTCUSDT").upper()
-
-    # ----- GCS creds -----
-    try:
-        ensure_gcs_credentials_from_env()
-    except Exception as e:
-        logging.exception("[GCS] ensure_gcs_credentials_from_env failed: %s", e)
 
     if must_check:
         per_env = {}
