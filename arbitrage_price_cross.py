@@ -2164,6 +2164,14 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
                 ev  = r.get("ema_var", None)
                 upd = r.get("updated_ms", None)
                 okf = r.get("stats_ok", None)
+                # fallback: если stats_ok не проставили апстримом, попробуем вывести по std
+                if okf is None:
+                    try:
+                        sstd = r.get("std", None)
+                        sstd = float(sstd) if sstd is not None else float("nan")
+                        okf = bool((sstd == sstd) and (sstd > 0))
+                    except Exception:
+                        okf = False
 
                 upd_age = None
                 if upd is not None:
@@ -2241,7 +2249,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.80</b>")
+    lines.append(f"\n<b> ver: 2.81</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3995,7 +4003,10 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
     try:
         if str(entry_mode_loc).lower() == "zscore":
-            res = best.get("spread_res_bps")
+            # prefer explicit delta if present
+            res = best.get("spread_delta_bps")
+            if res is None:
+                res = best.get("spread_res_bps")
             if res is not None:
                 res_f = float(res)
                 if res_f == res_f:  # not NaN
@@ -4035,7 +4046,10 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
 
     try:
         if ENTRY_MODE == "zscore":
-            res = best.get("spread_res_bps")
+            # prefer explicit delta if present
+            res = best.get("spread_delta_bps")
+            if res is None:
+                res = best.get("spread_res_bps")
             if res is not None:
                 res_f = float(res)
                 if res_f == res_f:  # not NaN
@@ -4605,18 +4619,26 @@ def scan_all_with_instant_alerts(
             px_low=float(best["px_low"]),
             px_high=float(best["px_high"]),
         )
-        # --- NEW: residual spread in bps (deviation from baseline / mean) ---
+        # --- NEW: DELTA spread in bps (raw_spread_bps - baseline_spread_bps) ---
         try:
-            # residual in log-space
-            res_log = float(x_log) - float(mu)
-            # convert to bps in price space: exp(res)-1
-            res_bps = (math.exp(res_log) - 1.0) * 1e4
+            mu_log = float(mu)
+            baseline_bps = (math.exp(mu_log) - 1.0) * 1e4
+            raw_bps = float(best.get("spread_bps") or 0.0)
+            # fallback: если raw не проставлен, выведем из x_log
+            if raw_bps <= 0:
+                raw_bps = (math.exp(float(x_log)) - 1.0) * 1e4
+            delta_bps = raw_bps - baseline_bps
             best["log_spread_x"] = float(x_log)
-            best["spread_mu"] = float(mu)
-            best["spread_res_bps"] = float(res_bps)
+            best["spread_mu"] = float(mu_log)               # log-space mean (для z-диагностики)
+            best["spread_mu_bps"] = float(baseline_bps)     # baseline in bps
+            best["spread_delta_bps"] = float(delta_bps)     # delta in bps
+            # совместимость: старое имя, на которое завязаны фильтры/гейтинг
+            best["spread_res_bps"] = float(delta_bps)
         except Exception:
             best["log_spread_x"] = None
             best["spread_mu"] = None
+            best["spread_mu_bps"] = None
+            best["spread_delta_bps"] = None
             best["spread_res_bps"] = None
 
         SLIPPAGE_BPS_DYNAMIC = getenv_bool("SLIPPAGE_BPS_DYNAMIC", True)
@@ -4861,12 +4883,23 @@ def scan_spreads_once(
 
         z_list, std_list, n_list = [], [], []
         mu_list = []
+        mu_bps_list = []
         res_bps_list = []
         x_bps_list = []
+        stats_ok_list = []
+        ema_var_list = []
+        count_list = []
+        updated_ms_list = []        
         for _, r in cands.iterrows():
             key = (str(r["symbol"]).upper(), str(r["ex_low"]).lower(), str(r["ex_high"]).lower())
             if key in stats_key.index:
                 st = stats_key.loc[key]
+                # если индекс не уникален, stats_key.loc вернёт DataFrame — берём первую строку
+                if hasattr(st, "iloc"):
+                    try:
+                        st = st.iloc[0]
+                    except Exception:
+                        pass                
                 mu = float(st["ema_mean"])
                 sd = float(st["std"])
                 n  = float(st.get("n", 0))
@@ -4876,30 +4909,59 @@ def scan_spreads_once(
                 std_list.append(sd)
                 n_list.append(n)
                 mu_list.append(mu)
-                # log_spread is ln(px_high/px_low). Convert delta-to-mean to "bps-like" scale for gating.
-                res_bps_list.append((x - mu) * 1e4)
+                # baseline in bps from mu (log-space), and DELTA in bps = raw - baseline
+                baseline_bps = (math.exp(mu) - 1.0) * 1e4
+                raw_bps = float(r.get("spread_bps") or 0.0)
+                if raw_bps <= 0:
+                    # fallback: raw from x
+                    raw_bps = (math.exp(x) - 1.0) * 1e4
+                delta_bps = raw_bps - baseline_bps
+                mu_bps_list.append(baseline_bps)
+                # ВАЖНО: spread_res_bps теперь хранит DELTA (для гейтинга в zscore-mode)
+                res_bps_list.append(delta_bps)
                 x_bps_list.append(x * 1e4)
+                stats_ok_list.append(bool(sd > 0 and (sd == sd)))
+                ema_var_list.append(float(st.get("ema_var", np.nan)))
+                count_list.append(float(st.get("count", n)))
+                updated_ms_list.append(float(st.get("updated_ms", np.nan)))                
             else:
                 z_list.append(np.nan)
                 std_list.append(np.nan)
                 n_list.append(0)
                 mu_list.append(np.nan)
+                mu_bps_list.append(np.nan)
                 res_bps_list.append(np.nan)
                 x_bps_list.append(np.nan)
+                stats_ok_list.append(False)
+                ema_var_list.append(np.nan)
+                count_list.append(np.nan)
+                updated_ms_list.append(np.nan)
 
         cands["z"] = z_list
         cands["std"] = std_list
         cands["n"] = n_list
         cands["spread_mu"] = mu_list
+        cands["spread_mu_bps"] = mu_bps_list
         cands["spread_res_bps"] = res_bps_list
+        cands["spread_delta_bps"] = res_bps_list
         cands["log_spread_bps"] = x_bps_list
+        cands["stats_ok"] = stats_ok_list
+        cands["ema_var"] = ema_var_list
+        cands["count"] = count_list
+        cands["updated_ms"] = updated_ms_list        
     else:
         cands["z"] = np.nan
         cands["std"] = np.nan
         cands["n"] = 0
         cands["spread_mu"] = np.nan
+        cands["spread_mu_bps"] = np.nan
         cands["spread_res_bps"] = np.nan
+        cands["spread_delta_bps"] = np.nan
         cands["log_spread_bps"] = np.nan
+        cands["stats_ok"] = False
+        cands["ema_var"] = np.nan
+        cands["count"] = np.nan
+        cands["updated_ms"] = np.nan
 
     # ---------- 5) правильный выбор best (как в positions_once) ----------
     entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
