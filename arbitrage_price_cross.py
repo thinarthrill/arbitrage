@@ -35,6 +35,91 @@ def getenv_list(k: str, default_list: List[str]) -> List[str]:
     return [x.strip() for x in v.split(",") if x.strip()]
 
 ENTRY_SPREAD_BPS = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+
+# --- Drive backend bootstrap (Render-friendly) ---
+def _ensure_google_creds_from_b64() -> None:
+    """If GDRIVE_SA_JSON_B64 is provided, materialize it as a JSON file and point
+    GOOGLE_APPLICATION_CREDENTIALS to it (unless already pointing to an existing file)."""
+    b64 = (os.getenv("GDRIVE_SA_JSON_B64") or "").strip()
+    if not b64:
+        return
+    creds_path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if creds_path and os.path.exists(creds_path):
+        return
+    try:
+        raw = base64.b64decode(b64)
+        tmp_path = "/tmp/gdrive_sa.json"
+        with open(tmp_path, "wb") as f:
+            f.write(raw)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
+    except Exception as e:
+        logging.exception("Failed to materialize GDRIVE_SA_JSON_B64 into credentials file: %s", e)
+
+_ensure_google_creds_from_b64()
+
+def _is_gdrive(path: str) -> bool:
+    return isinstance(path, str) and path.startswith("gdrive://")
+
+def _parse_gdrive(path: str) -> tuple[str, str]:
+    """Return (folder_id, filename) for gdrive://FOLDER_ID/filename.csv"""
+    p = path[len("gdrive://"):]
+    p = p.lstrip("/")
+    parts = p.split("/", 1)
+    folder_id = parts[0].strip()
+    rel = parts[1].strip() if len(parts) > 1 else ""
+    name = os.path.basename(rel) if rel else ""
+    return folder_id, name
+
+_drive_service = None
+def _drive_service_client():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not creds_path or not os.path.exists(creds_path):
+        raise RuntimeError("Drive backend enabled but GOOGLE_APPLICATION_CREDENTIALS file not found. "
+                           "Provide GDRIVE_SA_JSON_B64 or mount the JSON file.")
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+def _drive_find_file_id(folder_id: str, name: str) -> str | None:
+    svc = _drive_service_client()
+    q = f"'{folder_id}' in parents and name='{name}' and trashed=false"
+    r = svc.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = r.get("files", [])
+    return files[0]["id"] if files else None
+
+def _drive_download_bytes(folder_id: str, name: str) -> bytes:
+    from googleapiclient.http import MediaIoBaseDownload
+    import io
+    svc = _drive_service_client()
+    file_id = _drive_find_file_id(folder_id, name)
+    if not file_id:
+        raise FileNotFoundError(f"Drive file not found in folder {folder_id}: {name}")
+    request = svc.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    return fh.getvalue()
+
+def _drive_upload_bytes(folder_id: str, name: str, data: bytes, mime: str = "text/csv") -> str:
+    from googleapiclient.http import MediaInMemoryUpload
+    svc = _drive_service_client()
+    file_id = _drive_find_file_id(folder_id, name)
+    media = MediaInMemoryUpload(data, mimetype=mime, resumable=False)
+    if file_id:
+        svc.files().update(fileId=file_id, media_body=media).execute()
+        return file_id
+    body = {"name": name, "parents": [folder_id]}
+    created = svc.files().create(body=body, media_body=media, fields="id").execute()
+    return created["id"]
+
 # --- Structured event logs (JSONL) for post-trade analysis ---
 # Stored in the same GCS folder as CARD_LOG_JSONL_PATH / TG_LOG_JSONL_PATH (tg_cards.jsonl)
 def _gcs_dir_from_path(gs_path: str) -> str:
@@ -2161,7 +2246,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.73</b>")
+    lines.append(f"\n<b> ver: 2.74</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2443,32 +2528,34 @@ def is_gdrive(path: Optional[str]) -> bool:
 def is_remote(path: Optional[str]) -> bool:
     return is_gs(path) or is_gdrive(path)
 
-def bucketize_path(path: Optional[str]) -> Optional[str]:
-    """Normalize storage path.
+def bucketize_path(path: str) -> str:
+    """Normalize relative paths to the configured storage backend.
 
-    Supported:
-      - gs://bucket/obj (GCS)
-      - gdrive://<folder_id>/path/file (Google Drive)
-      - local path
-
-    If user provides a relative path and DRIVE_FOLDER_ID is set, we default to Drive.
-    Else, if GCS_BUCKET/BACKET is set, we default to GCS.
+    Priority:
+      1) If already gs:// or gdrive:// or absolute => return as-is
+      2) If STORAGE_BACKEND is drive/gdrive (or DRIVE_FOLDER_ID/GDRIVE_ROOT_ID is set) => gdrive://<FOLDER>/<path>
+      3) Else if BUCKET/GCS_BUCKET is set => gs://<BUCKET>/<path>
+      4) Else => local relative path
     """
-    if not path or str(path).strip() == "":
+    if not path:
         return path
     p = str(path).strip()
-    if is_gs(p) or is_gdrive(p) or os.path.isabs(p):
+    if not p:
+        return p
+    if p.startswith("gs://") or p.startswith("gdrive://") or os.path.isabs(p):
         return p
 
-    drive_folder = getenv_str("DRIVE_FOLDER_ID", "").strip()
-    if drive_folder:
-        norm = p.lstrip("/").replace("\\", "/")
-        return f"gdrive://{drive_folder}/{norm}"
+    storage_backend = (os.getenv("STORAGE_BACKEND") or "").strip().lower()
+    drive_folder = (os.getenv("DRIVE_FOLDER_ID") or os.getenv("GDRIVE_ROOT_ID") or os.getenv("GDRIVE_FOLDER_ID") or "").strip()
+    bucket = (os.getenv("GCS_BUCKET") or os.getenv("BUCKET") or os.getenv("GCS_BUCKET_NAME") or "").strip()
 
-    backet = getenv_str("GCS_BUCKET", "").strip() or getenv_str("BACKET", "").strip()
-    if backet:
-        norm = p.lstrip("/").replace("\\", "/")
-        return f"gs://{backet}/{norm}"
+    if storage_backend in ("drive", "gdrive") or drive_folder:
+        if not drive_folder:
+            logging.error("STORAGE_BACKEND=drive but DRIVE_FOLDER_ID/GDRIVE_ROOT_ID is not set; using local path: %s", p)
+            return p
+        return f"gdrive://{drive_folder}/{p.lstrip('/')}"
+    if bucket:
+        return f"gs://{bucket}/{p.lstrip('/')}"
     return p
 
 # ----------------- Simple open-lock (pair-lock) -----------------
@@ -2699,6 +2786,10 @@ def gcs_write_csv(gs_path: str, df: pd.DataFrame):
 def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
     if not path or path.strip()=="": return
     p = bucketize_path(path)
+    if _is_gdrive(p):
+        folder_id, name = _parse_gdrive(p)
+        data = _drive_download_bytes(folder_id, name)
+        return pd.read_csv(io.BytesIO(data), *args, **kwargs)
     if is_gs(p):
         gcs_write_csv(p, df)
         return
