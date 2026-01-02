@@ -94,7 +94,7 @@ def _drive_find_file_id(folder_id: str, name: str) -> str | None:
     return files[0]["id"] if files else None
 
 def _drive_download_bytes(folder_id: str, name: str) -> bytes:
-    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.http import MediaIoBaseDownload  # type: ignore[import-not-found]
     import io
     svc = _drive_service_client()
     file_id = _drive_find_file_id(folder_id, name)
@@ -109,7 +109,7 @@ def _drive_download_bytes(folder_id: str, name: str) -> bytes:
     return fh.getvalue()
 
 def _drive_upload_bytes(folder_id: str, name: str, data: bytes, mime: str = "text/csv") -> str:
-    from googleapiclient.http import MediaInMemoryUpload
+    from googleapiclient.http import MediaInMemoryUpload  # type: ignore[import-not-found]
     svc = _drive_service_client()
     file_id = _drive_find_file_id(folder_id, name)
     media = MediaInMemoryUpload(data, mimetype=mime, resumable=False)
@@ -2246,7 +2246,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.75</b>")
+    lines.append(f"\n<b> ver: 2.76</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2572,7 +2572,7 @@ except Exception:
 
 DRIVE_AVAILABLE = True
 try:
-    from googleapiclient.discovery import build  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore[import-not-found]
     from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload  # type: ignore
     from google.oauth2 import service_account  # type: ignore
 except Exception:
@@ -2795,8 +2795,11 @@ def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
     p = bucketize_path(path)
     if _is_gdrive(p):
         folder_id, name = _parse_gdrive(p)
-        data = _drive_download_bytes(folder_id, name)
-        return pd.read_csv(io.BytesIO(data), *args, **kwargs)
+        # write df -> gdrive file (CSV)
+        from io import StringIO
+        buf = StringIO(); df.to_csv(buf, index=False)
+        _drive_upload_bytes(folder_id, name, buf.getvalue().encode("utf-8"), mime="text/csv")
+        return
     if is_gs(p):
         gcs_write_csv(p, df)
         return
