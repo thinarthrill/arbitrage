@@ -1645,6 +1645,88 @@ def to_float(x) -> Optional[float]:
         if x is None: return None
         return float(x)
     except: return None
+def _add_reason(reasons: List[str], r: str) -> None:
+    """Append skip reason once (keeps logs clean)."""
+    try:
+        if r and (r not in reasons):
+            reasons.append(r)
+    except Exception:
+        pass
+
+def _compute_candidate_score(best: Dict[str, Any],
+                             net_adj: float,
+                             z: float,
+                             std: float,
+                             entry_mode: str,
+                             per_leg_notional_usd: float) -> Dict[str, Any]:
+    """
+    Единственный "истинный" расчёт candidate_score:
+      money × z_mult × liquidity × stability(std) × sample(count)
+    + возвращает liq_ok/stats_quality_ok для финального gate.
+    """
+    entry_mode_loc = (entry_mode or "price").lower()
+
+    # z multiplier (soft; not a hard gate)
+    Z_REF = float(getenv_float("Z_REF", 2.5))
+    MAX_Z_MULT = float(getenv_float("MAX_Z_MULT", 1.5))
+    if entry_mode_loc == "zscore":
+        z_abs = abs(float(z)) if (z == z) else 0.0
+        z_mult = min(z_abs / max(Z_REF, 1e-9), MAX_Z_MULT)
+    else:
+        z_mult = 1.0
+
+    # liquidity + stats quality gates (no new env vars)
+    MIN_TOPBOOK_FACTOR = float(getenv_float("MIN_TOPBOOK_FACTOR", 1.0))
+    MIN_SPREAD_COUNT = float(getenv_float("MIN_SPREAD_COUNT", 30))
+    SPREAD_STALE_SEC = float(getenv_float("SPREAD_STALE_SEC", 600))
+    now_ms = int(time.time() * 1000)
+
+    min_topbook_usd = to_float(best.get("min_topbook_usd"))
+    liq_ok = True
+    liq_mult = 1.0
+    if float(per_leg_notional_usd or 0.0) > 0 and min_topbook_usd is not None and (min_topbook_usd == min_topbook_usd):
+        liq_ok = bool(min_topbook_usd >= (float(per_leg_notional_usd) * MIN_TOPBOOK_FACTOR))
+        # bounded multiplier; more topbook => more reliable fills
+        try:
+            liq_ratio = max(float(min_topbook_usd) / max(float(per_leg_notional_usd), 1e-9), 0.0)
+            liq_mult = float(max(0.7, min(1.8, 1.0 + 0.15 * math.log1p(liq_ratio))))
+        except Exception:
+            liq_mult = 1.0
+    else:
+        # If can't measure liquidity: reject only in zscore-mode (prevents illiquid ghosts)
+        liq_ok = (entry_mode_loc != "zscore")
+
+    count = to_float(best.get("count"))
+    updated_ms = to_float(best.get("updated_ms"))
+    stats_ok = bool(best.get("stats_ok")) if (best.get("stats_ok") is not None) else False
+    stats_fresh_ok = bool(updated_ms is not None and updated_ms == updated_ms and (now_ms - float(updated_ms)) <= (SPREAD_STALE_SEC * 1000.0))
+    stats_count_ok = bool(count is not None and count == count and float(count) >= float(MIN_SPREAD_COUNT))
+    stats_quality_ok = bool(stats_ok and stats_fresh_ok and stats_count_ok)
+
+    # stability multipliers
+    std_bps = float(std) * 1e4 if (std == std) else 0.0
+    std_mult = float(max(0.55, min(1.0, 1.0 / (1.0 + (std_bps / 120.0)))))
+
+    count_mult = 1.0
+    try:
+        if count is not None and count == count and float(count) > 0:
+            count_mult = float(max(1.0, min(1.5, 1.0 + 0.10 * math.log1p(float(count) / max(float(MIN_SPREAD_COUNT), 1.0)))))
+    except Exception:
+        count_mult = 1.0
+
+    base = (float(net_adj) if (net_adj == net_adj) else 0.0)
+    candidate_score = float(base) * float(z_mult) * float(liq_mult) * float(std_mult) * float(count_mult)
+
+    return {
+        "z_mult": z_mult,
+        "liq_ok": bool(liq_ok),
+        "stats_quality_ok": bool(stats_quality_ok),
+        "liq_mult": liq_mult,
+        "std_mult": std_mult,
+        "count_mult": count_mult,
+        "std_bps": std_bps,
+        "candidate_score": candidate_score,
+    }
 
 def _json_sanitize(v: Any) -> Any:
     """Convert NaN/inf/numpy types to JSON-safe primitives.
@@ -2251,7 +2333,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.85</b>")
+    lines.append(f"\n<b> ver: 2.87-clean-score</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -3834,6 +3916,18 @@ def get_pair_reco(stats: pd.DataFrame, symbol: str, ex_low: str, ex_high: str) -
         entry_bps_sugg = entry_bps_d
 
     return float(z_in_sugg), float(entry_bps_sugg)
+
+# helper: keep skip reasons unique (clean logs)
+def _uniq_list(xs):
+    try:
+        out = []
+        for x in xs or []:
+            if x and x not in out:
+                out.append(x)
+        return out
+    except Exception:
+        return list(xs) if xs is not None else []
+
 def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     """
     Единственный источник открытия позиции.
@@ -4107,39 +4201,49 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     best["min_spread_lifetime_ms_used"] = int(MIN_SPREAD_LIFETIME_MS)
     best["min_spread_ticks_used"] = int(MIN_SPREAD_TICKS)
 
-    # --- NEW: composite candidate score (money × quality) ---
-    Z_REF = float(getenv_float("Z_REF", 2.5))
-    MAX_Z_MULT = float(getenv_float("MAX_Z_MULT", 1.5))
-    if ENTRY_MODE == "zscore":
-        z_abs = abs(float(z)) if (z == z) else 0.0
-        z_mult = min(z_abs / max(Z_REF, 1e-9), MAX_Z_MULT)
-    else:
-        # In price-mode, z is not a hard factor; keep multiplier neutral
-        z_mult = 1.0
-    candidate_score = (float(net_adj) if (net_adj == net_adj) else 0.0) * float(z_mult)
-    best["z_mult"] = round(float(z_mult), 4)
+    score_pack = _compute_candidate_score(
+        best=best,
+        net_adj=net_adj,
+        z=z,
+        std=std,
+        entry_mode=ENTRY_MODE,
+        per_leg_notional_usd=float(per_leg_notional_usd or 0.0),
+    )
+    liq_ok = score_pack["liq_ok"]
+    stats_quality_ok = score_pack["stats_quality_ok"]
+    candidate_score = score_pack["candidate_score"]
+    best["z_mult"] = round(float(score_pack["z_mult"]), 4)
     best["candidate_score"] = round(float(candidate_score), 6)
+    best["liq_ok"] = bool(liq_ok)
+    best["stats_quality_ok"] = bool(stats_quality_ok)
+    best["liq_mult"] = round(float(score_pack["liq_mult"]), 4)
+    best["std_mult"] = round(float(score_pack["std_mult"]), 4)
+    best["count_mult"] = round(float(score_pack["count_mult"]), 4)
 
     FINAL_SCORE_MIN = float(getenv_float("FINAL_SCORE_MIN", 1.5))
     best["final_score_min_used"] = float(FINAL_SCORE_MIN)
 
     # --- NEW: final open gate (spread-hunter oriented)
     # z_ok is NOT a hard gate anymore. z contributes via candidate_score.
-    open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
-
+    open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and bool(liq_ok) and bool(stats_quality_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
+ 
+    if not liq_ok:
+        _add_reason(skip_reasons, "low_topbook_liquidity")
+    if (not stats_quality_ok) and (str(ENTRY_MODE).lower() == "zscore"):
+        _add_reason(skip_reasons, "stats_stale_or_low_count")
     if not spread_alive_ok:
-        skip_reasons.append("spread_dead_fast")
+        _add_reason(skip_reasons, "spread_dead_fast")
     if float(candidate_score) < float(FINAL_SCORE_MIN):
-        skip_reasons.append("low_candidate_score")
-    if not std_ok and ENTRY_MODE == "zscore":
-        skip_reasons.append("std_too_low")
+        _add_reason(skip_reasons, "low_candidate_score")
+    if (not std_ok) and (str(ENTRY_MODE).lower() == "zscore"):
+        _add_reason(skip_reasons, "std_too_low")
     if not spread_ok:
-        skip_reasons.append("spread_too_low")
+        _add_reason(skip_reasons, "spread_too_low")
     if not eco_ok:
-        skip_reasons.append("eco_too_low")
+        _add_reason(skip_reasons, "eco_too_low")
 
     best["open_ok"] = bool(open_ok)
-    best["open_skip_reasons"] = list(skip_reasons)
+    best["open_skip_reasons"] = _uniq_list(skip_reasons)
 
     if not open_ok:
         return _reject("precheck failed: " + ", ".join(skip_reasons))
@@ -4782,7 +4886,7 @@ def scan_all_with_instant_alerts(
                     maybe_send_telegram("🚨 <b>INSTANT ALERT</b>\n" + card)
                     _LAST_ALERT_TS[best["symbol"]] = now
 
-    cols = ["exchange","symbol","bid","ask","mid","last","mark","ts"]
+    cols = ["exchange","symbol","bid","ask","bid_sz","ask_sz","top_bid_usd","top_ask_usd","topbook_usd","qv_usd","mid","last","mark","ts"]
     return pd.DataFrame(rows_all) if rows_all else pd.DataFrame(columns=cols)
 
 def scan_spreads_once(
@@ -4843,22 +4947,56 @@ def scan_spreads_once(
             last = to_float(q.get("last"))
             mark = to_float(q.get("mark"))
 
+            # --- NEW: best-level sizes (if exchange bulk provides them) ---
+            bid_sz = to_float(
+                q.get("bidSize") or q.get("bidSz") or q.get("bidQty") or q.get("bSz") or q.get("bestBidSz")
+                or q.get("bestBidSize") or q.get("bestBidQty") or q.get("bidSize1")
+            )
+            ask_sz = to_float(
+                q.get("askSize") or q.get("askSz") or q.get("askQty") or q.get("aSz") or q.get("bestAskSz")
+                or q.get("bestAskSize") or q.get("bestAskQty") or q.get("askSize1")
+            )
+
+            # --- NEW: 24h quote volume if available (USDT notionals) ---
+            qv_usd = to_float(
+                q.get("quoteVolume") or q.get("quoteVol") or q.get("turnover24h") or q.get("quoteTurnover")
+                or q.get("volCcy24h") or q.get("volCcy") or q.get("qv")
+            )
             mid = None
             if bid is not None and ask is not None and bid > 0 and ask > 0:
                 mid = (bid + ask) / 2.0
+
+            top_bid_usd = (float(bid) * float(bid_sz)) if (bid and bid_sz and bid > 0 and bid_sz > 0) else np.nan
+            top_ask_usd = (float(ask) * float(ask_sz)) if (ask and ask_sz and ask > 0 and ask_sz > 0) else np.nan
+            topbook_usd = np.nan
+            try:
+                if top_bid_usd == top_bid_usd and top_ask_usd == top_ask_usd:
+                    topbook_usd = min(top_bid_usd, top_ask_usd)
+                elif top_bid_usd == top_bid_usd:
+                    topbook_usd = top_bid_usd
+                elif top_ask_usd == top_ask_usd:
+                    topbook_usd = top_ask_usd
+            except Exception:
+                topbook_usd = np.nan
 
             rows_all.append({
                 "exchange": ex_l,
                 "symbol": sym_u,
                 "bid": bid,
                 "ask": ask,
+                "bid_sz": bid_sz,
+                "ask_sz": ask_sz,
+                "top_bid_usd": top_bid_usd,
+                "top_ask_usd": top_ask_usd,
+                "topbook_usd": topbook_usd,
+                "qv_usd": qv_usd,
                 "mid": mid,
                 "last": last,
                 "mark": mark,
                 "ts": q.get("ts", now),
             })
 
-    cols = ["exchange", "symbol", "bid", "ask", "mid", "last", "mark", "ts"]
+    cols = ["exchange","symbol","bid","ask","bid_sz","ask_sz","top_bid_usd","top_ask_usd","topbook_usd","qv_usd","mid","last","mark","ts"]
     quotes_df = pd.DataFrame(rows_all, columns=cols)
     if quotes_df.empty:
         return None, quotes_df
@@ -4993,6 +5131,38 @@ def scan_spreads_once(
         # keep only rows with usable stats (otherwise z is meaningless)
         cands = cands[cands["std"].notna() & (cands["std"] >= std_min_for_open)].copy()
         if not cands.empty:
+            # --- NEW: liquidity + stats quality gates (trade stable pairs where liquidity sits) ---
+            # No new env vars:
+            #   - MIN_TOPBOOK_FACTOR already exists in your env
+            #   - MIN_SPREAD_COUNT already exists in your env
+            #   - SPREAD_STALE_SEC already exists in your env
+            MIN_TOPBOOK_FACTOR = float(getenv_float("MIN_TOPBOOK_FACTOR", 1.0))
+            MIN_SPREAD_COUNT = float(getenv_float("MIN_SPREAD_COUNT", 30))
+            SPREAD_STALE_SEC = float(getenv_float("SPREAD_STALE_SEC", 600))
+            now_ms = int(time.time() * 1000)
+
+            # ensure columns exist
+            if "min_topbook_usd" not in cands.columns:
+                cands["min_topbook_usd"] = np.nan
+            cands["min_topbook_usd"] = pd.to_numeric(cands.get("min_topbook_usd"), errors="coerce")
+
+            # top-of-book must cover our intended per-leg notional (or a fraction via MIN_TOPBOOK_FACTOR)
+            liq_threshold = float(per_leg_notional_usd) * float(MIN_TOPBOOK_FACTOR)
+            cands["liq_ok"] = cands["min_topbook_usd"].notna() & (cands["min_topbook_usd"] >= liq_threshold)
+
+            # stats must be usable + sufficiently sampled + fresh
+            cands["count"] = pd.to_numeric(cands.get("count"), errors="coerce")
+            cands["updated_ms"] = pd.to_numeric(cands.get("updated_ms"), errors="coerce")
+            cands["stats_fresh_ok"] = cands["updated_ms"].notna() & ((now_ms - cands["updated_ms"]) <= (SPREAD_STALE_SEC * 1000.0))
+            cands["stats_count_ok"] = cands["count"].notna() & (cands["count"] >= float(MIN_SPREAD_COUNT))
+            cands["stats_quality_ok"] = cands.get("stats_ok", False).astype(bool) & cands["stats_fresh_ok"] & cands["stats_count_ok"]
+
+            # Hard-filter: stop picking "width for width" on illiquid / unsampled / stale pairs
+            # (this is exactly where phantom-wide spreads live)
+            cands = cands[cands["liq_ok"] & cands["stats_quality_ok"]].copy()
+            if cands.empty:
+                return None, quotes_df
+
             cands["__rating_z__"] = candidate_rating_z(cands)
             # Rank by expected net AFTER slippage, weighted by |z| and residual bps (no new env vars).
             net_base = cands.get("net_usd_adj_total", cands["net_usd_adj"]).fillna(0.0)
@@ -5010,7 +5180,28 @@ def scan_spreads_once(
             cands["__z_mult__"] = z_mult
             cands["__res_mult__"] = res_mult
 
-            cands["__score__"] = (net_base * z_mult * res_mult) + 0.05 * cands["__rating_z__"].fillna(0.0)
+            # --- NEW: stability & liquidity multipliers (bounded) ---
+            # liquidity: more topbook -> more reliable fills, less slippage
+            liq_ratio = (cands["min_topbook_usd"] / float(per_leg_notional_usd)).clip(lower=0.0)
+            liq_mult = (1.0 + 0.15 * np.log1p(liq_ratio)).clip(lower=0.7, upper=1.8)
+
+            # stability: prefer better-sampled, lower-variance spreads (std in bps is more intuitive)
+            std_bps = (pd.to_numeric(cands.get("std"), errors="coerce").fillna(0.0) * 1e4).clip(lower=0.0)
+            # std_mult decreases as std grows; bounded so it doesn't kill everything
+            std_mult = (1.0 / (1.0 + (std_bps / 120.0))).clip(lower=0.55, upper=1.0)
+
+            # count_mult grows with count above MIN_SPREAD_COUNT; bounded
+            cnt = pd.to_numeric(cands.get("count"), errors="coerce").fillna(0.0)
+            count_mult = (1.0 + 0.10 * np.log1p((cnt / max(float(MIN_SPREAD_COUNT), 1.0)))).clip(lower=1.0, upper=1.5)
+
+            cands["__liq_ratio__"] = liq_ratio
+            cands["__liq_mult__"] = liq_mult
+            cands["__std_bps__"] = std_bps
+            cands["__std_mult__"] = std_mult
+            cands["__count_mult__"] = count_mult
+
+            cands["__score__"] = (net_base * z_mult * res_mult * liq_mult * std_mult * count_mult) + 0.05 * cands["__rating_z__"].fillna(0.0)
+
 
             # anti-noise tie-breaker:
             # when __score__/net/z are close, prefer smaller gap_bps (less real slippage risk)
@@ -5953,6 +6144,23 @@ def build_price_arbitrage(
     use = _coalesce_cols(use, ["ask"], ["ask", "bestAsk", "askPrice", "a", "sell", "offer", "ask_px"])
     use = _coalesce_cols(use, ["bid"], ["bid", "bestBid", "bidPrice", "b", "buy", "bid_px"])
 
+    # --- NEW: normalize best-level sizes if present ---
+    # (we don't hard-require them; absence -> NaN -> liquidity filters just won't pass)
+    use = _coalesce_cols(use, ["bid_sz"], ["bid_sz","bidSize","bidSz","bidQty","bSz","bestBidSz","bestBidSize","bestBidQty","bidSize1"])
+    use = _coalesce_cols(use, ["ask_sz"], ["ask_sz","askSize","askSz","askQty","aSz","bestAskSz","bestAskSize","bestAskQty","askSize1"])
+    for col in ("bid_sz","ask_sz"):
+        if col not in use.columns:
+            use[col] = np.nan
+
+    # --- NEW: derive top-of-book USD liquidity per row (best bid/ask) ---
+    try:
+        use["top_bid_usd"] = pd.to_numeric(use["bid"], errors="coerce") * pd.to_numeric(use["bid_sz"], errors="coerce")
+        use["top_ask_usd"] = pd.to_numeric(use["ask"], errors="coerce") * pd.to_numeric(use["ask_sz"], errors="coerce")
+        use["topbook_usd"] = np.nanmin(np.vstack([use["top_bid_usd"].to_numpy(), use["top_ask_usd"].to_numpy()]), axis=0)
+    except Exception:
+        # keep best-effort; missing cols are OK
+        pass
+
     # 2) если после коалесса всё равно нет — создаём
     for col in ("bid", "ask"):
         if col not in use.columns:
@@ -6020,6 +6228,9 @@ def build_price_arbitrage(
             px_low, ex_low   = float(cheapest["ask"]), str(cheapest["exchange"])
             px_high, ex_high = float(priciest["bid"]), str(priciest["exchange"])
 
+            # --- NEW: liquidity on the actual sides we hit (buy=ask, sell=bid) ---
+            liq_buy_usd  = to_float(cheapest.get("top_ask_usd"))
+            liq_sell_usd = to_float(priciest.get("top_bid_usd"))
         else:
             if len(sub) < 2:
                 continue
@@ -6027,6 +6238,8 @@ def build_price_arbitrage(
             priciest = sub.loc[sub["px"].idxmax()]
             px_low, ex_low   = float(cheapest["px"]), str(cheapest["exchange"])
             px_high, ex_high = float(priciest["px"]), str(priciest["exchange"])
+            liq_buy_usd  = to_float(cheapest.get("topbook_usd"))
+            liq_sell_usd = to_float(priciest.get("topbook_usd"))
 
         spread = px_high - px_low
         spread_pct = (spread / px_low) * 100.0 if px_low > 0 else 0.0
@@ -6037,6 +6250,14 @@ def build_price_arbitrage(
         fees_rt = 4.0 * taker_fee * per_leg_notional_usd
         net = gross - fees_rt
 
+        # --- NEW: min best-level liquidity across legs (USD) ---
+        min_topbook_usd = np.nan
+        try:
+            if liq_buy_usd is not None and liq_buy_usd == liq_buy_usd and liq_buy_usd > 0 and \
+               liq_sell_usd is not None and liq_sell_usd == liq_sell_usd and liq_sell_usd > 0:
+                min_topbook_usd = float(min(liq_buy_usd, liq_sell_usd))
+        except Exception:
+            min_topbook_usd = np.nan
         out_rows.append({
             "symbol": sym,
             "long_ex": ex_low,
@@ -6050,6 +6271,9 @@ def build_price_arbitrage(
             "gross_usd": gross,
             "fees_roundtrip_usd": fees_rt,
             "net_usd": net,
+            "liq_buy_usd": liq_buy_usd,
+            "liq_sell_usd": liq_sell_usd,
+            "min_topbook_usd": min_topbook_usd,
         })
 
     out = pd.DataFrame(out_rows)
@@ -8431,15 +8655,34 @@ def positions_once(
         spread_lifetime_ms, spread_ticks_alive = track_spread_lifetime_ms(_k)
         spread_alive_ok = (spread_lifetime_ms >= MIN_SPREAD_LIFETIME_MS) and (spread_ticks_alive >= MIN_SPREAD_TICKS)
 
-        # composite score (money × quality)
-        Z_REF = float(getenv_float("Z_REF", 2.5))
-        MAX_Z_MULT = float(getenv_float("MAX_Z_MULT", 1.5))
-        z_mult = min((abs(z) / max(Z_REF, 1e-9)) if (z == z) else 0.0, MAX_Z_MULT) if entry_mode_loc == "zscore" else 1.0
-        candidate_score = float(net_adj) * float(z_mult)
+        # unified candidate_score (same as try_instant_open)
+        try:
+            per_leg_notional_usd_loc = float(best.get("per_leg_notional_usd") or (float(best.get("qty_est") or 0.0) * float(best.get("px_low") or 0.0)) or 0.0)
+        except Exception:
+            per_leg_notional_usd_loc = 0.0
+        score_pack = _compute_candidate_score(
+            best=best,
+            net_adj=net_adj,
+            z=z,
+            std=std,
+            entry_mode=entry_mode_loc,
+            per_leg_notional_usd=per_leg_notional_usd_loc,
+        )
+        candidate_score = float(score_pack["candidate_score"])
+        liq_ok = bool(score_pack["liq_ok"])
+        stats_quality_ok = bool(score_pack["stats_quality_ok"])
+        best["z_mult"] = round(float(score_pack["z_mult"]), 4)
+        best["liq_ok"] = bool(liq_ok)
+        best["stats_quality_ok"] = bool(stats_quality_ok)
+        best["liq_mult"] = round(float(score_pack["liq_mult"]), 4)
+        best["std_mult"] = round(float(score_pack["std_mult"]), 4)
+        best["count_mult"] = round(float(score_pack["count_mult"]), 4)
+        best["candidate_score"] = round(float(candidate_score), 6)
         FINAL_SCORE_MIN = float(getenv_float("FINAL_SCORE_MIN", 1.5))
+        best["final_score_min_used"] = float(FINAL_SCORE_MIN)
 
         # z_ok is NOT a hard gate anymore; it affects candidate_score only.
-        open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
+        open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and bool(liq_ok) and bool(stats_quality_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
 
         if open_ok:
             _paper = bool(getenv_bool("PAPER", True)) if paper is None else bool(paper)
