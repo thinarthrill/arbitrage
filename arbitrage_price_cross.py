@@ -2400,7 +2400,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.88</b>")
+    lines.append(f"\n<b> ver: 2.89</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4893,11 +4893,14 @@ def scan_all_with_instant_alerts(
             if not (zf == zf) or not (sf == sf) or sf <= 0:
                 best["data_quality"] = "bad"
                 best["data_quality_reason"] = "z_or_std_missing"
+                # do not crash / do not open; return control to caller
+                best["skip_open"] = True
                 best["reject_reason"] = "data_quality_bad: z/std missing (ENTRY_MODE=zscore)"
                 return None
         except Exception:
             best["data_quality"] = "bad"
             best["data_quality_reason"] = "z_or_std_missing"
+            best["skip_open"] = True
             best["reject_reason"] = "data_quality_bad: z/std missing (ENTRY_MODE=zscore)"
             return None
 
@@ -6285,7 +6288,10 @@ def build_price_arbitrage(
             use["ask"] = pd.to_numeric(use["px"], errors="coerce")
         if use["bid"].isna().all() and "px" in use.columns:
             use["bid"] = pd.to_numeric(use["px"], errors="coerce")
-
+    else:
+        # Extra guard: in book mode we never allow px/mid to "repair" bid/ask.
+        # Keep as-is; strict filters above will drop such rows.
+        pass
     # BOOK MODE FILTERS (execution-safe):
     # if no real bid/ask -> drop; if no sizes -> drop (or becomes non-executable watchlist)
     if str(ps).lower() == "book":
@@ -6293,9 +6299,12 @@ def build_price_arbitrage(
             use = use.dropna(subset=["bid","ask","bid_sz","ask_sz"])
         except Exception:
             pass
+        # If after strict book filters there is nothing left, return silently.
+        if use is None or use.empty:
+            return pd.DataFrame()
 
-    # 4) если bid/ask всё ещё пустые — логируем один раз на цикл
-    if use["ask"].isna().all() or use["bid"].isna().all():
+    # 4) если bid/ask всё ещё пустые — логируем (только если DF не пустой)
+    if (use is not None) and (not use.empty) and (use["ask"].isna().all() or use["bid"].isna().all()):
         logging.warning(
             "build_price_arbitrage(book): bid/ask still empty after fallbacks. cols=%s",
             list(use.columns)
@@ -7722,9 +7731,28 @@ def positions_once(
         else:
             _su_used = cands.get("spread_bps")
         _su_used = pd.to_numeric(_su_used, errors="coerce").fillna(0.0)
-        _fees_rt = pd.to_numeric(cands.get("fees_roundtrip_usd"), errors="coerce")
-        if _fees_rt is None or _fees_rt.isna().all():
+        _fees_src = cands.get("fees_roundtrip_usd")
+        # robust: sometimes _fees_src becomes scalar (numpy.float64) -> no .isna()
+        if _fees_src is None:
+            _fees_rt = None
+        else:
+            try:
+                _fees_rt = pd.to_numeric(_fees_src, errors="coerce")
+            except Exception:
+                _fees_rt = None
+
+        _fees_missing = False
+        if _fees_rt is None:
+            _fees_missing = True
+        else:
+            try:
+                _fees_missing = bool(pd.isna(_fees_rt).all()) if hasattr(_fees_rt, "__len__") else bool(pd.isna(_fees_rt))
+            except Exception:
+                _fees_missing = True
+
+        if _fees_missing:
             _fees_rt = (4.0 * float(getenv_float("TAKER_FEE", 0.0005)) * float(per_leg_notional_usd))
+ 
         _slip_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
         _slip_usd = (4.0 * (_slip_bps / 1e4) * float(per_leg_notional_usd))
         cands["gross_usd_used"] = (_su_used / 1e4) * float(per_leg_notional_usd)
