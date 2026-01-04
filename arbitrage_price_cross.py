@@ -1741,27 +1741,16 @@ def _compute_candidate_score(best: Dict[str, Any],
     else:
         z_mult = 1.0
 
-    # liquidity + stats quality gates (no new env vars)
-    MIN_TOPBOOK_FACTOR = float(getenv_float("MIN_TOPBOOK_FACTOR", 1.0))
+    # stats quality gates (liquidity gate DISABLED)
     MIN_SPREAD_COUNT = float(getenv_float("MIN_SPREAD_COUNT", 30))
     SPREAD_STALE_SEC = float(getenv_float("SPREAD_STALE_SEC", 600))
     now_ms = int(time.time() * 1000)
 
-    min_topbook_usd = to_float(best.get("min_topbook_usd"))
+    # Liquidity gate removed:
+    # - do NOT fail candidates if topbook sizes are missing
+    # - keep multipliers neutral
     liq_ok = True
     liq_mult = 1.0
-    if float(per_leg_notional_usd or 0.0) > 0 and min_topbook_usd is not None and (min_topbook_usd == min_topbook_usd):
-        liq_ok = bool(min_topbook_usd >= (float(per_leg_notional_usd) * MIN_TOPBOOK_FACTOR))
-        # bounded multiplier; more topbook => more reliable fills
-        try:
-            liq_ratio = max(float(min_topbook_usd) / max(float(per_leg_notional_usd), 1e-9), 0.0)
-            liq_mult = float(max(0.7, min(1.8, 1.0 + 0.15 * math.log1p(liq_ratio))))
-        except Exception:
-            liq_mult = 1.0
-    else:
-        # HARD: unknown/NaN topbook => liquidity gate MUST FAIL (no soft pass)
-        liq_ok = False
-        liq_mult = 0.0
 
     count = to_float(best.get("count"))
     updated_ms = to_float(best.get("updated_ms"))
@@ -2400,7 +2389,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.89</b>")
+    lines.append(f"\n<b> ver: 2.90-no-topbook</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -6134,9 +6123,6 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         row_low  = min(asks, key=lambda r: float(to_float(r.get("ask"))))
         row_high = max(bids, key=lambda r: float(to_float(r.get("bid"))))
 
-        MIN_TOPBOOK_FACTOR = float(getenv_float("MIN_TOPBOOK_FACTOR", 1.25))
-        need_usd = per_leg_notional_usd * MIN_TOPBOOK_FACTOR
-
         ask_px = float(to_float(row_low.get("ask")))
         bid_px = float(to_float(row_high.get("bid")))
 
@@ -6146,15 +6132,6 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         if min_price > 0.0 and (ask_px < min_price or bid_px < min_price):
            # цена монеты ниже допустимого порога — пару вообще не строим
             return None
-
-        ask_sz = float(to_float(row_low.get("ask_qty") or row_low.get("askSize") or 0.0))
-        bid_sz = float(to_float(row_high.get("bid_qty") or row_high.get("bidSize") or 0.0))
-
-        ask_notional = (ask_px * ask_sz) if (ask_px and ask_sz) else 0.0
-        bid_notional = (bid_px * bid_sz) if (bid_px and bid_sz) else 0.0
-
-        if ask_notional < need_usd or bid_notional < need_usd:
-            return None  # недостаточно ликвидности на лучших уровнях
 
         if row_low["exchange"] == row_high["exchange"]:
             # если совпали, альтернативы нет — возвращаем None, чтобы не строить фальшивую пару
@@ -6293,10 +6270,10 @@ def build_price_arbitrage(
         # Keep as-is; strict filters above will drop such rows.
         pass
     # BOOK MODE FILTERS (execution-safe):
-    # if no real bid/ask -> drop; if no sizes -> drop (or becomes non-executable watchlist)
+    # if no real bid/ask -> drop; sizes are OPTIONAL (we do not gate on liquidity anymore)
     if str(ps).lower() == "book":
         try:
-            use = use.dropna(subset=["bid","ask","bid_sz","ask_sz"])
+            use = use.dropna(subset=["bid","ask"])
         except Exception:
             pass
         # If after strict book filters there is nothing left, return silently.
