@@ -6115,12 +6115,57 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         return to_float(r.get("mid"))
 
     if price_source == "book":
+        # In book mode we want an executable cross-exchange pair.
+        # IMPORTANT: do NOT require top-of-book sizes (many venues don't provide them consistently).
         asks = [r for r in rows if to_float(r.get("ask")) is not None]
         bids = [r for r in rows if to_float(r.get("bid")) is not None]
-        if len(asks) < 1 or len(bids) < 1: return None
-        row_low  = min(asks, key=lambda r: float(to_float(r.get("ask"))))
-        row_high = max(bids, key=lambda r: float(to_float(r.get("bid"))))
+        if len(asks) < 1 or len(bids) < 1:
+            return None
 
+        # Pick best ask per exchange + best bid per exchange, then select the best cross-exchange spread.
+        best_ask: Dict[str, Dict[str, Any]] = {}
+        for r in asks:
+            ex = str(r.get("exchange"))
+            apx = to_float(r.get("ask"))
+            if apx is None:
+                continue
+            cur = best_ask.get(ex)
+            if cur is None or float(apx) < float(to_float(cur.get("ask"))):
+                best_ask[ex] = r
+
+        best_bid: Dict[str, Dict[str, Any]] = {}
+        for r in bids:
+            ex = str(r.get("exchange"))
+            bpx = to_float(r.get("bid"))
+            if bpx is None:
+                continue
+            cur = best_bid.get(ex)
+            if cur is None or float(bpx) > float(to_float(cur.get("bid"))):
+                best_bid[ex] = r
+
+        if not best_ask or not best_bid:
+            return None
+
+        row_low = None
+        row_high = None
+        best_spread = -1e30
+        for ex_low, ra in best_ask.items():
+            a = to_float(ra.get("ask"))
+            if a is None:
+                continue
+            for ex_high, rb in best_bid.items():
+                if ex_low == ex_high:
+                    continue
+                b = to_float(rb.get("bid"))
+                if b is None:
+                    continue
+                sp = float(b) - float(a)
+                if sp > best_spread:
+                    best_spread = sp
+                    row_low, row_high = ra, rb
+
+        if row_low is None or row_high is None:
+            return None
         ask_px = float(to_float(row_low.get("ask")))
         bid_px = float(to_float(row_high.get("bid")))
 
@@ -6128,12 +6173,8 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
         # Отсекаем ультрадешёвые тикеры, чтобы не получать десятки миллионов контрактов.
         min_price = float(getenv_float("MIN_PRICE", 0.0))
         if min_price > 0.0 and (ask_px < min_price or bid_px < min_price):
-           # цена монеты ниже допустимого порога — пару вообще не строим
             return None
 
-        if row_low["exchange"] == row_high["exchange"]:
-            # если совпали, альтернативы нет — возвращаем None, чтобы не строить фальшивую пару
-            return None
         sym = str(row_low["symbol"])
         px_low, ex_low   = float(row_low["ask"]),   str(row_low["exchange"])
         px_high, ex_high = float(row_high["bid"]),  str(row_high["exchange"])
@@ -6153,45 +6194,6 @@ def best_pair_for_symbol(rows: List[Dict[str, Any]], per_leg_notional_usd: float
             "fees_roundtrip_usd": fees_rt,
             "net_usd": net
         }
-    # Обычные режимы: одна метрика цены на обеих биржах
-    usable = []
-    for r in rows:
-        px = pick_px(r)
-        if px is not None:
-            usable.append({"exchange": r["exchange"], "symbol": r["symbol"], "px": float(px)})
-    if len(usable) < 2: return None
-    cheapest = min(usable, key=lambda x:x["px"])
-    priciest = max(usable, key=lambda x:x["px"])
-
-    px_low, px_high = float(cheapest["px"]), float(priciest["px"])
-
-    # --- Тот же фильтр MIN_PRICE для не-book режимов (mid/last/mark/bid/ask) ---
-    min_price = float(getenv_float("MIN_PRICE", 0.0))
-    if min_price > 0.0 and (px_low < min_price or px_high < min_price):
-        # слишком дешёвая монета — сразу выходим, она нам не нужна
-        return None
-
-    spread = px_high - px_low
-    spread_pct = (spread/px_low)*100.0 if px_low>0 else 0.0
-    spread_bps = spread_pct*100.0
-    qty = per_leg_notional_usd / px_low if px_low>0 else 0.0
-    gross = spread * qty
-    fees_rt = 4.0 * taker_fee * per_leg_notional_usd
-    net = gross - fees_rt
-    return {
-        "symbol": rows[0]["symbol"].upper(),
-        "long_ex": cheapest["exchange"],
-        "short_ex": priciest["exchange"],
-        "px_low": px_low,
-        "px_high": px_high,
-        "spread": spread,
-        "spread_pct": spread_pct,
-        "spread_bps": spread_bps,
-        "qty_est": qty,
-        "gross_usd": gross,
-        "fees_roundtrip_usd": fees_rt,
-        "net_usd": net
-    }
 
 def _coalesce_cols(df: pd.DataFrame, targets: List[str], candidates: List[str]) -> pd.DataFrame:
      """
@@ -6240,10 +6242,13 @@ def build_price_arbitrage(
         use["top_ask_usd"] = pd.to_numeric(use["ask"], errors="coerce") * pd.to_numeric(use["ask_sz"], errors="coerce")
         _tb = use["top_bid_usd"].to_numpy()
         _ta = use["top_ask_usd"].to_numpy()
-        # strict: if sizes missing -> topbook_usd must be NaN (liq gate should FAIL)
-        use["topbook_usd"] = np.where(np.isfinite(_tb) & np.isfinite(_ta), np.minimum(_tb, _ta), np.nan)
+        # best-effort: if one side is missing, keep the other; if both missing -> NaN
+        use["topbook_usd"] = np.where(
+            np.isfinite(_tb) & np.isfinite(_ta), np.minimum(_tb, _ta),
+            np.where(np.isfinite(_tb), _tb, np.where(np.isfinite(_ta), _ta, np.nan))
+        )
     except Exception:
-        # keep best-effort; missing cols are OK
+        # missing cols are OK
         pass
 
     # 2) если после коалесса всё равно нет — создаём
