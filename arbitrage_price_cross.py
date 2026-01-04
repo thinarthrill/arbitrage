@@ -2389,7 +2389,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.90-no-topbook</b>")
+    lines.append(f"\n<b> ver: 2.91-no-more-topbook</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4283,8 +4283,6 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
     # z_ok is NOT a hard gate anymore. z contributes via candidate_score.
     open_ok = bool(eco_ok) and bool(spread_ok) and bool(std_ok) and bool(spread_alive_ok) and bool(liq_ok) and bool(stats_quality_ok) and (float(candidate_score) >= float(FINAL_SCORE_MIN))
  
-    if not liq_ok:
-        _add_reason(skip_reasons, "low_topbook_liquidity")
     if (not stats_quality_ok) and (str(ENTRY_MODE).lower() == "zscore"):
         _add_reason(skip_reasons, "stats_stale_or_low_count")
     if not spread_alive_ok:
@@ -5232,7 +5230,7 @@ def scan_spreads_once(
             #   - MIN_TOPBOOK_FACTOR already exists in your env
             #   - MIN_SPREAD_COUNT already exists in your env
             #   - SPREAD_STALE_SEC already exists in your env
-            MIN_TOPBOOK_FACTOR = float(getenv_float("MIN_TOPBOOK_FACTOR", 1.0))
+            # stats quality gates (liquidity gating DISABLED)
             MIN_SPREAD_COUNT = float(getenv_float("MIN_SPREAD_COUNT", 30))
             SPREAD_STALE_SEC = float(getenv_float("SPREAD_STALE_SEC", 600))
             now_ms = int(time.time() * 1000)
