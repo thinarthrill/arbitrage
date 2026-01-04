@@ -1596,6 +1596,9 @@ def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                 "client_order_id": oa.get("client_order_id") or oa.get("clientOrderId") or cl_close_a,
                 "avg_px": close_a_px,
                 "fee_usd_reported": fee_a,
+                "status": _extract_order_status(oa),
+                "filled_qty": _extract_filled_qty(oa),
+                "reason_code": _leg_reason_code(oa, reduce_only=True),
             },
             "close_leg_b": {
                 "exchange": str(rich_ex),
@@ -1604,6 +1607,9 @@ def atomic_cross_close(symbol: str, cheap_ex: str, rich_ex: str,
                 "client_order_id": ob.get("client_order_id") or ob.get("clientOrderId") or cl_close_b,
                 "avg_px": close_b_px,
                 "fee_usd_reported": fee_b,
+                "status": _extract_order_status(ob),
+                "filled_qty": _extract_filled_qty(ob),
+                "reason_code": _leg_reason_code(ob, reduce_only=True),
             },
             "close_fee_usd_reported": float(fee_a + fee_b),
         })
@@ -1653,6 +1659,66 @@ def _add_reason(reasons: List[str], r: str) -> None:
     except Exception:
         pass
 
+# ----------------- audit helpers (orders) -----------------
+def _extract_order_status(o: dict) -> str:
+    """Best-effort normalized status across venues."""
+    try:
+        return str(o.get("status") or o.get("orderStatus") or o.get("state") or "")
+    except Exception:
+        return ""
+
+def _extract_filled_qty(o: dict) -> float:
+    # common fields across venues
+    for k in ["executed_qty","executedQty","cumQty","cumExecQty","filled_qty","filledQty","fillSz","dealSize","sizeFilled"]:
+        try:
+            v = o.get(k)
+            if v is None:
+                continue
+            f = float(v)
+            if f == f:
+                return abs(f)
+        except Exception:
+            pass
+    return 0.0
+
+def _extract_reject_reason(o: dict) -> str:
+    for k in ["reject_reason","rejectReason","reason","msg","retMsg","message","sMsg","error","err_msg","error_msg"]:
+        try:
+            v = o.get(k)
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    try:
+        if isinstance(o.get("info"), dict):
+            inf = o["info"]
+            for k in ["rejectReason","reason","msg","retMsg","error"]:
+                if inf.get(k):
+                    return str(inf.get(k))
+    except Exception:
+        pass
+    return ""
+
+def _leg_reason_code(o: dict, reduce_only: bool=False) -> str:
+    """
+    Normalized per-leg code for audit:
+    filled / partial / partial_canceled / rejected:<reason> / status:<X> / unknown
+    """
+    st = _extract_order_status(o).upper()
+    fq = _extract_filled_qty(o)
+    if st in ("FILLED","CLOSED","DONE"):
+        return "filled"
+    if st in ("PARTIALLY_FILLED","PARTIAL","PARTIALLYFILLED") or (fq > 0 and st and "PART" in st):
+        return "partial"
+    if st in ("CANCELED","CANCELLED") and fq > 0:
+        return "partial_canceled"
+    if st in ("CANCELED","CANCELLED","REJECTED","FAILED","EXPIRED","ERROR"):
+        rs = _extract_reject_reason(o).replace("\n"," ").strip()
+        return f"rejected:{rs[:160]}" if rs else "rejected"
+    if st:
+        return f"status:{st}"
+    return "unknown"
+
 def _compute_candidate_score(best: Dict[str, Any],
                              net_adj: float,
                              z: float,
@@ -1693,8 +1759,9 @@ def _compute_candidate_score(best: Dict[str, Any],
         except Exception:
             liq_mult = 1.0
     else:
-        # If can't measure liquidity: reject only in zscore-mode (prevents illiquid ghosts)
-        liq_ok = (entry_mode_loc != "zscore")
+        # HARD: unknown/NaN topbook => liquidity gate MUST FAIL (no soft pass)
+        liq_ok = False
+        liq_mult = 0.0
 
     count = to_float(best.get("count"))
     updated_ms = to_float(best.get("updated_ms"))
@@ -2333,7 +2400,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.87-clean-score</b>")
+    lines.append(f"\n<b> ver: 2.88</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -4490,6 +4557,18 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
         df_pos = load_positions(pos_path)
         cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max() if not df_pos.empty else None
         next_id = int(cur_max) + 1 if cur_max == cur_max and cur_max is not None else 1
+        # --- AUDIT-GRADE GUARD: do not write "open" if we don't have real fill px/qty ---
+        try:
+            _olpx = float(meta.get("open_long_px") or 0.0)
+            _ospx = float(meta.get("open_short_px") or 0.0)
+            _olfq = float(meta.get("open_long_filled_qty") or 0.0)
+            _osfq = float(meta.get("open_short_filled_qty") or 0.0)
+            if _olpx <= 0 or _ospx <= 0:
+                return _reject("audit_bad_open_fill_px")
+            if _olfq <= 0 or _osfq <= 0:
+                return _reject("audit_bad_open_filled_qty")
+        except Exception:
+            return _reject("audit_bad_open_meta")
 
         new = {
             "id": next_id, "attempt_id": attempt_id, "symbol": sym,
@@ -4509,7 +4588,15 @@ def try_instant_open(best, per_leg_notional_usd, taker_fee, paper, pos_path):
             "open_short_px": meta.get("open_short_px", 0.0),
             "open_fees_usd": meta.get("open_fees_usd", 0.0),
             "open_long_cloid": meta.get("open_long_cloid",""),
-            "open_short_cloid": meta.get("open_short_cloid","")
+            "open_short_cloid": meta.get("open_short_cloid",""),
+
+            # --- audit-grade open leg facts ---
+            "open_long_status": meta.get("open_long_status",""),
+            "open_short_status": meta.get("open_short_status",""),
+            "open_long_filled_qty": float(meta.get("open_long_filled_qty") or 0.0),
+            "open_short_filled_qty": float(meta.get("open_short_filled_qty") or 0.0),
+            "open_long_reason": meta.get("open_long_reason",""),
+            "open_short_reason": meta.get("open_short_reason",""),
         }
 
         df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
@@ -4797,6 +4884,23 @@ def scan_all_with_instant_alerts(
 
         best["z"]   = z
         best["std"] = std
+
+    # HARD: in zscore-mode, z/std MUST exist BEFORE any open/signal is treated as valid
+    if str(getenv_str("ENTRY_MODE", "price")).lower() == "zscore":
+        try:
+            zf = float(best.get("z"))
+            sf = float(best.get("std"))
+            if not (zf == zf) or not (sf == sf) or sf <= 0:
+                best["data_quality"] = "bad"
+                best["data_quality_reason"] = "z_or_std_missing"
+                best["reject_reason"] = "data_quality_bad: z/std missing (ENTRY_MODE=zscore)"
+                return None
+        except Exception:
+            best["data_quality"] = "bad"
+            best["data_quality_reason"] = "z_or_std_missing"
+            best["reject_reason"] = "data_quality_bad: z/std missing (ENTRY_MODE=zscore)"
+            return None
+
         best["net_usd_adj"] = net_usd_adj
         # если stats невалидна — помечаем отдельным флагом
         stats_ok = (std == std) and (std > 0)
@@ -6156,7 +6260,10 @@ def build_price_arbitrage(
     try:
         use["top_bid_usd"] = pd.to_numeric(use["bid"], errors="coerce") * pd.to_numeric(use["bid_sz"], errors="coerce")
         use["top_ask_usd"] = pd.to_numeric(use["ask"], errors="coerce") * pd.to_numeric(use["ask_sz"], errors="coerce")
-        use["topbook_usd"] = np.nanmin(np.vstack([use["top_bid_usd"].to_numpy(), use["top_ask_usd"].to_numpy()]), axis=0)
+        _tb = use["top_bid_usd"].to_numpy()
+        _ta = use["top_ask_usd"].to_numpy()
+        # strict: if sizes missing -> topbook_usd must be NaN (liq gate should FAIL)
+        use["topbook_usd"] = np.where(np.isfinite(_tb) & np.isfinite(_ta), np.minimum(_tb, _ta), np.nan)
     except Exception:
         # keep best-effort; missing cols are OK
         pass
@@ -6167,15 +6274,25 @@ def build_price_arbitrage(
             use[col] = np.nan
 
     # 3) мягкое восстановление из mid/px если bulk вернул только их
-    if use["ask"].isna().all() and "mid" in use.columns:
-        use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
-    if use["bid"].isna().all() and "mid" in use.columns:
-        use["bid"] = pd.to_numeric(use["mid"], errors="coerce")
+    # HARD RULE for execution/book: NO synthetic bid/ask (mid/px) allowed
+    if str(ps).lower() != "book":
+        if use["ask"].isna().all() and "mid" in use.columns:
+            use["ask"] = pd.to_numeric(use["mid"], errors="coerce")
+        if use["bid"].isna().all() and "mid" in use.columns:
+            use["bid"] = pd.to_numeric(use["mid"], errors="coerce")
 
-    if use["ask"].isna().all() and "px" in use.columns:
-        use["ask"] = pd.to_numeric(use["px"], errors="coerce")
-    if use["bid"].isna().all() and "px" in use.columns:
-        use["bid"] = pd.to_numeric(use["px"], errors="coerce")
+        if use["ask"].isna().all() and "px" in use.columns:
+            use["ask"] = pd.to_numeric(use["px"], errors="coerce")
+        if use["bid"].isna().all() and "px" in use.columns:
+            use["bid"] = pd.to_numeric(use["px"], errors="coerce")
+
+    # BOOK MODE FILTERS (execution-safe):
+    # if no real bid/ask -> drop; if no sizes -> drop (or becomes non-executable watchlist)
+    if str(ps).lower() == "book":
+        try:
+            use = use.dropna(subset=["bid","ask","bid_sz","ask_sz"])
+        except Exception:
+            pass
 
     # 4) если bid/ask всё ещё пустые — логируем один раз на цикл
     if use["ask"].isna().all() or use["bid"].isna().all():
@@ -6559,6 +6676,11 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             cheap_ex, symbol, side_a_open, qty_final,
             paper=paper, cl_oid=cl_open_long, reduce_only=False
         )
+        meta_open_a = {
+            "status": _extract_order_status(oa),
+            "filled_qty": _extract_filled_qty(oa),
+            "reason_code": _leg_reason_code(oa, reduce_only=False),
+        }
         if oa.get("status") != "FILLED":
             raise RuntimeError(f"legA not filled: {oa}")
         # --- NEW: фиксируем реальную цену открытия LONG ---
@@ -6584,6 +6706,11 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             rich_ex, symbol, side_b_open, qty_final,
             paper=paper, cl_oid=cl_open_short, reduce_only=False
         )
+        meta_open_b = {
+            "status": _extract_order_status(ob),
+            "filled_qty": _extract_filled_qty(ob),
+            "reason_code": _leg_reason_code(ob, reduce_only=False),
+        }
         if ob.get("status") != "FILLED":
             # откат первой ноги
             rollback_failed = False
@@ -6700,6 +6827,12 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         "open_long_cloid":  oa.get("client_order_id"),
         "open_short_cloid": ob.get("client_order_id"),
         "entry_bps_filled": float(entry_bps_filled) if entry_bps_filled is not None else None,
+        "open_long_status": (meta_open_a.get("status") if isinstance(locals().get("meta_open_a"), dict) else ""),
+        "open_short_status": (meta_open_b.get("status") if isinstance(locals().get("meta_open_b"), dict) else ""),
+        "open_long_filled_qty": float(meta_open_a.get("filled_qty") if isinstance(locals().get("meta_open_a"), dict) else 0.0),
+        "open_short_filled_qty": float(meta_open_b.get("filled_qty") if isinstance(locals().get("meta_open_b"), dict) else 0.0),
+        "open_long_reason": (meta_open_a.get("reason_code") if isinstance(locals().get("meta_open_a"), dict) else ""),
+        "open_short_reason": (meta_open_b.get("reason_code") if isinstance(locals().get("meta_open_b"), dict) else ""),
     }
     # --- NEW: сразу подтягиваем реальные fills и переписываем open_*_px ---
     try:
@@ -7312,8 +7445,12 @@ POS_COLS = ["id","attempt_id","symbol","long_ex","short_ex","opened_ms","last_ms
             "status","opened_at","closed_at","close_reason","validated_qty","note_net_usd",
             "open_long_order_id","open_short_order_id","open_long_px","open_short_px","open_fees_usd",
             "open_long_cloid","open_short_cloid",
+            "open_long_status","open_short_status","open_long_filled_qty","open_short_filled_qty",
+            "open_long_reason","open_short_reason",
             "close_long_order_id","close_short_order_id","close_long_px","close_short_px","close_fees_usd",
             "close_long_cloid","close_short_cloid",
+            "close_long_status","close_short_status","close_long_filled_qty","close_short_filled_qty",
+            "close_long_reason","close_short_reason",
             "realized_pnl_usd"]
 
 def load_positions(path: str) -> pd.DataFrame:
@@ -7325,6 +7462,8 @@ def load_positions(path: str) -> pd.DataFrame:
         "opened_at","closed_at","close_reason",
         "open_long_order_id","open_short_order_id","close_long_order_id","close_short_order_id",
         "open_long_cloid","open_short_cloid","close_long_cloid","close_short_cloid",
+        "open_long_status","open_short_status","open_long_reason","open_short_reason",
+        "close_long_status","close_short_status","close_long_reason","close_short_reason",
         "status","symbol","long_ex","short_ex","attempt_id"
     ]
     for c in str_cols:
@@ -7336,7 +7475,9 @@ def load_positions(path: str) -> pd.DataFrame:
         "entry_spread_bps","entry_z",
         "entry_px_low","entry_px_high","validated_qty",
         "open_long_px","open_short_px","open_fees_usd",
-        "close_long_px","close_short_px","close_fees_usd","realized_pnl_usd"
+        "open_long_filled_qty","open_short_filled_qty",
+        "close_long_px","close_short_px","close_fees_usd","realized_pnl_usd",
+        "close_long_filled_qty","close_short_filled_qty",
     ]
     for c in num_cols:
         if c in df.columns:
@@ -7570,7 +7711,27 @@ def positions_once(
         cands["net_usd_adj_total_full"] = cands["net_usd_adj"].fillna(0.0) + cands["funding_expected_usd_full"].fillna(0.0)
         cands["net_usd_adj_total"] = cands["net_usd_adj"].fillna(0.0) + cands["funding_expected_usd"].fillna(0.0)
 
-        cands["eco_ok"]    = cands["net_usd_adj_total"].notna() & (cands["net_usd_adj_total"] > min_net_abs)
+        # --- unify metric: expected net after slippage on "used" spread (delta) ---
+        _su_used = None
+        if "spread_bps_used" in cands.columns:
+            _su_used = cands["spread_bps_used"]
+        elif "spread_delta_bps" in cands.columns:
+            _su_used = cands["spread_delta_bps"]
+        elif "spread_res_bps" in cands.columns:
+            _su_used = cands["spread_res_bps"]
+        else:
+            _su_used = cands.get("spread_bps")
+        _su_used = pd.to_numeric(_su_used, errors="coerce").fillna(0.0)
+        _fees_rt = pd.to_numeric(cands.get("fees_roundtrip_usd"), errors="coerce")
+        if _fees_rt is None or _fees_rt.isna().all():
+            _fees_rt = (4.0 * float(getenv_float("TAKER_FEE", 0.0005)) * float(per_leg_notional_usd))
+        _slip_bps = float(getenv_float("SLIPPAGE_BPS", 1.0))
+        _slip_usd = (4.0 * (_slip_bps / 1e4) * float(per_leg_notional_usd))
+        cands["gross_usd_used"] = (_su_used / 1e4) * float(per_leg_notional_usd)
+        cands["net_usd_adj_used"] = cands["gross_usd_used"] - _fees_rt - _slip_usd
+        cands["net_usd_adj_total_used"] = cands["net_usd_adj_used"].fillna(0.0) + pd.to_numeric(cands.get("funding_expected_usd"), errors="coerce").fillna(0.0)
+
+        cands["eco_ok"]    = cands["net_usd_adj_total_used"].notna() & (cands["net_usd_adj_total_used"] > min_net_abs)
         cands["funding_ok"] = cands["funding_expected_pct"].notna() & (cands["funding_expected_pct"] >= funding_min_pct)
         if funding_min_pct <= 0:
             cands["funding_ok"] = True
@@ -7664,7 +7825,8 @@ def positions_once(
             # 3) сортировка (soft-scoring вместо hard-gate по z/std)
             # base: экономика после slippage + funding_effective
             cands["__rating_z__"] = candidate_rating_z(cands)
-            net_base = cands.get("net_usd_adj_total", cands.get("net_usd_adj")).fillna(0.0)
+            # rank on the SAME metric as eco/open: expected net after slippage on delta-spread
+            net_base = pd.to_numeric(cands.get("net_usd_adj_total_used"), errors="coerce").fillna(0.0)
             z_bonus  = pd.to_numeric(cands.get("z"), errors="coerce").fillna(0.0).clip(lower=0.0) * 0.10
             std_pen  = pd.to_numeric(cands.get("std"), errors="coerce").fillna(0.0) * 0.02
             f_bonus  = pd.to_numeric(cands.get("funding_expected_usd"), errors="coerce").fillna(0.0) * 0.05
@@ -7804,6 +7966,15 @@ def positions_once(
         topN = tg_df.head(int(top3_to_tg)).to_dict("records")
         for rec in topN:
             try:
+                # HARD: do not emit topN events if ENTRY_MODE=zscore and z/std are bad
+                if str(getenv_str("ENTRY_MODE","price")).lower() == "zscore":
+                    try:
+                        zf = float(rec.get("z"))
+                        sf = float(rec.get("std"))
+                        if not (zf == zf) or not (sf == sf) or sf <= 0:
+                            continue
+                    except Exception:
+                        continue
                 eventlog_append(SIGNALS_LOG_JSONL_PATH, {
                     "event": "signal",
                     "stage": "topN",
@@ -7812,6 +7983,10 @@ def positions_once(
                     "short_ex": rec.get("short_ex"),
                     "px_low": rec.get("px_low"),
                     "px_high": rec.get("px_high"),
+                    "spread_bps_used": rec.get("spread_bps_used"),
+                    "z": rec.get("z"),
+                    "std": rec.get("std"),
+                    "data_quality": "ok",
                     "spread_bps": rec.get("spread_bps"),
                     "spread_pct": rec.get("spread_pct"),
                     "net_usd": rec.get("net_usd"),
@@ -8337,6 +8512,25 @@ def positions_once(
                     except Exception:
                         pass
 
+                    # --- audit-grade close fields (ids/px/fees/status/reasons/filled qty) ---
+                    try:
+                        cla = (meta.get("close_leg_a") or {}) if isinstance(meta, dict) else {}
+                        clb = (meta.get("close_leg_b") or {}) if isinstance(meta, dict) else {}
+                        df_pos.at[i, "close_long_order_id"] = cla.get("order_id","")
+                        df_pos.at[i, "close_short_order_id"] = clb.get("order_id","")
+                        df_pos.at[i, "close_long_cloid"] = cla.get("client_order_id","")
+                        df_pos.at[i, "close_short_cloid"] = clb.get("client_order_id","")
+                        df_pos.at[i, "close_long_px"] = float(cla.get("avg_px") or 0.0)
+                        df_pos.at[i, "close_short_px"] = float(clb.get("avg_px") or 0.0)
+                        df_pos.at[i, "close_fees_usd"] = float(meta.get("close_fee_usd_reported") or 0.0)
+                        df_pos.at[i, "close_long_status"] = str(cla.get("status") or "")
+                        df_pos.at[i, "close_short_status"] = str(clb.get("status") or "")
+                        df_pos.at[i, "close_long_filled_qty"] = float(cla.get("filled_qty") or 0.0)
+                        df_pos.at[i, "close_short_filled_qty"] = float(clb.get("filled_qty") or 0.0)
+                        df_pos.at[i, "close_long_reason"] = str(cla.get("reason_code") or "")
+                        df_pos.at[i, "close_short_reason"] = str(clb.get("reason_code") or "")
+                    except Exception:
+                        pass
                     # ---- eventlog: close ok ----
                     try:
                         _row = df_pos.loc[i].to_dict()
