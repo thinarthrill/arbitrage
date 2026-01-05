@@ -5235,15 +5235,6 @@ def scan_spreads_once(
             SPREAD_STALE_SEC = float(getenv_float("SPREAD_STALE_SEC", 600))
             now_ms = int(time.time() * 1000)
 
-            # ensure columns exist
-            if "min_topbook_usd" not in cands.columns:
-                cands["min_topbook_usd"] = np.nan
-            cands["min_topbook_usd"] = pd.to_numeric(cands.get("min_topbook_usd"), errors="coerce")
-
-            # top-of-book must cover our intended per-leg notional (or a fraction via MIN_TOPBOOK_FACTOR)
-            liq_threshold = float(per_leg_notional_usd) * float(MIN_TOPBOOK_FACTOR)
-            cands["liq_ok"] = cands["min_topbook_usd"].notna() & (cands["min_topbook_usd"] >= liq_threshold)
-
             # stats must be usable + sufficiently sampled + fresh
             cands["count"] = pd.to_numeric(cands.get("count"), errors="coerce")
             cands["updated_ms"] = pd.to_numeric(cands.get("updated_ms"), errors="coerce")
@@ -5253,7 +5244,7 @@ def scan_spreads_once(
 
             # Hard-filter: stop picking "width for width" on illiquid / unsampled / stale pairs
             # (this is exactly where phantom-wide spreads live)
-            cands = cands[cands["liq_ok"] & cands["stats_quality_ok"]].copy()
+            cands = cands[cands["stats_quality_ok"]].copy()
             if cands.empty:
                 return None, quotes_df
 
@@ -6533,15 +6524,10 @@ class StatsStore:
             old_var  = to_float(self.df.at[i, "ema_var"])  or 0.0
             old_cnt  = to_float(self.df.at[i, "count"])    or 0.0
 
-            # EMA mean
-            new_mean = (1.0 - ALPHA) * old_mean + ALPHA * x
-
-            # EMA variance (простая и стабильная формула)
-            dx = x - old_mean
-            new_var = (1.0 - ALPHA) * old_var + ALPHA * (dx * dx)
+            new_mean, new_var = self._ema_update(old_mean, old_var, x)
 
             self.df.at[i, "ema_mean"] = new_mean
-            self.df.at[i, "ema_var"]  = max(new_var, 0.0)
+            self.df.at[i, "ema_var"]  = max(float(new_var), 1e-12)
             self.df.at[i, "count"]    = old_cnt + 1.0
             self.df.at[i, "updated_ms"] = now_ms
 
@@ -6555,7 +6541,7 @@ class StatsStore:
                 "ex_low": ex_low_l,
                 "ex_high": ex_high_l,
                 "ema_mean": float(x),
-                "ema_var": 0.0,
+                "ema_var": 1e-6,
                 "count": 1.0,
                 "updated_ms": now_ms,
 
@@ -7974,15 +7960,6 @@ def positions_once(
         topN = tg_df.head(int(top3_to_tg)).to_dict("records")
         for rec in topN:
             try:
-                # HARD: do not emit topN events if ENTRY_MODE=zscore and z/std are bad
-                if str(getenv_str("ENTRY_MODE","price")).lower() == "zscore":
-                    try:
-                        zf = float(rec.get("z"))
-                        sf = float(rec.get("std"))
-                        if not (zf == zf) or not (sf == sf) or sf <= 0:
-                            continue
-                    except Exception:
-                        continue
                 eventlog_append(SIGNALS_LOG_JSONL_PATH, {
                     "event": "signal",
                     "stage": "topN",
