@@ -2401,7 +2401,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.92-no gdrive log-directional trading</b>")
+    lines.append(f"\n<b> ver: 3.00-directional trading</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2697,10 +2697,98 @@ def _dir_enabled() -> bool:
 def _dir_base_exchange() -> str:
     return str(getenv_str("DIRECTIONAL_BASE_EXCHANGE", "binance") or "binance").strip().lower()
 
+def _dir_base_exchange_for_sensor(base_ex: str) -> str:
+    """Directional sensor needs a concrete exchange name (cannot be 'auto')."""
+    bx = str(base_ex or "").strip().lower()
+    return bx if bx and bx != "auto" else "binance"
+
+
+def _dir_exchange_has_private_keys(exchange: str) -> bool:
+    """Best-effort: whether we have creds for real trading on exchange."""
+    ex = str(exchange or "").strip().lower()
+    if ex == "binance":
+        return bool(getenv_str("BINANCE_API_KEY", "")) and bool(getenv_str("BINANCE_API_SECRET", ""))
+    if ex == "bybit":
+        return bool(getenv_str("BYBIT_API_KEY", "")) and bool(getenv_str("BYBIT_API_SECRET", ""))
+    if ex == "okx":
+        return bool(getenv_str("OKX_API_KEY", "")) and bool(getenv_str("OKX_API_SECRET", "")) and bool(getenv_str("OKX_PASSPHRASE", ""))
+    if ex == "gate":
+        return bool(getenv_str("GATE_API_KEY", "")) and bool(getenv_str("GATE_API_SECRET", ""))
+    return False
+
+
+def _dir_exchange_supported_for_trading(exchange: str) -> bool:
+    """Directional uses the existing perp market order router."""
+    return str(exchange or "").strip().lower() in ("binance", "bybit", "okx", "gate")
+
+
+def _dir_quote_metrics(quotes_df: pd.DataFrame, symbol: str, exchange: str) -> tuple[float, float]:
+    """Return (topbook_usd, local_spread_bps) for (exchange, symbol), best-effort."""
+    try:
+        if quotes_df is None or quotes_df.empty:
+            return (float("nan"), float("nan"))
+        sym = str(symbol or "").upper()
+        ex = str(exchange or "").strip().lower()
+        m = (quotes_df["symbol"].astype(str).str.upper() == sym) & (quotes_df["exchange"].astype(str).str.lower() == ex)
+        sub = quotes_df.loc[m]
+        if sub.empty:
+            return (float("nan"), float("nan"))
+        r0 = sub.iloc[0]
+        topbook = to_float(r0.get("topbook_usd"))
+        try:
+            topbook = float(topbook) if topbook is not None else float("nan")
+        except Exception:
+            topbook = float("nan")
+        bid = to_float(r0.get("bid"))
+        ask = to_float(r0.get("ask"))
+        mid = to_float(r0.get("mid"))
+        if mid is None or not mid or mid <= 0:
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = 0.5 * (bid + ask)
+        spread_bps = float("nan")
+        if bid is not None and ask is not None and mid is not None and mid > 0:
+            spread_bps = float((ask - bid) / mid) * 1e4
+        return (topbook, spread_bps)
+    except Exception:
+        return (float("nan"), float("nan"))
+
+
+def _dir_choose_exec_exchange(sym: str, st: dict, quotes_df: pd.DataFrame) -> tuple[str, str]:
+    """Pick best execution exchange for directional entry.
+
+    Candidates: long_ex (cheap), short_ex (rich), fallback binance.
+    Score: max topbook_usd; tie-breaker: min local spread_bps.
+    Filters: has creds (for real trading), supported in router, symbol present in quotes snapshot.
+    """
+    sym_u = str(sym or "").upper()
+    long_ex = str(st.get("long_ex") or "").strip().lower()
+    short_ex = str(st.get("short_ex") or "").strip().lower()
+    cands = []
+    for ex in [long_ex, short_ex, "binance"]:
+        exl = str(ex or "").strip().lower()
+        if not exl:
+            continue
+        if not _dir_exchange_supported_for_trading(exl):
+            continue
+        # In PAPER mode we can allow missing creds; in REAL require keys
+        if not getenv_bool("PAPER", True):
+            if not _dir_exchange_has_private_keys(exl):
+                continue
+        # Must have the symbol in the current snapshot
+        tb, sp = _dir_quote_metrics(quotes_df, sym_u, exl)
+        if not (tb == tb):  # NaN
+            continue
+        cands.append((exl, float(tb), float(sp) if (sp == sp) else 9e9))
+
+    if not cands:
+        return ("binance", "fallback_binance_no_candidate")
+
+    cands.sort(key=lambda x: (-x[1], x[2], x[0]))
+    best = cands[0]
+    return (best[0], f"auto_pick(topbook_usd={best[1]:.2f}, spread_bps={best[2]:.2f})")
 
 def _dir_cooldown_sec() -> float:
     return float(getenv_float("DIRECTIONAL_COOLDOWN_MIN", 20.0)) * 60.0
-
 
 def _dir_get_ex_mid(quotes_df: pd.DataFrame, symbol: str, exchange: str) -> Optional[float]:
     """Best-effort mid/mark/last from quotes_df for (exchange, symbol)."""
@@ -2756,20 +2844,23 @@ def _dir_positions_log_paths() -> tuple[str, str]:
 
 
 def _dir_log_position_to_csv(pos: dict) -> None:
-    """Append/update a simple CSV. We append rows (idempotency is not critical for paper mode)."""
+    """Append/update a simple CSV. We append rows (idempotency is not critical)."""
     try:
         _, csv_path = _dir_positions_log_paths()
         cols = [
-            "ts","event","symbol","direction","base_exchange",
+            "ts","event","symbol","direction",
+            "base_exchange","exec_exchange",
             "entry_price","exit_price","sl","tp","qty","notional_usd",
-            "opened_ms","closed_ms","reason","exit_reason","pnl_usd",
+            "opened_ms","closed_ms",
+            "order_id_entry","order_id_exit",
+            "reason","exit_reason","pnl_usd",
         ]
         row = {k: pos.get(k) for k in cols}
         exists = os.path.exists(csv_path)
         with open(csv_path, "a", encoding="utf-8") as f:
             if not exists:
                 f.write(",".join(cols) + "\n")
-            # naive CSV escaping (values are mostly numeric/short strings)
+
             def esc(v):
                 s = "" if v is None else str(v)
                 if any(c in s for c in [",", "\n", "\r", '"']):
@@ -2783,7 +2874,7 @@ def _dir_log_position_to_csv(pos: dict) -> None:
 def _dir_format_tg_card(event: str, pos: dict) -> str:
     sym = str(pos.get("symbol", "")).upper()
     direction = str(pos.get("direction", "")).upper()
-    base_ex = str(pos.get("base_exchange", "")).lower()
+    exec_ex = str(pos.get("exec_exchange") or pos.get("base_exchange") or "").strip().lower()
     entry = pos.get("entry_price")
     sl = pos.get("sl")
     tp = pos.get("tp")
@@ -2792,11 +2883,45 @@ def _dir_format_tg_card(event: str, pos: dict) -> str:
     reason = str(pos.get("reason") or "").strip()
     exit_reason = str(pos.get("exit_reason") or "").strip()
     ts = pos.get("ts")
+    oid_in = str(pos.get("order_id_entry") or "").strip()
+    oid_out = str(pos.get("order_id_exit") or "").strip()
+
+    # Balances snapshot (best-effort)
+    total_eq = None
+    balances_text = ""
+    try:
+        exs = []
+        for x in ("binance", "bybit", "okx", "gate"):
+            if _dir_exchange_has_private_keys(x):
+                exs.append(x)
+        if exs:
+            per_ex = get_post_close_balances(exs) or {}
+            lines = []
+            tot = 0.0
+            for ex_name, val in per_ex.items():
+                try:
+                    v = float((val or {}).get("equity") or 0.0)
+                except Exception:
+                    v = 0.0
+                if v and v == v:
+                    tot += v
+                    lines.append(f"   • {ex_name}: ${v:,.2f}")
+            if lines:
+                total_eq = tot
+                balances_text = "\n".join(lines)
+    except Exception:
+        pass
 
     lines = []
     lines.append("──────────────")
-    lines.append(f"📈 DIRECTIONAL {event.upper()}")
-    lines.append(f"{sym}  |  {direction}  @ {base_ex}")
+    lines.append(f"📈 DIRECTIONAL {str(event or '').upper()}")
+    if total_eq is not None:
+        lines.append(f"🏦 Total equity: ${float(total_eq):,.2f}")
+    lines.append(f"{sym}  |  {direction}  @ {exec_ex}")
+    if oid_in and event.lower() in ("entry", "open"):
+        lines.append(f"Order ID: {oid_in}")
+    if oid_out and event.lower() in ("exit", "close"):
+        lines.append(f"Order ID: {oid_out}")
     if entry is not None:
         lines.append(f"Entry: {float(entry):.8f}")
     if sl is not None and tp is not None:
@@ -2805,10 +2930,14 @@ def _dir_format_tg_card(event: str, pos: dict) -> str:
         lines.append(f"Exit: {float(ex):.8f}")
     if pnl is not None:
         lines.append(f"PnL: ${float(pnl):.2f}")
-    if reason:
-        lines.append(f"Reason: {reason}")
     if exit_reason:
         lines.append(f"Exit reason: {exit_reason}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+    if balances_text:
+        lines.append("")
+        lines.append("📊 Balances:")
+        lines.append(balances_text)        
     if ts:
         lines.append(f"🕒 {ts}")
     return "\n".join(lines)
@@ -2827,7 +2956,6 @@ def _dir_cross_open_for_symbol(df_pos: Optional[pd.DataFrame], symbol: str) -> b
         return bool(m.any())
     except Exception:
         return False
-
 
 def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFrame) -> None:
     """Update per-symbol dislocation state based on snapshot candidates (polling)."""
@@ -2856,7 +2984,10 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
         df = df.sort_values(["symbol", "__raw__"], ascending=[True, False])
         df = df.drop_duplicates(subset=["symbol"], keep="first")
 
-        base_ex = _dir_base_exchange()
+        base_ex_cfg = _dir_base_exchange()
+        base_ex = _dir_base_exchange_for_sensor(base_ex_cfg)  # legacy alias
+        sensor_ex = _dir_base_exchange_for_sensor(base_ex_cfg)
+
         for _, rw in df.iterrows():
             sym = str(rw.get("symbol", "")).upper()
             if not sym:
@@ -2870,10 +3001,22 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
             st = _DIR_DISLOC_STATE.get(sym) or {}
             active = bool(st.get("active"))
 
+            long_ex = str(rw.get("long_ex", "") or "").strip().lower()   # cheap
+            short_ex = str(rw.get("short_ex", "") or "").strip().lower() # rich
+
             if is_spike:
                 if not active:
                     # start a new dislocation window
-                    px0 = _dir_get_ex_mid(quotes_df, sym, base_ex)
+                    px0_sensor = _dir_get_ex_mid(quotes_df, sym, sensor_ex)
+                    px0_long = _dir_get_ex_mid(quotes_df, sym, long_ex) if long_ex else None
+                    px0_short = _dir_get_ex_mid(quotes_df, sym, short_ex) if short_ex else None
+                    avg_mid = None
+                    try:
+                        if px0_long and px0_short:
+                            avg_mid = 0.5 * (float(px0_long) + float(px0_short))
+                    except Exception:
+                        avg_mid = None
+
                     st = {
                         "active": True,
                         "started_ms": now_ms,
@@ -2883,10 +3026,14 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
                         "raw_last_bps": raw_bps,
                         "used_last_bps": used_bps,
                         "net_start_usd": net_usd,
-                        "base_exchange": base_ex,
-                        "base_price_start": px0,
-                        "long_ex": str(rw.get("long_ex", "") or ""),   # cheap
-                        "short_ex": str(rw.get("short_ex", "") or ""), # rich
+                        "base_exchange": base_ex_cfg,            # can be 'auto' (config)
+                        "sensor_exchange": sensor_ex,            # concrete for price reference
+                        "sensor_price_start": px0_sensor,
+                        "long_ex": long_ex,
+                        "short_ex": short_ex,
+                        "long_price_start": px0_long,
+                        "short_price_start": px0_short,
+                        "avg_mid_start": avg_mid,
                     }
                 else:
                     st["cycles"] = int(st.get("cycles") or 0) + 1
@@ -2901,11 +3048,8 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
                     started_ms = float(st.get("started_ms") or now_ms)
                     cycles = int(st.get("cycles") or 0)
                     dur_sec = max(0.0, (now_ms - started_ms) / 1000.0)
-                    # Must be "real" (duration/cycles)
                     mature = (dur_sec >= DISLOC_MIN_SECS) or (cycles >= DISLOC_MIN_CYCLES)
-                    # Collapse condition: raw_now <= peak * 0.4 (60% drop from peak)
                     collapsed = (peak > 0) and (raw_bps <= peak * 0.4)
-                    # also require some sanity net at start or now
                     net_ok = (float(st.get("net_start_usd") or 0.0) >= NET_MIN_USD) or (net_usd >= NET_MIN_USD)
 
                     if mature and collapsed and net_ok:
@@ -2916,11 +3060,10 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
                         st["collapsed"] = True
                         _DIR_DISLOC_STATE[sym] = st
                     else:
-                        # Reset if it fizzles out (no collapse trigger) -> avoid stale triggers.
                         _DIR_DISLOC_STATE.pop(sym, None)
     except Exception as e:
         logging.debug("directional update state failed: %s", e)
-
+    return
 
 def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd.DataFrame], paper: bool, per_leg_notional_usd: float) -> None:
     if not _dir_enabled():
@@ -2929,8 +3072,8 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
     try:
         now_ms = utc_ms_now()
         now_ts = now_utc_str()
-        base_ex = _dir_base_exchange()
-
+        base_ex_cfg = _dir_base_exchange()
+        base_ex = _dir_base_exchange_for_sensor(base_ex_cfg)  # legacy alias
         MIN_PRICE_MOVE_PCT = 0.002
         NET_MIN_USD = 1.0
         SL_PCT = 0.003
@@ -2978,32 +3121,89 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
                 _DIR_DISLOC_STATE.pop(sym, None)
                 continue
 
-            # Determine direction using "base exchange" context.
-            # In build_price_arbitrage: long_ex is CHEAP (buy), short_ex is RICH (sell).
-            # We trade continuation *in the direction of where the base exchange was priced* during the spike:
-            #   - if base was CHEAP -> expect upward continuation after collapse -> LONG confirmation on base
-            #   - if base was RICH  -> expect downward continuation after collapse -> SHORT confirmation on base
-            # If base wasn't part of the pair (rare), fall back to simple price-momentum on base.
             long_ex = str(st.get("long_ex") or "").strip().lower()
             short_ex = str(st.get("short_ex") or "").strip().lower()
-            base_side = None
-            if base_ex == long_ex:
-                base_side = "cheap"
-            elif base_ex == short_ex:
-                base_side = "rich"
 
+            # 1) pick execution exchange (auto or fixed)
+            exec_ex = None
+            exec_pick_reason = ""
+            if base_ex_cfg == "auto":
+                exec_ex, exec_pick_reason = _dir_choose_exec_exchange(sym_u, st, quotes_df)
+            else:
+                exec_ex = str(base_ex_cfg or "").strip().lower() or "binance"
+                exec_pick_reason = "fixed"
+            if not exec_ex:
+                exec_ex = "binance"
+                exec_pick_reason = "fallback_binance_empty"
+
+            # Require that symbol exists in snapshot for chosen exchange (avoid trading unseen contract)
+            _tb, _sp = _dir_quote_metrics(quotes_df, sym_u, exec_ex)
+            if not (_tb == _tb):  # NaN
+                if exec_ex != "binance":
+                    exec_ex = "binance"
+                    exec_pick_reason = "fallback_binance_no_quote"
+                    _tb, _sp = _dir_quote_metrics(quotes_df, sym_u, exec_ex)
+
+            # For REAL execution, require creds; for paper allow.
+            if (not paper) and (not _dir_exchange_has_private_keys(exec_ex)):
+                exec_ex = "binance"
+                exec_pick_reason = "fallback_binance_no_creds"
+
+            # 2) confirmation price uses exec_exchange
+            px_now = _dir_get_ex_mid(quotes_df, sym_u, exec_ex)
+            if px_now is None or px_now <= 0:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # price_start for confirmation must come from exec exchange (as available)
+            px0_exec = None
+            if exec_ex == long_ex:
+                px0_exec = st.get("long_price_start")
+            elif exec_ex == short_ex:
+                px0_exec = st.get("short_price_start")
+            else:
+                # fallback: if we used sensor exchange and it matches exec
+                if exec_ex == str(st.get("sensor_exchange") or "").strip().lower():
+                    px0_exec = st.get("sensor_price_start")
+
+            try:
+                px0_exec = float(px0_exec) if px0_exec is not None else None
+            except Exception:
+                px0_exec = None
+
+            if px0_exec is None or px0_exec <= 0:
+                # cannot confirm properly -> skip
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # 3) Direction determination relative to exec_exchange
             direction = None
+            base_side = None
+            if exec_ex == long_ex:
+                base_side = "cheap"
+            elif exec_ex == short_ex:
+                base_side = "rich"
+            else:
+                # fallback: infer whether exec was on cheap/rich side at start using avg_mid_start
+                try:
+                    avg_mid = st.get("avg_mid_start")
+                    avg_mid = float(avg_mid) if avg_mid is not None else None
+                except Exception:
+                    avg_mid = None
+                if avg_mid is not None and avg_mid > 0:
+                    base_side = "cheap" if px0_exec <= avg_mid else "rich"
+
             if base_side == "cheap":
-                if px_now >= px0 * (1.0 + MIN_PRICE_MOVE_PCT):
+                if px_now >= px0_exec * (1.0 + MIN_PRICE_MOVE_PCT):
                     direction = "LONG"
             elif base_side == "rich":
-                if px_now <= px0 * (1.0 - MIN_PRICE_MOVE_PCT):
+                if px_now <= px0_exec * (1.0 - MIN_PRICE_MOVE_PCT):
                     direction = "SHORT"
             else:
-                # fallback: momentum
-                if px_now >= px0 * (1.0 + MIN_PRICE_MOVE_PCT):
+                # fallback: momentum on exec exchange
+                if px_now >= px0_exec * (1.0 + MIN_PRICE_MOVE_PCT):
                     direction = "LONG"
-                elif px_now <= px0 * (1.0 - MIN_PRICE_MOVE_PCT):
+                elif px_now <= px0_exec * (1.0 - MIN_PRICE_MOVE_PCT):
                     direction = "SHORT"
 
             if direction is None:
@@ -3024,13 +3224,66 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
                 sl = px_now * (1.0 + SL_PCT)
                 tp = px_now * (1.0 - TP_PCT)
 
+            # 5) Real execution (MARKET). Do NOT open position if execution failed.
+            oid_entry = None
+            clid_entry = None
+            entry_fill_px = None
+
+            if not paper:
+                try:
+                    side = "BUY" if direction == "LONG" else "SELL"
+                    clid_entry = f"dir_{sym_u}_{int(now_ms)%100000000}"
+                    try:
+                        if exec_ex.lower() == "okx":
+                            clid_entry = normalize_okx_clordid(clid_entry)
+                    except Exception:
+                        pass
+                    od = _place_perp_market_order(exec_ex, sym_u, side, float(qty), paper=False, cl_oid=clid_entry, reduce_only=False)
+                    if isinstance(od, dict):
+                        oid_entry = od.get("orderId") or od.get("ordId") or od.get("id")
+                        ap = od.get("avgPrice") or od.get("avgPx") or od.get("price") or od.get("fillPrice")
+                        try:
+                            entry_fill_px = float(ap) if ap is not None else None
+                        except Exception:
+                            entry_fill_px = None
+                except Exception as e_exec:
+                    # Execution failed: do not open; optional TG alert
+                    try:
+                        maybe_send_telegram(
+                            _dir_format_tg_card(
+                                "ENTRY FAILED",
+                                {
+                                    "ts": now_ts,
+                                    "symbol": sym_u,
+                                    "direction": direction,
+                                    "exec_exchange": exec_ex,
+                                    "entry_price": float(px_now),
+                                    "sl": float(sl),
+                                    "tp": float(tp),
+                                    "reason": f"directional entry execution failed: {e_exec}",
+                                },
+                            )
+                        )
+                    except Exception:
+                        pass
+                    _DIR_DISLOC_STATE.pop(sym, None)
+                    continue
+
+                if not oid_entry:
+                    # treat as failure (safety)
+                    _DIR_DISLOC_STATE.pop(sym, None)
+                    continue
+
+            # 6) Register position
+            entry_px_used = float(entry_fill_px) if (entry_fill_px is not None and entry_fill_px > 0) else float(px_now)
             pos = {
                 "ts": now_ts,
                 "event": "open",
                 "symbol": sym_u,
                 "direction": direction,
-                "base_exchange": base_ex,
-                "entry_price": float(px_now),
+                "base_exchange": base_ex_cfg,
+                "exec_exchange": exec_ex,
+                "entry_price": entry_px_used,
                 "sl": float(sl),
                 "tp": float(tp),
                 "qty": float(qty),
@@ -3038,7 +3291,13 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
                 "opened_ms": float(now_ms),
                 "max_hold_sec": float(MAX_HOLD_SEC),
                 "paper": bool(paper),
-                "reason": f"post-dislocation continuation (peak_raw={float(st.get('peak_raw_bps') or 0.0):.1f}bps, collapsed_to={float(st.get('collapse_raw_bps') or 0.0):.1f}bps; start_px={px0:.8f})",
+                "order_id_entry": oid_entry,
+                "client_order_id_entry": clid_entry,
+                "reason": (
+                    f"post-dislocation continuation | exec={exec_ex} ({exec_pick_reason}) | "
+                    f"peak_raw={float(st.get('peak_raw_bps') or 0.0):.1f}bps, collapsed_to={float(st.get('collapse_raw_bps') or 0.0):.1f}bps; "
+                    f"start_px_exec={float(px0_exec):.8f}"
+                ),
                 "status": "open",
             }
             _DIR_POSITIONS[sym_u] = pos
@@ -3071,7 +3330,8 @@ def _dir_check_exits(quotes_df: pd.DataFrame) -> None:
             if not pos or pos.get("status") != "open":
                 continue
             sym_u = str(sym or "").upper()
-            px = _dir_get_ex_mid(quotes_df, sym_u, base_ex)
+            exec_ex = str(pos.get("exec_exchange") or pos.get("base_exchange") or "binance").strip().lower()
+            px = _dir_get_ex_mid(quotes_df, sym_u, exec_ex)
             if px is None or px <= 0:
                 continue
             entry = float(pos.get("entry_price") or 0.0)
@@ -3101,22 +3361,54 @@ def _dir_check_exits(quotes_df: pd.DataFrame) -> None:
 
             if exit_reason is None:
                 continue
+            # Real reduce-only market exit. If execution fails, keep position open to retry.
+            oid_exit = None
+            clid_exit = None
+            exit_fill_px = None
+            if not bool(pos.get("paper", False)):
+                try:
+                    side = "SELL" if direction == "LONG" else "BUY"
+                    clid_exit = f"dirx_{sym_u}_{int(now_ms)%100000000}"
+                    try:
+                        if exec_ex.lower() == "okx":
+                            clid_exit = normalize_okx_clordid(clid_exit)
+                    except Exception:
+                        pass
+                    od = _place_perp_market_order(exec_ex, sym_u, side, float(qty), paper=False, cl_oid=clid_exit, reduce_only=True)
+                    if isinstance(od, dict):
+                        oid_exit = od.get("orderId") or od.get("ordId") or od.get("id")
+                        ap = od.get("avgPrice") or od.get("avgPx") or od.get("price") or od.get("fillPrice")
+                        try:
+                            exit_fill_px = float(ap) if ap is not None else None
+                        except Exception:
+                            exit_fill_px = None
+                except Exception as e_exec:
+                    logging.warning("directional exit execution failed %s %s@%s: %s", sym_u, direction, exec_ex, e_exec)
+                    continue
+
+                if not oid_exit:
+                    # safety: do not mark closed without a confirmed order id
+                    continue
+
+            exit_px_used = float(exit_fill_px) if (exit_fill_px is not None and exit_fill_px > 0) else float(px)
 
             # close
             if direction == "LONG":
-                pnl = (float(px) - entry) * qty
+                pnl = (exit_px_used - entry) * qty
             else:
-                pnl = (entry - float(px)) * qty
+                pnl = (entry - exit_px_used) * qty
 
             pos_close = dict(pos)
             pos_close.update({
                 "ts": now_ts,
                 "event": "close",
-                "exit_price": float(px),
+                "exit_price": float(exit_px_used),
                 "closed_ms": float(now_ms),
                 "exit_reason": exit_reason,
                 "pnl_usd": float(pnl),
                 "status": "closed",
+                "order_id_exit": oid_exit,
+                "client_order_id_exit": clid_exit,                
             })
             _DIR_POSITIONS[sym_u] = pos_close
 
