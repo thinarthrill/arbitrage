@@ -183,6 +183,10 @@ def cardlog_append(event: Dict[str, Any], force: bool = False) -> None:
 
     This produces a single growing file in GCS (append semantics), reliable on Render.
     """
+    # DEBUG-gated remote logs: when DEBUG=False we do not write tg_cards/events to Drive/GCS
+    if not getenv_bool("DEBUG", False):
+        return    
+    
     global _CARDLOG_LOCAL, _CARDLOG_LAST_UPLOAD_TS, _CARDLOG_PENDING_LINES
 
     global _CARDLOG_WARNED_NO_GCS, _CARDLOG_WARNED_BAD_PATH, _CARDLOG_WARNED_UPLOAD_FAIL
@@ -779,6 +783,10 @@ def _eventlog_fingerprint(evt: Dict[str, Any]) -> str:
 
 def events_agg_append(path: str, event: Dict[str, Any], key: str = "events") -> None:
     """Append JSONL events to local file and periodically overwrite ONE remote file (gs:// or gdrive://)."""
+    # DEBUG-gated remote logs: when DEBUG=False we do not write tg_cards/events to Drive/GCS
+    if not getenv_bool("DEBUG", False):
+        return
+    
     try:
         remote_path = bucketize_path(path)
         if not remote_path or not is_remote(remote_path):
@@ -925,6 +933,10 @@ def log_event_gcs(event: Dict[str, Any], force: bool = False) -> None:
     Strategy: append locally to /tmp and periodically upload (overwrite) a run-scoped file in GCS.
     This avoids expensive GCS "append" patterns while keeping logs near-real-time.
     """
+    # DEBUG-gated remote logs: when DEBUG=False we do not write tg_cards/events to Drive/GCS
+    if not getenv_bool("DEBUG", False):
+        return
+    
     global _TG_LOG_LOCAL, _TG_LOG_LAST_UPLOAD_TS, _TG_LOG_LINES
     gs_path = bucketize_path(getenv_str("TG_LOG_JSONL_PATH", ""))
     if not gs_path or not is_gs(gs_path):
@@ -2389,7 +2401,7 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
 
         # маленький хвостик: режим
         lines.append(f"\n🔧 mode: {entry_mode}")
-    lines.append(f"\n<b> ver: 2.91-no-more-topbook</b>")
+    lines.append(f"\n<b> ver: 2.92-no gdrive log-directional trading</b>")
     # --- NEW: show confirm snapshot from try_instant_open (if happened) ---
     try:
         if r.get("spread_bps_confirm") is not None:
@@ -2660,6 +2672,467 @@ def maybe_send_telegram(text: str) -> None:
                 logging.warning("Telegram send failed: %s %s", r.status_code, r.text[:400])
         except Exception as e:
             logging.warning("Telegram exception: %s", e)
+
+# ----------------- Directional mode (post-dislocation continuation) -----------------
+# Uses cross-exchange dislocation (raw spread spike without trusted edge) as a sensor,
+# then trades continuation on a single "base" exchange after the dislocation collapses.
+#
+# Env (max 3 new):
+#   - DIRECTIONAL_MODE: true/false (default false)
+#   - DIRECTIONAL_BASE_EXCHANGE: which exchange's mid to use for entry/exit (default: binance)
+#   - DIRECTIONAL_COOLDOWN_MIN: per-symbol cooldown after close (default: 20)
+#
+# Everything else is intentionally hard-defaulted (can be promoted to env later if needed).
+
+# In-RAM per-symbol state (polling snapshots; no ticks)
+_DIR_DISLOC_STATE: dict[str, dict] = {}
+_DIR_POSITIONS: dict[str, dict] = {}          # symbol -> position dict
+_DIR_COOLDOWN_UNTIL_MS: dict[str, float] = {} # symbol -> utc_ms
+
+
+def _dir_enabled() -> bool:
+    return bool(getenv_bool("DIRECTIONAL_MODE", False))
+
+
+def _dir_base_exchange() -> str:
+    return str(getenv_str("DIRECTIONAL_BASE_EXCHANGE", "binance") or "binance").strip().lower()
+
+
+def _dir_cooldown_sec() -> float:
+    return float(getenv_float("DIRECTIONAL_COOLDOWN_MIN", 20.0)) * 60.0
+
+
+def _dir_get_ex_mid(quotes_df: pd.DataFrame, symbol: str, exchange: str) -> Optional[float]:
+    """Best-effort mid/mark/last from quotes_df for (exchange, symbol)."""
+    try:
+        if quotes_df is None or quotes_df.empty:
+            return None
+        sym = str(symbol or "").upper()
+        ex = str(exchange or "").lower()
+        if not sym or not ex:
+            return None
+        df = quotes_df
+        # quotes_df schema: exchange, symbol, bid, ask, mid, last, mark
+        m = (df["symbol"].astype(str).str.upper() == sym) & (df["exchange"].astype(str).str.lower() == ex)
+        sub = df.loc[m]
+        if sub.empty:
+            return None
+        r0 = sub.iloc[0]
+        for k in ("mid", "mark", "last"):
+            v = r0.get(k)
+            try:
+                vf = float(v)
+                if vf == vf and vf > 0:
+                    return vf
+            except Exception:
+                pass
+        # fall back to bid/ask
+        try:
+            bid = float(r0.get("bid"))
+            ask = float(r0.get("ask"))
+            if bid == bid and ask == ask and bid > 0 and ask > 0:
+                return 0.5 * (bid + ask)
+        except Exception:
+            pass
+    except Exception:
+        return None
+    return None
+
+
+def _dir_append_jsonl(path: str, obj: dict) -> None:
+    """Append a JSON object to a local JSONL file (no bucketize/remote)."""
+    try:
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logging.debug("directional jsonl append failed: %s", e)
+
+
+def _dir_positions_log_paths() -> tuple[str, str]:
+    # Explicitly local (avoid bucketize_path / Drive) per requirements
+    return ("positions_directional.jsonl", "positions_directional.csv")
+
+
+def _dir_log_position_to_csv(pos: dict) -> None:
+    """Append/update a simple CSV. We append rows (idempotency is not critical for paper mode)."""
+    try:
+        _, csv_path = _dir_positions_log_paths()
+        cols = [
+            "ts","event","symbol","direction","base_exchange",
+            "entry_price","exit_price","sl","tp","qty","notional_usd",
+            "opened_ms","closed_ms","reason","exit_reason","pnl_usd",
+        ]
+        row = {k: pos.get(k) for k in cols}
+        exists = os.path.exists(csv_path)
+        with open(csv_path, "a", encoding="utf-8") as f:
+            if not exists:
+                f.write(",".join(cols) + "\n")
+            # naive CSV escaping (values are mostly numeric/short strings)
+            def esc(v):
+                s = "" if v is None else str(v)
+                if any(c in s for c in [",", "\n", "\r", '"']):
+                    s = '"' + s.replace('"', '""') + '"'
+                return s
+            f.write(",".join(esc(row.get(c)) for c in cols) + "\n")
+    except Exception as e:
+        logging.debug("directional csv append failed: %s", e)
+
+
+def _dir_format_tg_card(event: str, pos: dict) -> str:
+    sym = str(pos.get("symbol", "")).upper()
+    direction = str(pos.get("direction", "")).upper()
+    base_ex = str(pos.get("base_exchange", "")).lower()
+    entry = pos.get("entry_price")
+    sl = pos.get("sl")
+    tp = pos.get("tp")
+    ex = pos.get("exit_price")
+    pnl = pos.get("pnl_usd")
+    reason = str(pos.get("reason") or "").strip()
+    exit_reason = str(pos.get("exit_reason") or "").strip()
+    ts = pos.get("ts")
+
+    lines = []
+    lines.append("──────────────")
+    lines.append(f"📈 DIRECTIONAL {event.upper()}")
+    lines.append(f"{sym}  |  {direction}  @ {base_ex}")
+    if entry is not None:
+        lines.append(f"Entry: {float(entry):.8f}")
+    if sl is not None and tp is not None:
+        lines.append(f"SL/TP: {float(sl):.8f} / {float(tp):.8f}")
+    if ex is not None:
+        lines.append(f"Exit: {float(ex):.8f}")
+    if pnl is not None:
+        lines.append(f"PnL: ${float(pnl):.2f}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+    if exit_reason:
+        lines.append(f"Exit reason: {exit_reason}")
+    if ts:
+        lines.append(f"🕒 {ts}")
+    return "\n".join(lines)
+
+
+def _dir_cross_open_for_symbol(df_pos: Optional[pd.DataFrame], symbol: str) -> bool:
+    try:
+        if df_pos is None or df_pos.empty:
+            return False
+        sym = str(symbol or "").upper()
+        if not sym:
+            return False
+        if "symbol" not in df_pos.columns or "status" not in df_pos.columns:
+            return False
+        m = (df_pos["symbol"].astype(str).str.upper() == sym) & df_pos["status"].isin(["open", "closing"])
+        return bool(m.any())
+    except Exception:
+        return False
+
+
+def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFrame) -> None:
+    """Update per-symbol dislocation state based on snapshot candidates (polling)."""
+    if not _dir_enabled():
+        return
+    try:
+        if cands_pre is None or cands_pre.empty:
+            return
+        now_ms = utc_ms_now()
+        now_ts = utc_ts_now_str()
+
+        RAW_SPIKE_BPS = 400.0
+        USED_MAX_BPS = 20.0
+        DISLOC_MIN_SECS = 30.0
+        DISLOC_MIN_CYCLES = 3
+        NET_MIN_USD = 1.0
+
+        # Pick one row per symbol: the largest raw spread snapshot.
+        df = cands_pre.copy()
+        raw_col = "spread_bps_raw" if "spread_bps_raw" in df.columns else "spread_bps"
+        used_col = "spread_bps_used" if "spread_bps_used" in df.columns else "spread_bps"
+        df["__raw__"] = pd.to_numeric(df.get(raw_col), errors="coerce")
+        df["__used__"] = pd.to_numeric(df.get(used_col), errors="coerce")
+        df["__net__"] = pd.to_numeric(df.get("net_usd_adj"), errors="coerce")
+
+        df = df.sort_values(["symbol", "__raw__"], ascending=[True, False])
+        df = df.drop_duplicates(subset=["symbol"], keep="first")
+
+        base_ex = _dir_base_exchange()
+        for _, rw in df.iterrows():
+            sym = str(rw.get("symbol", "")).upper()
+            if not sym:
+                continue
+            raw_bps = float(rw.get("__raw__") or 0.0)
+            used_bps = float(rw.get("__used__") or 0.0)
+            net_usd = float(rw.get("__net__") or 0.0)
+
+            is_spike = (raw_bps >= RAW_SPIKE_BPS) and (used_bps <= USED_MAX_BPS)
+
+            st = _DIR_DISLOC_STATE.get(sym) or {}
+            active = bool(st.get("active"))
+
+            if is_spike:
+                if not active:
+                    # start a new dislocation window
+                    px0 = _dir_get_ex_mid(quotes_df, sym, base_ex)
+                    st = {
+                        "active": True,
+                        "started_ms": now_ms,
+                        "started_ts": now_ts,
+                        "cycles": 1,
+                        "peak_raw_bps": raw_bps,
+                        "raw_last_bps": raw_bps,
+                        "used_last_bps": used_bps,
+                        "net_start_usd": net_usd,
+                        "base_exchange": base_ex,
+                        "base_price_start": px0,
+                        "long_ex": str(rw.get("long_ex", "") or ""),   # cheap
+                        "short_ex": str(rw.get("short_ex", "") or ""), # rich
+                    }
+                else:
+                    st["cycles"] = int(st.get("cycles") or 0) + 1
+                    st["raw_last_bps"] = raw_bps
+                    st["used_last_bps"] = used_bps
+                    st["peak_raw_bps"] = max(float(st.get("peak_raw_bps") or 0.0), raw_bps)
+                _DIR_DISLOC_STATE[sym] = st
+            else:
+                # Not a spike now. If we had an active dislocation, it may be collapsing.
+                if active:
+                    peak = float(st.get("peak_raw_bps") or 0.0)
+                    started_ms = float(st.get("started_ms") or now_ms)
+                    cycles = int(st.get("cycles") or 0)
+                    dur_sec = max(0.0, (now_ms - started_ms) / 1000.0)
+                    # Must be "real" (duration/cycles)
+                    mature = (dur_sec >= DISLOC_MIN_SECS) or (cycles >= DISLOC_MIN_CYCLES)
+                    # Collapse condition: raw_now <= peak * 0.4 (60% drop from peak)
+                    collapsed = (peak > 0) and (raw_bps <= peak * 0.4)
+                    # also require some sanity net at start or now
+                    net_ok = (float(st.get("net_start_usd") or 0.0) >= NET_MIN_USD) or (net_usd >= NET_MIN_USD)
+
+                    if mature and collapsed and net_ok:
+                        st["active"] = False
+                        st["ended_ms"] = now_ms
+                        st["ended_ts"] = now_ts
+                        st["collapse_raw_bps"] = raw_bps
+                        st["collapsed"] = True
+                        _DIR_DISLOC_STATE[sym] = st
+                    else:
+                        # Reset if it fizzles out (no collapse trigger) -> avoid stale triggers.
+                        _DIR_DISLOC_STATE.pop(sym, None)
+    except Exception as e:
+        logging.debug("directional update state failed: %s", e)
+
+
+def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd.DataFrame], paper: bool, per_leg_notional_usd: float) -> None:
+    if not _dir_enabled():
+        return
+
+    try:
+        now_ms = utc_ms_now()
+        now_ts = utc_ts_now_str()
+        base_ex = _dir_base_exchange()
+
+        MIN_PRICE_MOVE_PCT = 0.002
+        NET_MIN_USD = 1.0
+        SL_PCT = 0.003
+        TP_PCT = 0.006
+        MAX_HOLD_SEC = 600.0
+
+        # iterate over symbols that have a collapsed state
+        for sym, st in list(_DIR_DISLOC_STATE.items()):
+            if not st or not bool(st.get("collapsed")):
+                continue
+
+            sym_u = str(sym or "").upper()
+            if not sym_u:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # protection: only one directional position per symbol
+            if sym_u in _DIR_POSITIONS and _DIR_POSITIONS[sym_u].get("status") == "open":
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # cooldown
+            cd_until = float(_DIR_COOLDOWN_UNTIL_MS.get(sym_u) or 0.0)
+            if cd_until > 0 and now_ms < cd_until:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # do not run directional if cross-arb position is open on same symbol
+            if _dir_cross_open_for_symbol(df_cross_pos, sym_u):
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            px0 = st.get("base_price_start")
+            try:
+                px0 = float(px0) if px0 is not None else None
+            except Exception:
+                px0 = None
+            px_now = _dir_get_ex_mid(quotes_df, sym_u, base_ex)
+            if px0 is None or px_now is None or px_now <= 0:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            net_start = float(st.get("net_start_usd") or 0.0)
+            if net_start < NET_MIN_USD:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # Determine direction using "base exchange" context.
+            # In build_price_arbitrage: long_ex is CHEAP (buy), short_ex is RICH (sell).
+            # We trade continuation *in the direction of where the base exchange was priced* during the spike:
+            #   - if base was CHEAP -> expect upward continuation after collapse -> LONG confirmation on base
+            #   - if base was RICH  -> expect downward continuation after collapse -> SHORT confirmation on base
+            # If base wasn't part of the pair (rare), fall back to simple price-momentum on base.
+            long_ex = str(st.get("long_ex") or "").strip().lower()
+            short_ex = str(st.get("short_ex") or "").strip().lower()
+            base_side = None
+            if base_ex == long_ex:
+                base_side = "cheap"
+            elif base_ex == short_ex:
+                base_side = "rich"
+
+            direction = None
+            if base_side == "cheap":
+                if px_now >= px0 * (1.0 + MIN_PRICE_MOVE_PCT):
+                    direction = "LONG"
+            elif base_side == "rich":
+                if px_now <= px0 * (1.0 - MIN_PRICE_MOVE_PCT):
+                    direction = "SHORT"
+            else:
+                # fallback: momentum
+                if px_now >= px0 * (1.0 + MIN_PRICE_MOVE_PCT):
+                    direction = "LONG"
+                elif px_now <= px0 * (1.0 - MIN_PRICE_MOVE_PCT):
+                    direction = "SHORT"
+
+            if direction is None:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            # Create a paper position (real execution can be wired later)
+            notional = float(per_leg_notional_usd)
+            qty = notional / float(px_now)
+            if qty <= 0:
+                _DIR_DISLOC_STATE.pop(sym, None)
+                continue
+
+            if direction == "LONG":
+                sl = px_now * (1.0 - SL_PCT)
+                tp = px_now * (1.0 + TP_PCT)
+            else:
+                sl = px_now * (1.0 + SL_PCT)
+                tp = px_now * (1.0 - TP_PCT)
+
+            pos = {
+                "ts": now_ts,
+                "event": "open",
+                "symbol": sym_u,
+                "direction": direction,
+                "base_exchange": base_ex,
+                "entry_price": float(px_now),
+                "sl": float(sl),
+                "tp": float(tp),
+                "qty": float(qty),
+                "notional_usd": float(notional),
+                "opened_ms": float(now_ms),
+                "max_hold_sec": float(MAX_HOLD_SEC),
+                "paper": bool(paper),
+                "reason": f"post-dislocation continuation (peak_raw={float(st.get('peak_raw_bps') or 0.0):.1f}bps, collapsed_to={float(st.get('collapse_raw_bps') or 0.0):.1f}bps; start_px={px0:.8f})",
+                "status": "open",
+            }
+            _DIR_POSITIONS[sym_u] = pos
+
+            # persist
+            jsonl_path, _ = _dir_positions_log_paths()
+            _dir_append_jsonl(jsonl_path, dict(pos))
+            _dir_log_position_to_csv(dict(pos))
+
+            # Telegram
+            maybe_send_telegram(_dir_format_tg_card("entry", pos))
+
+            # consume state (one-shot)
+            _DIR_DISLOC_STATE.pop(sym, None)
+    except Exception as e:
+        logging.debug("directional open failed: %s", e)
+
+
+def _dir_check_exits(quotes_df: pd.DataFrame) -> None:
+    if not _dir_enabled():
+        return
+    try:
+        if not _DIR_POSITIONS:
+            return
+        now_ms = utc_ms_now()
+        now_ts = utc_ts_now_str()
+        base_ex = _dir_base_exchange()
+
+        for sym, pos in list(_DIR_POSITIONS.items()):
+            if not pos or pos.get("status") != "open":
+                continue
+            sym_u = str(sym or "").upper()
+            px = _dir_get_ex_mid(quotes_df, sym_u, base_ex)
+            if px is None or px <= 0:
+                continue
+            entry = float(pos.get("entry_price") or 0.0)
+            sl = float(pos.get("sl") or 0.0)
+            tp = float(pos.get("tp") or 0.0)
+            qty = float(pos.get("qty") or 0.0)
+            direction = str(pos.get("direction") or "LONG").upper()
+            opened_ms = float(pos.get("opened_ms") or now_ms)
+            max_hold_sec = float(pos.get("max_hold_sec") or 600.0)
+
+            age_sec = max(0.0, (now_ms - opened_ms) / 1000.0)
+
+            exit_reason = None
+            if direction == "LONG":
+                if px <= sl:
+                    exit_reason = "SL"
+                elif px >= tp:
+                    exit_reason = "TP"
+            else:
+                if px >= sl:
+                    exit_reason = "SL"
+                elif px <= tp:
+                    exit_reason = "TP"
+
+            if exit_reason is None and age_sec >= max_hold_sec:
+                exit_reason = "TIME"
+
+            if exit_reason is None:
+                continue
+
+            # close
+            if direction == "LONG":
+                pnl = (float(px) - entry) * qty
+            else:
+                pnl = (entry - float(px)) * qty
+
+            pos_close = dict(pos)
+            pos_close.update({
+                "ts": now_ts,
+                "event": "close",
+                "exit_price": float(px),
+                "closed_ms": float(now_ms),
+                "exit_reason": exit_reason,
+                "pnl_usd": float(pnl),
+                "status": "closed",
+            })
+            _DIR_POSITIONS[sym_u] = pos_close
+
+            # persist
+            jsonl_path, _ = _dir_positions_log_paths()
+            _dir_append_jsonl(jsonl_path, dict(pos_close))
+            _dir_log_position_to_csv(dict(pos_close))
+
+            # Telegram
+            maybe_send_telegram(_dir_format_tg_card("exit", pos_close))
+
+            # cooldown
+            _DIR_COOLDOWN_UNTIL_MS[sym_u] = float(now_ms) + (_dir_cooldown_sec() * 1000.0)
+    except Exception as e:
+        logging.debug("directional exits failed: %s", e)
+
 
 # ----------------- CSV / Remote storage (GCS or Google Drive) -----------------
 def is_gs(path: Optional[str]) -> bool:
@@ -7736,6 +8209,15 @@ def positions_once(
         # keep pre-filter candidates for Telegram topN (so TG doesn't go silent)
         cands_pre = cands.copy()
 
+        # ------------------------------
+        # Directional mode: dislocation sensor update (per-symbol RAM state)
+        # Must run BEFORE any entry/exit checks.
+        # ------------------------------
+        try:
+            _dir_update_dislocation_state(cands_pre, quotes_df)
+        except Exception:
+            pass
+
         m = cands["spread_ok"] & cands["eco_ok"]
         if hard_z:
             m = m & cands["z_ok"]
@@ -8047,6 +8529,25 @@ def positions_once(
 
     # FIX: MAX_OPEN_TRADES используется ниже в positions_once (Pylance ругался, что переменная не определена)
     MAX_OPEN_TRADES = int(getenv_float("MAX_OPEN_TRADES", 1))
+
+    # ------------------------------
+    # Directional mode: entry on dislocation collapse + exit checks
+    # a) (already) updated dislocation state above
+    # b) try to open directional trade if conditions met
+    # c) check exits for any open directional positions
+    # ------------------------------
+    try:
+        if _dir_enabled():
+            _dir_try_open_on_collapse(
+                quotes_df=quotes_df,
+                df_cross_pos=df_pos,
+                paper=paper,
+                per_leg_notional_usd=per_leg_notional_usd,
+            )
+            _dir_check_exits(quotes_df=quotes_df)
+    except Exception:
+        pass
+
     # ------------------------------
     # 4) проверяем открытые позиции на выход
     # ------------------------------
