@@ -2837,7 +2837,7 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
         if cands_pre is None or cands_pre.empty:
             return
         now_ms = utc_ms_now()
-        now_ts = utc_ts_now_str()
+        now_ts = now_utc_str()
 
         RAW_SPIKE_BPS = 400.0
         USED_MAX_BPS = 20.0
@@ -2928,7 +2928,7 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
 
     try:
         now_ms = utc_ms_now()
-        now_ts = utc_ts_now_str()
+        now_ts = now_utc_str()
         base_ex = _dir_base_exchange()
 
         MIN_PRICE_MOVE_PCT = 0.002
@@ -3064,7 +3064,7 @@ def _dir_check_exits(quotes_df: pd.DataFrame) -> None:
         if not _DIR_POSITIONS:
             return
         now_ms = utc_ms_now()
-        now_ts = utc_ts_now_str()
+        now_ts = now_utc_str()
         base_ex = _dir_base_exchange()
 
         for sym, pos in list(_DIR_POSITIONS.items()):
