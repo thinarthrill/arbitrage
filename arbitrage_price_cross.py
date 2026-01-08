@@ -2144,6 +2144,171 @@ def format_signal_card(r: dict, per_leg_notional_usd: float, price_source: str) 
         f"🕒 {ts}",
     ])
 
+    # ------------------------------------------------------------------
+    # Decision panels (compact): OPEN / CROSS CHECK / DIR CHECK
+    # ------------------------------------------------------------------
+    def _flag(ok: bool) -> str:
+        return "✅" if ok else "❌"
+
+    # --- OPEN status (if scanner attempted/decided) ---
+    try:
+        oa = r.get("open_attempted", None)
+        ok = r.get("open_ok", None)
+        rs = r.get("open_skip_reasons") or r.get("_open_skip_reasons") or []
+        if oa is not None or ok is not None or rs:
+            st = "OPENED" if bool(ok) else ("ATTEMPTED" if bool(oa) else "SKIPPED")
+            lines.append(f"\n🧩 <b>OPEN</b>: <code>{st}</code>")
+            _u = []
+            for x in (rs or []):
+                xs = str(x)
+                if xs and xs not in _u:
+                    _u.append(xs)
+            if _u:
+                lines.append("🧯 <b>REASONS</b>: " + ", ".join(_u[:10]))
+    except Exception:
+        pass
+
+    # --- CROSS CHECK (what blocks cross open) ---
+    if getenv_bool("SHOW_ENTRY_FILTERS", False):
+        try:
+            entry_mode_loc = getenv_str("ENTRY_MODE", "price").lower()
+            z_in_loc         = float(getenv_float("Z_IN", 2.0))
+            entry_bps_loc    = float(getenv_float("ENTRY_SPREAD_BPS", 0.0))
+            std_min_loc      = float(getenv_float("STD_MIN_FOR_OPEN", 1e-4))
+            capital_env      = float(getenv_float("CAPITAL", 1000.0))
+            entry_net_pct    = float(getenv_float("ENTRY_NET_PCT", 1.0))
+            min_net_abs      = (entry_net_pct / 100.0) * capital_env
+
+            net_for_eco = r.get("net_usd_adj", None)
+            try:
+                nt = r.get("net_usd_adj_total", None)
+                if nt is not None and float(nt) == float(nt):
+                    net_for_eco = float(nt)
+            except Exception:
+                pass
+
+            lines.append("\n🎯 <b>CROSS CHECK</b> (gap → what\'s missing)")
+            if net_for_eco is not None and float(net_for_eco) == float(net_for_eco):
+                gap = max(0.0, min_net_abs - float(net_for_eco))
+                if gap <= 1e-9:
+                    lines.append(f"{_flag(True)} eco    · net=<code>{float(net_for_eco):.2f}$</code> > <code>{min_net_abs:.2f}$</code> · gap=<code>0</code>")
+                else:
+                    lines.append(f"{_flag(False)} eco    · net=<code>{float(net_for_eco):.2f}$</code> ≤ <code>{min_net_abs:.2f}$</code> · need +<code>{gap:.2f}$</code>")
+            else:
+                lines.append(f"{_flag(False)} eco    · net=<code>None</code> · need > <code>{min_net_abs:.2f}$</code>")
+
+            try:
+                gap_sp = max(0.0, float(entry_bps_loc) - float(sp_bps))
+            except Exception:
+                gap_sp = float(entry_bps_loc)
+            if gap_sp <= 1e-9:
+                lines.append(f"{_flag(True)} spread · used=<code>{float(sp_bps):.0f} bps</code> ≥ <code>{entry_bps_loc:.0f} bps</code> · gap=<code>0</code>")
+            else:
+                lines.append(f"{_flag(False)} spread · used=<code>{float(sp_bps):.0f} bps</code> < <code>{entry_bps_loc:.0f} bps</code> · need +<code>{gap_sp:.0f} bps</code>")
+
+            if entry_mode_loc == "zscore":
+                if (z is not None) and (z == z):
+                    gap_z = max(0.0, float(z_in_loc) - float(z))
+                    if gap_z <= 1e-12:
+                        lines.append(f"{_flag(True)} z      · z=<code>{float(z):.2f}</code> ≥ <code>{z_in_loc:.2f}</code> · gap=<code>0</code>")
+                    else:
+                        lines.append(f"{_flag(False)} z      · z=<code>{float(z):.2f}</code> < <code>{z_in_loc:.2f}</code> · need +<code>{gap_z:.2f}</code>")
+                else:
+                    lines.append(f"{_flag(False)} z      · z=<code>{z}</code> · need ≥ <code>{z_in_loc:.2f}</code>")
+
+                if (std is not None) and (std == std):
+                    gap_std = max(0.0, float(std_min_loc) - float(std))
+                    if gap_std <= 1e-18:
+                        lines.append(f"{_flag(True)} std    · σ=<code>{float(std):.6f}</code> ≥ <code>{std_min_loc:.6f}</code> · gap=<code>0</code>")
+                    else:
+                        lines.append(f"{_flag(False)} std    · σ=<code>{float(std):.6f}</code> < <code>{std_min_loc:.6f}</code> · need +<code>{gap_std:.6f}</code>")
+                else:
+                    lines.append(f"{_flag(False)} std    · σ=<code>{std}</code> · need ≥ <code>{std_min_loc:g}</code>")
+
+            if "spread_alive_ok" in r:
+                lines.append(f"{_flag(bool(r.get('spread_alive_ok')))} alive  · spread_alive_ok=<code>{bool(r.get('spread_alive_ok'))}</code>")
+            if "liq_ok" in r:
+                lines.append(f"{_flag(bool(r.get('liq_ok')))} liq    · liq_ok=<code>{bool(r.get('liq_ok'))}</code>")
+            if "stats_quality_ok" in r:
+                lines.append(f"{_flag(bool(r.get('stats_quality_ok')))} stats  · stats_quality_ok=<code>{bool(r.get('stats_quality_ok'))}</code>")
+
+            try:
+                cs = r.get("candidate_score", None)
+                if cs is not None and "FINAL_SCORE_MIN" in globals():
+                    cs = float(cs)
+                    fmin = float(FINAL_SCORE_MIN)
+                    gap_cs = max(0.0, fmin - cs)
+                    if gap_cs <= 1e-12:
+                        lines.append(f"{_flag(True)} score  · <code>{cs:.3f}</code> ≥ <code>{fmin:.3f}</code> · gap=<code>0</code>")
+                    else:
+                        lines.append(f"{_flag(False)} score  · <code>{cs:.3f}</code> < <code>{fmin:.3f}</code> · need +<code>{gap_cs:.3f}</code>")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # --- DIR CHECK (structural dislocation lifecycle) ---
+    try:
+        if _dir_enabled():
+            st = _DIR_DISLOC_STATE.get(sym.upper()) if isinstance(sym, str) else None
+            if st:
+                RAW_SPIKE_BPS = 400.0
+                USED_MAX_BPS = 20.0
+                DISLOC_MIN_SECS = 30.0
+                DISLOC_MIN_CYCLES = 3
+                NET_MIN_USD = 1.0
+                COLLAPSE_FACTOR = 0.4
+                MIN_PRICE_MOVE_PCT = 0.002
+
+                active = bool(st.get("active"))
+                collapsed = bool(st.get("collapsed"))
+                phase = "SPIKE_ACTIVE" if active else ("COLLAPSED_WAIT_CONFIRM" if collapsed else "STATE")
+                raw_last = float(to_float(st.get("raw_last_bps")) or 0.0)
+                used_last = float(to_float(st.get("used_last_bps")) or 0.0)
+                peak = float(to_float(st.get("peak_raw_bps")) or 0.0)
+                cycles = int(to_float(st.get("cycles")) or 0)
+                started_ms = float(to_float(st.get("started_ms")) or 0.0)
+                dur_sec = 0.0
+                try:
+                    if started_ms > 0:
+                        dur_sec = max(0.0, (utc_ms_now() - started_ms) / 1000.0)
+                except Exception:
+                    dur_sec = 0.0
+                net_start = float(to_float(st.get("net_start_usd")) or 0.0)
+                mature_ok = (dur_sec >= DISLOC_MIN_SECS) or (cycles >= DISLOC_MIN_CYCLES)
+                collapse_target = peak * COLLAPSE_FACTOR if peak > 0 else 0.0
+                collapse_ok = (peak > 0) and (raw_last <= collapse_target)
+                net_ok = (net_start >= NET_MIN_USD)
+
+                lines.append("\n🧭 <b>DIR CHECK</b> (structural dislocation)")
+                lines.append(f"phase=<code>{phase}</code> · base_ex=<code>{st.get('base_exchange')}</code> · sensor=<code>{st.get('sensor_exchange')}</code>")
+                if raw_last < RAW_SPIKE_BPS:
+                    lines.append(f"{_flag(False)} raw    · <code>{raw_last:.0f}</code> < <code>{RAW_SPIKE_BPS:.0f}</code> · need +<code>{(RAW_SPIKE_BPS-raw_last):.0f}</code>")
+                else:
+                    lines.append(f"{_flag(True)} raw    · <code>{raw_last:.0f}</code> ≥ <code>{RAW_SPIKE_BPS:.0f}</code>")
+                if used_last > USED_MAX_BPS:
+                    lines.append(f"{_flag(False)} used   · <code>{used_last:.0f}</code> > <code>{USED_MAX_BPS:.0f}</code> · need -<code>{(used_last-USED_MAX_BPS):.0f}</code>")
+                else:
+                    lines.append(f"{_flag(True)} used   · <code>{used_last:.0f}</code> ≤ <code>{USED_MAX_BPS:.0f}</code>")
+                lines.append(f"{_flag(mature_ok)} mature · dur=<code>{dur_sec:.0f}s</code> or cycles=<code>{cycles}</code>")
+                if peak > 0:
+                    if collapse_ok:
+                        lines.append(f"{_flag(True)} collap · raw=<code>{raw_last:.0f}</code> ≤ <code>{collapse_target:.0f}</code> (peak*{COLLAPSE_FACTOR})")
+                    else:
+                        lines.append(f"{_flag(False)} collap · raw=<code>{raw_last:.0f}</code> > <code>{collapse_target:.0f}</code> · need -<code>{(raw_last-collapse_target):.0f}</code>")
+                else:
+                    lines.append(f"{_flag(False)} collap · peak=<code>{peak:.0f}</code> invalid")
+                if net_ok:
+                    lines.append(f"{_flag(True)} net    · net_start=<code>{net_start:.2f}$</code> ≥ <code>{NET_MIN_USD:.2f}$</code>")
+                else:
+                    lines.append(f"{_flag(False)} net    · net_start=<code>{net_start:.2f}$</code> < <code>{NET_MIN_USD:.2f}$</code> · need +<code>{(NET_MIN_USD-net_start):.2f}$</code>")
+                has_sensor_px0 = st.get("sensor_price_start") is not None
+                has_long_px0 = st.get("long_price_start") is not None
+                has_short_px0 = st.get("short_price_start") is not None
+                lines.append(f"📌 confirm: move≥<code>{MIN_PRICE_MOVE_PCT*100:.2f}%</code>, px0(sensor/long/short)=<code>{int(has_sensor_px0)}/{int(has_long_px0)}/{int(has_short_px0)}</code>")
+    except Exception:
+        pass
+
     # defaults to keep linters happy even if SHOW_ENTRY_FILTERS=False
     eco_ok = False; spread_ok = False; z_ok = False; std_ok = False
 
@@ -3029,6 +3194,7 @@ def _dir_update_dislocation_state(cands_pre: pd.DataFrame, quotes_df: pd.DataFra
                         "base_exchange": base_ex_cfg,            # can be 'auto' (config)
                         "sensor_exchange": sensor_ex,            # concrete for price reference
                         "sensor_price_start": px0_sensor,
+                        "base_price_start": px0_sensor,  # IMPORTANT: used by _dir_try_open_on_collapse()
                         "long_ex": long_ex,
                         "short_ex": short_ex,
                         "long_price_start": px0_long,
@@ -3107,6 +3273,10 @@ def _dir_try_open_on_collapse(quotes_df: pd.DataFrame, df_cross_pos: Optional[pd
                 continue
 
             px0 = st.get("base_price_start")
+            if px0 is None:
+                px0 = st.get("sensor_price_start")
+            if px0 is None:
+                px0 = st.get("avg_mid_start")
             try:
                 px0 = float(px0) if px0 is not None else None
             except Exception:
