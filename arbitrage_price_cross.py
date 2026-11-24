@@ -1481,9 +1481,8 @@ def expected_funding_pnl_pct(symbol: str, cheap_ex: str, rich_ex: str, hold_sec:
 
     total = None
     if pnlA is not None and pnlB is not None:
-        # NOTE: cycles could differ; use min cycles to avoid overstating
-        c = min(cA, cB)
-        total = (pnlA + pnlB) * c * 100.0
+        # Count each venue settlement independently.
+        total = (pnlA * cA + pnlB * cB) * 100.0
 
     details = {
         'cheap_ex': str(cheap_ex), 'rich_ex': str(rich_ex), 'reverse_side': bool(reverse_side),
@@ -7529,6 +7528,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
     Без reduce_only. Возвращаем метаданные и клиентские id.
     """
     attempt_id = new_attempt_id()
+    reverse_side = getenv_bool("REVERSE_SIDE", False)
     # ---- eventlog: open attempt (before any early returns) ----
     try:
         _ev = {
@@ -7627,7 +7627,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             rollback_err: Optional[Exception] = None
             try:
                 _ = _place_perp_market_order(
-                    cheap_ex, symbol, "SELL", qty_final,
+                    cheap_ex, symbol, ("BUY" if reverse_side else "SELL"), qty_final,
                     paper=paper, reduce_only=True
                 )
             except Exception as e2:
@@ -7667,7 +7667,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         rollback_err: Optional[Exception] = None
         try:
             _ = _place_perp_market_order(
-                cheap_ex, symbol, "SELL", qty_final,
+                cheap_ex, symbol, ("BUY" if reverse_side else "SELL"), qty_final,
                 paper=paper, reduce_only=True
             )
         except Exception as e2:
@@ -7700,7 +7700,7 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         )
         entry_bps_filled = None
     else:
-        entry_bps_filled = (short_px - long_px) / long_px * 1e4
+        entry_bps_filled = (short_px - long_px) / long_px * 1e4 * (-1 if reverse_side else 1)
         if ENTRY_BPS_MIN > 0.0 and entry_bps_filled < ENTRY_BPS_MIN:
             logging.warning(
                 "Bad fill for %s: entry_bps_filled=%.2f < %.2f bps, panic closing",
@@ -7709,14 +7709,14 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
             # Закрываем обе ноги reduce_only маркетами
             try:
                 _ = _place_perp_market_order(
-                    cheap_ex, symbol, "SELL", qty_final,
+                    cheap_ex, symbol, ("BUY" if reverse_side else "SELL"), qty_final,
                     paper=paper, reduce_only=True
                 )
             except Exception as e2:
                 logging.error("Bad-fill close legA failed: %s", e2)
             try:
                 _ = _place_perp_market_order(
-                    rich_ex, symbol, "BUY", qty_final,
+                    rich_ex, symbol, ("SELL" if reverse_side else "BUY"), qty_final,
                     paper=paper, reduce_only=True
                 )
             except Exception as e3:
@@ -7751,14 +7751,14 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         start_ms_for_trades = utc_ms_now() - int(getenv_float("FILL_LOOKBACK_MS", 180_000))
 
         sum_long = summarize_fills(
-            cheap_ex, symbol, "BUY",
+            cheap_ex, symbol, side_a_open,
             meta.get("open_long_order_id",""),
             meta.get("open_long_cloid",""),
             None, None, None,
             start_ms_for_trades
         )
         sum_short = summarize_fills(
-            rich_ex, symbol, "SELL",
+            rich_ex, symbol, side_b_open,
             meta.get("open_short_order_id",""),
             meta.get("open_short_cloid",""),
             None, None, None,
@@ -7770,9 +7770,8 @@ def atomic_cross_open(symbol: str, cheap_ex: str, rich_ex: str,
         if sum_short.get("avg_open_px"):
             meta["open_short_px"] = float(sum_short["avg_open_px"])
 
-        meta["open_fees_usd"] = float(meta.get("open_fees_usd", 0.0)) \
-                                + float(sum_long.get("fees_open_usd", 0.0)) \
-                                + float(sum_short.get("fees_open_usd", 0.0))
+        if sum_long.get("avg_open_px") and sum_short.get("avg_open_px"):
+            meta["open_fees_usd"] = float(sum_long.get("fees_open_usd", 0.0)) + float(sum_short.get("fees_open_usd", 0.0))
 
     except Exception as e:
         logging.debug("post-open fill fetch skipped: %s", e)
